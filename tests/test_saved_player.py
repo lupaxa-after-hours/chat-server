@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from totp_fixtures import TOTP_TEST_SEED
 
 from lupaxa.chat_server.exceptions import ConfigError
 from lupaxa.chat_server.saved_player import (
@@ -86,6 +87,43 @@ def test_save_and_load_round_trip(tmp_path: Path) -> None:
     path = player_path(tmp_path, "Bea")
     assert load_saved(path) == SavedPlayer("Bea", RANK_RESIDENT, hashed, logged_out)
     assert "secret" not in path.read_text(encoding="utf-8")
+
+
+def test_mfa_secret_round_trips_when_set(tmp_path: Path) -> None:
+    """An optional mfa_secret is stored and loaded."""
+    hashed = hash_password("secret", rounds=4)
+    totp_seed = TOTP_TEST_SEED
+    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hashed, mfa_secret=totp_seed))
+    loaded = load_saved(player_path(tmp_path, "Bea"))
+    assert loaded is not None
+    assert loaded.mfa_secret == totp_seed
+
+
+def test_mfa_secret_absent_means_none(tmp_path: Path) -> None:
+    """A file with no mfa_secret key loads as None."""
+    hashed = hash_password("secret", rounds=4)
+    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hashed))
+    loaded = load_saved(player_path(tmp_path, "Bea"))
+    assert loaded is not None
+    assert loaded.mfa_secret is None
+
+
+def test_mfa_secret_rejects_empty_or_non_string(tmp_path: Path) -> None:
+    """Empty or non-string mfa_secret values are refused."""
+    hashed = hash_password("secret", rounds=4)
+    path = player_path(tmp_path, "Bea")
+    path.write_text(
+        f"name: Bea\nlowercase_name: bea\nrank: resident\npassword: {hashed}\nmfa_secret: ''\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="mfa_secret must be a base32 secret"):
+        load_saved(path)
+    path.write_text(
+        f"name: Bea\nlowercase_name: bea\nrank: resident\npassword: {hashed}\nmfa_secret: 1\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="mfa_secret must be a base32 secret"):
+        load_saved(path)
 
 
 def test_same_key_updates_the_display_spelling(tmp_path: Path) -> None:
@@ -355,3 +393,33 @@ def test_logout_keeps_colour_off(tmp_path: Path) -> None:
     saved = load_saved(player_path(tmp_path, "bea"))
     assert saved is not None
     assert saved.colour is False
+
+
+def test_only_the_config_admin_may_be_super_admin(tmp_path: Path) -> None:
+    """Another file that claims super admin is refused."""
+    from lupaxa.chat_server.saved_player import RANK_SUPER_ADMIN, normalize_super_admin
+
+    bea = SavedPlayer("Bea", RANK_SUPER_ADMIN, hash_password("pw", rounds=4))
+    with pytest.raises(ConfigError, match="Only the config admin can be a super admin."):
+        normalize_super_admin(bea, "admin")
+
+
+def test_saved_players_skips_a_non_config_super_admin_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A roster file that claims super admin for someone else is skipped, not fatal."""
+    from types import SimpleNamespace
+
+    from lupaxa.chat_server.saved_player import RANK_SUPER_ADMIN
+    from lupaxa.chat_server.utilities import _saved_players
+
+    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
+    save_player(
+        tmp_path,
+        SavedPlayer("Cora", RANK_SUPER_ADMIN, hash_password("pw", rounds=4)),
+    )
+    host = SimpleNamespace(_roster_dir=tmp_path, _config=SimpleNamespace(admin="admin"))
+    loaded = _saved_players(host)  # type: ignore[arg-type]
+    assert [player.name for player in loaded] == ["Bea"]
+    captured = capsys.readouterr()
+    assert "Only the config admin can be a super admin." in captured.out

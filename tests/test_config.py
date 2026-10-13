@@ -352,3 +352,15 @@ def test_allow_flags_must_be_booleans(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="allow_newbies must be true or false"):
         load_config(path)
+
+
+def test_mfa_enabled_defaults_to_true_and_rejects_a_number(tmp_path: Path) -> None:
+    """The MFA flag is on unless the file says false."""
+    base = "port: 9000\nrooms: rooms.yml\nstart: reception\nhelp: help.yml\n"
+    path = _write(tmp_path, base)
+    assert load_config(path).mfa_enabled is True
+    path = _write(tmp_path, f"{base}mfa_enabled: false\n")
+    assert load_config(path).mfa_enabled is False
+    path = _write(tmp_path, f"{base}mfa_enabled: 1\n")
+    with pytest.raises(ConfigError, match="mfa_enabled must be true or false"):
+        load_config(path)

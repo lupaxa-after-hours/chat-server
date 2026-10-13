@@ -92,9 +92,6 @@ def command_nuke(host: Host, client: Client, command: Command, text: str | None)
     name, reason = resolved
     if refuses_self(host, client, name):
         return
-    if _is_admin(host, name):
-        host.send(client, "The admin cannot be removed.\n")
-        return
     try:
         saved = _find_saved(host, name)
     except (ConfigError, OSError) as exc:
@@ -175,12 +172,8 @@ def command_disconnect(host: Host, client: Client, command: Command, text: str |
 
 
 def _may_remove(host: Host, client: Client, target_rank: str) -> bool:
-    """Return whether this caller may nuke or disconnect ``target_rank``.
-
-    Same rank or higher is refused, unless the caller is the config admin.
-    """
-    if _is_admin(host, _name_of(client)):
-        return True
+    """Return whether this caller outranks ``target_rank``."""
+    del host
     return not rank_allows(target_rank, _rank_of(client))
 
 

@@ -15,11 +15,14 @@ from .saved_player import (
     RANK_ADMIN,
     RANK_NEWBIE,
     RANK_SUPER,
+    RANK_SUPER_ADMIN,
     SavedPlayer,
     load_saved,
+    normalize_super_admin,
     player_path,
     rank_label,
     savable_name,
+    save_player,
 )
 from .time import duration_phrase
 
@@ -149,7 +152,7 @@ def shown_rank(rank: str, enabled: bool) -> str:
         return green(words)
     if rank == RANK_SUPER:
         return cyan(words)
-    if rank == RANK_ADMIN:
+    if rank in (RANK_ADMIN, RANK_SUPER_ADMIN):
         return red(words)
     return words
 
@@ -161,7 +164,7 @@ def shown_rank_cell(rank: str, enabled: bool) -> str:
         return cell
     if rank == RANK_SUPER:
         return cyan(cell)
-    if rank == RANK_ADMIN:
+    if rank in (RANK_ADMIN, RANK_SUPER_ADMIN):
         return red(cell)
     return cell
 
@@ -201,7 +204,7 @@ def examine_frame(
 def rank_cell(rank: str) -> str:
     """Return the list rank cell. Admin uses square brackets. Super user uses angles."""
     label = rank_words(rank)
-    if rank == RANK_ADMIN:
+    if rank in (RANK_ADMIN, RANK_SUPER_ADMIN):
         return f"[ {label} ]"
     if rank == RANK_SUPER:
         return f"< {label} >"
@@ -336,11 +339,22 @@ def _lookup(host: Host, client: Client, name: str) -> tuple[bool, SavedPlayer | 
         return False, None
 
 
+def _normalize_saved_rank(host: Host, saved: SavedPlayer) -> SavedPlayer:
+    """Return ``saved`` after config-account rank normalization, persisting when needed."""
+    normalized = normalize_super_admin(saved, host._config.admin)
+    if normalized.rank != saved.rank:
+        save_player(host._roster_dir, normalized)
+    return normalized
+
+
 def _find_saved(host: Host, name: str) -> SavedPlayer | None:
     """Return the saved player whose file ``name`` points at, or ``None``."""
     if not savable_name(name):
         return None
-    return load_saved(player_path(host._roster_dir, name))
+    saved = load_saved(player_path(host._roster_dir, name))
+    if saved is None:
+        return None
+    return _normalize_saved_rank(host, saved)
 
 
 def refuses_self(host: Host, client: Client, name: str) -> bool:
@@ -364,11 +378,12 @@ def _saved_players(host: Host) -> list[SavedPlayer]:
     for path in paths:
         try:
             saved = load_saved(path)
+            if saved is None:
+                continue
+            loaded.append(_normalize_saved_rank(host, saved))
         except (ConfigError, OSError) as exc:
             print(exc)
             continue
-        if saved is not None:
-            loaded.append(saved)
     return loaded
 
 

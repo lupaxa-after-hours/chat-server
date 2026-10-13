@@ -34,12 +34,13 @@ name must be typed in the spelling it was saved with.
 
 ## Ranks
 
-Newbie, then resident, then super user, then admin.
+Newbie, then resident, then super user, then admin, then Super Admin.
 
 A newbie is not saved. A resident is saved and has a password. A super
 user can save a newbie, delete a saved player, disconnect a lower rank,
-and use the staff channel. The admin can shut the server down, promote a
-resident, and demote a super user. The admin cannot be removed.
+and use the staff channel. An admin can shut the server down, promote a
+resident, and demote a super user. Only the Super Admin can promote
+someone to admin or demote them from admin.
 
 `lsu` and `staff` are for every rank. `shout` and `prompt` start at
 resident. `connections` starts at super user.

@@ -20,13 +20,15 @@ RANK_NEWBIE = "newbie"
 RANK_RESIDENT = "resident"
 RANK_SUPER = "super"
 RANK_ADMIN = "admin"
+RANK_SUPER_ADMIN = "super_admin"
 
-_RANK_ORDER = (RANK_NEWBIE, RANK_RESIDENT, RANK_SUPER, RANK_ADMIN)
-_SAVED_RANKS = frozenset({RANK_RESIDENT, RANK_SUPER, RANK_ADMIN})
+_RANK_ORDER = (RANK_NEWBIE, RANK_RESIDENT, RANK_SUPER, RANK_ADMIN, RANK_SUPER_ADMIN)
+_SAVED_RANKS = frozenset({RANK_RESIDENT, RANK_SUPER, RANK_ADMIN, RANK_SUPER_ADMIN})
 _RANK_LABELS = {
     RANK_RESIDENT: "Resident",
     RANK_SUPER: "Super User",
     RANK_ADMIN: "Admin",
+    RANK_SUPER_ADMIN: "Super Admin",
 }
 _PLAYER_KEYS = frozenset(
     {
@@ -38,6 +40,7 @@ _PLAYER_KEYS = frozenset(
         "ip_address",
         "logged_out_at",
         "lowercase_name",
+        "mfa_secret",
         "name",
         "password",
         "prompt",
@@ -63,6 +66,7 @@ class SavedPlayer:
     lowercase_name: str = ""
     colour: bool = True
     description: str = ""
+    mfa_secret: str | None = None
 
     def __post_init__(self) -> None:
         """Fill the key from the display spelling when the caller did not pass one."""
@@ -86,12 +90,21 @@ def rank_label(rank: str) -> str:
     Raises
     ------
     ConfigError
-        ``rank`` is not ``resident``, ``super``, or ``admin``.
+        ``rank`` is not ``resident``, ``super``, ``admin``, or ``super_admin``.
     """
     try:
         return _RANK_LABELS[rank]
     except KeyError as exc:
         raise ConfigError(f"Unknown rank {rank}.") from exc
+
+
+def normalize_super_admin(saved: SavedPlayer, admin_name: str) -> SavedPlayer:
+    """Return ``saved`` with the config account raised to super admin."""
+    if saved.rank == RANK_SUPER_ADMIN and saved.name.lower() != admin_name.lower():
+        raise ConfigError("Only the config admin can be a super admin.")
+    if saved.name.lower() == admin_name.lower() and saved.rank == RANK_ADMIN:
+        return replace(saved, rank=RANK_SUPER_ADMIN)
+    return saved
 
 
 def savable_name(name: str) -> bool:
@@ -171,6 +184,7 @@ def load_saved(path: Path) -> SavedPlayer | None:
     prompt = _player_prompt(path, payload.get("prompt"))
     colour = _player_colour(path, payload.get("colour"))
     description = _player_description(path, payload.get("description"))
+    mfa_secret = _player_mfa_secret(path, payload.get("mfa_secret"))
     return SavedPlayer(
         name,
         rank,
@@ -183,6 +197,7 @@ def load_saved(path: Path) -> SavedPlayer | None:
         lowercase_name,
         colour,
         description,
+        mfa_secret,
     )
 
 
@@ -199,7 +214,9 @@ def save_player(directory: Path, player: SavedPlayer) -> None:
     if not savable_name(player.name):
         raise ConfigError(f"{player.name} cannot be saved.")
     if player.rank not in _SAVED_RANKS:
-        raise ConfigError(f"Player file for {player.name} rank must be resident, super, or admin.")
+        raise ConfigError(
+            f"Player file for {player.name} rank must be resident, super, admin, or super_admin."
+        )
     if player.lowercase_name != player.name.lower():
         raise ConfigError(f"{player.name} cannot be saved.")
     path = player_path(directory, player.lowercase_name)
@@ -223,6 +240,8 @@ def save_player(directory: Path, player: SavedPlayer) -> None:
         payload["colour"] = False
     if player.description != "":
         payload["description"] = player.description
+    if player.mfa_secret is not None:
+        payload["mfa_secret"] = player.mfa_secret
     _replace_file(path, yaml.safe_dump(payload, sort_keys=False, allow_unicode=True))
 
 
@@ -287,7 +306,9 @@ def _player_name(path: Path, value: object) -> str:
 
 def _player_rank(path: Path, value: object) -> str:
     if not isinstance(value, str) or value not in _SAVED_RANKS:
-        raise ConfigError(f"Player file {path} rank must be resident, super, or admin.")
+        raise ConfigError(
+            f"Player file {path} rank must be resident, super, admin, or super_admin."
+        )
     return value
 
 
@@ -310,6 +331,14 @@ def _player_prompt(path: Path, value: object) -> str | None:
         return None
     if not isinstance(value, str) or value == "":
         raise ConfigError(f"Player file {path} prompt must be a non-empty string.")
+    return value
+
+
+def _player_mfa_secret(path: Path, value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value == "":
+        raise ConfigError(f"Player file {path} mfa_secret must be a base32 secret.")
     return value
 
 

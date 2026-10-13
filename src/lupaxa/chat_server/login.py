@@ -7,8 +7,16 @@ from .commands_list import Host, by_name
 from .entry import _ask, _enter, name_taken_reply, player_prompt
 from .exceptions import ConfigError
 from .globals import LOCALHOST, NAME_PROMPT
+from .mfa import (
+    _process_mfa_pw,
+    _process_mfa_remove_code,
+    _process_mfa_remove_pw,
+    _process_mfa_show,
+    _process_mfa_sure,
+)
 from .parse import consider_name, process_commands
 from .password import (
+    _process_code,
     _process_confirm_password,
     _process_current,
     _process_password,
@@ -58,6 +66,13 @@ def process_input(host: Host, client: Client, line: str) -> None:
     if client.player is None or client.auth in (
         "set",
         "confirm",
+        "code",
+        "mfa_enroll",
+        "mfa_pw",
+        "mfa_show",
+        "mfa_remove_pw",
+        "mfa_remove_code",
+        "mfa_sure",
         "current",
         "renew",
         "renew_confirm",
@@ -73,6 +88,10 @@ def process_input(host: Host, client: Client, line: str) -> None:
         "renew_confirm",
         "retire_confirm",
         "retire_password",
+        "mfa_pw",
+        "mfa_remove_pw",
+        "mfa_remove_code",
+        "mfa_sure",
     ):
         return
     host.send(client, player_prompt(client))
@@ -80,11 +99,16 @@ def process_input(host: Host, client: Client, line: str) -> None:
 
 def process_login(host: Host, client: Client, line: str) -> None:
     """Take one login line for a player who is not in a room yet."""
+    if client.auth in ("code", "mfa_enroll") and line.strip().lower() == "quit":
+        _run_named(host, client, "quit")
+        return
     if client.auth != "name" and line == "quit" and _unsaved_holder_may_quit(client):
         _run_named(host, client, "quit")
         return
     if client.auth == "password":
         _process_password(host, client, line)
+    elif client.auth in ("code", "mfa_enroll"):
+        _process_code(host, client, line)
     elif client.auth == "set":
         _process_set_password(host, client, line)
     elif client.auth == "confirm":
@@ -99,6 +123,16 @@ def process_login(host: Host, client: Client, line: str) -> None:
         _process_retire_confirm(host, client, line)
     elif client.auth == "retire_password":
         _process_retire_password(host, client, line)
+    elif client.auth == "mfa_pw":
+        _process_mfa_pw(host, client, line)
+    elif client.auth == "mfa_show":
+        _process_mfa_show(host, client, line)
+    elif client.auth == "mfa_remove_pw":
+        _process_mfa_remove_pw(host, client, line)
+    elif client.auth == "mfa_remove_code":
+        _process_mfa_remove_code(host, client, line)
+    elif client.auth == "mfa_sure":
+        _process_mfa_sure(host, client, line)
     else:
         _process_name(host, client, line)
 

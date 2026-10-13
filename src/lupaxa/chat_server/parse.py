@@ -92,6 +92,8 @@ def process_commands(host: Host, client: Client, line: str) -> None:
     if client.player is not None and not shows_idle:
         client.player.idle_seconds = 0
     try:
+        if command is not None and command.name == "mfa" and not host._mfa_enabled:
+            command = None
         if command is None:
             word = line.split(None, 1)[0]
             host.send(client, f"No such command '{word}'\n")

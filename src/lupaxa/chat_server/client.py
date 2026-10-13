@@ -21,6 +21,7 @@ class Client:
     pending_name: str = ""
     pending_saved: SavedPlayer | None = None
     pending_password: str = ""
+    pending_mfa_secret: str = ""
     pending_issuer: str = ""
     password_failures: int = 0
     address: str = "unknown"

@@ -22,6 +22,7 @@ _CONFIG_KEYS = frozenset(
         "help",
         "host",
         "login_timeout",
+        "mfa_enabled",
         "players",
         "port",
         "rooms",
@@ -49,6 +50,7 @@ class Config:
     background: bool = False
     allow_newbies: bool = True
     allow_residents: bool = True
+    mfa_enabled: bool = True
 
 
 def load_config(path: Path) -> Config:
@@ -59,14 +61,15 @@ def load_config(path: Path) -> Config:
     path :
         UTF-8 YAML file. The allowed keys are ``admin``, ``allow_newbies``,
         ``allow_residents``, ``background``, ``help``, ``host``,
-        ``login_timeout``, ``players``, ``port``, ``rooms``, ``ssh_port``, and
-        ``start``. ``port`` may be omitted when ``ssh_port`` is set. ``host``
+        ``login_timeout``, ``mfa_enabled``, ``players``, ``port``, ``rooms``,
+        ``ssh_port``, and ``start``. ``port`` may be omitted when ``ssh_port`` is
+        set. ``host``
         defaults to ``0.0.0.0`` when it is omitted. ``players`` defaults to a
         ``players`` directory beside the file. ``admin`` defaults to ``admin``.
         ``login_timeout`` defaults to 3 and is a whole number of minutes, at
         least 1. ``background`` defaults to false. ``allow_newbies`` and
-        ``allow_residents`` default to true. Each is written ``true`` or
-        ``false``, the same way as ``background``.
+        ``allow_residents`` default to true. ``mfa_enabled`` defaults to true.
+        Each is written ``true`` or ``false``, the same way as ``background``.
 
     Raises
     ------
@@ -133,6 +136,7 @@ def load_config(path: Path) -> Config:
     background = _config_bool(payload, "background", False)
     allow_newbies = _config_bool(payload, "allow_newbies", True)
     allow_residents = _config_bool(payload, "allow_residents", True)
+    mfa_enabled = _config_bool(payload, "mfa_enabled", True)
     return Config(
         port=port,
         rooms=rooms_path.resolve(),
@@ -147,6 +151,7 @@ def load_config(path: Path) -> Config:
         background=background,
         allow_newbies=allow_newbies,
         allow_residents=allow_residents,
+        mfa_enabled=mfa_enabled,
     )
 
 

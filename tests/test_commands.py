@@ -8,11 +8,13 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 
 import pytest
+from totp_fixtures import TOTP_TEST_SEED
 
 import lupaxa.chat_server.admin as admin_api
 import lupaxa.chat_server.commands as command_api
 import lupaxa.chat_server.entry as entry_api
 import lupaxa.chat_server.login as login_api
+import lupaxa.chat_server.mfa as mfa_api
 import lupaxa.chat_server.password as password_api
 import lupaxa.chat_server.su as su_api
 import lupaxa.chat_server.timer as timer_api
@@ -31,6 +33,7 @@ from lupaxa.chat_server.commands_list import Command, command_words, wrap_words
 from lupaxa.chat_server.config import Config
 from lupaxa.chat_server.entry import name_taken_reply
 from lupaxa.chat_server.exceptions import ConfigError
+from lupaxa.chat_server.globals import NAME_PROMPT
 from lupaxa.chat_server.help import (
     HelpBook,
     HelpEntry,
@@ -54,6 +57,7 @@ from lupaxa.chat_server.saved_player import (
     RANK_NEWBIE,
     RANK_RESIDENT,
     RANK_SUPER,
+    RANK_SUPER_ADMIN,
     SavedPlayer,
     delete_player,
     hash_password,
@@ -110,6 +114,7 @@ class _Player:
     pending_name: str = ""
     pending_saved: SavedPlayer | None = None
     pending_password: str = ""
+    pending_mfa_secret: str = ""
     pending_issuer: str = ""
     password_failures: int = 0
     address: str = "127.0.0.1"
@@ -151,6 +156,8 @@ class _Host:
     _shutdown_reason: str = ""
     _allow_newbies: bool = True
     _allow_residents: bool = True
+    _mfa_enabled: bool = False
+    _mfa_steps: dict[str, int] = field(default_factory=dict)
     dropped_clients: list[_Player] = field(default_factory=list)
     announced: list[bool] = field(default_factory=list)
     staff_lines: list[str] = field(default_factory=list)
@@ -174,6 +181,7 @@ class _Host:
             start="reception",
             help=Path("help.yml"),
             players=Path("players"),
+            mfa_enabled=False,
         )
     )
     _help: HelpBook = field(default_factory=lambda: HelpBook(entries=()))
@@ -428,7 +436,7 @@ def _route_scans_to_the_host_fake(monkeypatch: pytest.MonkeyPatch) -> None:
         "newbies": newbies,
         "player_named": player_named,
     }
-    for module in (command_api, admin_api, su_api, login_api, password_api, entry_api):
+    for module in (command_api, admin_api, su_api, login_api, password_api, entry_api, mfa_api):
         for name, func in replacements.items():
             if hasattr(module, name):
                 monkeypatch.setattr(module, name, func)
@@ -607,7 +615,7 @@ def test_glued_command_name_is_unknown() -> None:
 def test_help_version_and_commands() -> None:
     """Local replies do not go to the room."""
     help_result, _player = _run("help")
-    visible = command_api._visible_help(_SHIPPED_HELP, RANK_NEWBIE)
+    visible = command_api._visible_help(_SHIPPED_HELP, RANK_NEWBIE, mfa_enabled=False)
     assert help_result.sent == [format_index(visible)]
     assert help_result.room_lines == []
 
@@ -732,7 +740,7 @@ def test_help_shows_an_entry_or_says_it_is_missing() -> None:
 
 def test_prompt_follows_a_finished_command() -> None:
     """The prompt returns after success, a syntax error, and an unknown command."""
-    visible = command_api._visible_help(_SHIPPED_HELP, RANK_NEWBIE)
+    visible = command_api._visible_help(_SHIPPED_HELP, RANK_NEWBIE, mfa_enabled=False)
     host = _Host(_help=_SHIPPED_HELP)
     player = _Player()
     process_input(host, player, "help")  # type: ignore[arg-type]
@@ -2278,7 +2286,7 @@ def _login_host(tmp_path: Path, admin: str = "admin", *, opened: bool = True) ->
     if opened and load_saved(player_path(tmp_path, admin)) is None:
         save_player(
             tmp_path,
-            SavedPlayer(admin, RANK_ADMIN, hash_password("pw", rounds=4)),
+            SavedPlayer(admin, RANK_SUPER_ADMIN, hash_password("pw", rounds=4)),
         )
     config = Config(
         port=1,
@@ -2287,8 +2295,506 @@ def _login_host(tmp_path: Path, admin: str = "admin", *, opened: bool = True) ->
         help=Path("help.yml"),
         players=tmp_path,
         admin=admin,
+        mfa_enabled=False,
     )
     return _Host(_config=config, _roster_dir=tmp_path)
+
+
+def _mfa_login_host(tmp_path: Path, admin: str = "admin", *, opened: bool = True) -> _Host:
+    host = _login_host(tmp_path, admin, opened=opened)
+    host._mfa_enabled = True
+    host._config = replace(host._config, mfa_enabled=True)
+    return host
+
+
+def _register_mfa_command() -> None:
+    from lupaxa.chat_server.commands_list import COMMANDS, ensure_commands
+    from lupaxa.chat_server.mfa import register_mfa
+
+    ensure_commands()
+    register_mfa(COMMANDS)
+
+
+def _mfa_command_host(tmp_path: Path, admin: str = "admin", *, opened: bool = True) -> _Host:
+    host = _mfa_login_host(tmp_path, admin, opened=opened)
+    _register_mfa_command()
+    return host
+
+
+_MFA_REMOVED_WARNING = (
+    "Your MFA has been removed. Set it up again before you log out. "
+    "The next login will make you set it up before you can enter."
+)
+
+
+def _totp_code(secret: str, *, now: int = 1_700_000_000) -> str:
+    import base64
+    import hmac
+    import struct
+    from hashlib import sha1
+
+    raw = base64.b32decode(secret + "=" * ((8 - len(secret) % 8) % 8))
+    step = now // 30
+    digest = hmac.new(raw, struct.pack(">Q", step), sha1).digest()
+    offset = digest[-1] & 0x0F
+    binary = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
+    return f"{binary % 1_000_000:06d}"
+
+
+def test_mfa_login_asks_for_a_code_after_the_password(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A saved secret sends Code after the password, then enters on a match."""
+    totp_seed = TOTP_TEST_SEED
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            mfa_secret=totp_seed,
+        ),
+    )
+    host = _mfa_login_host(tmp_path)
+    player = _Player(player=None)
+    monkeypatch.setattr("lupaxa.chat_server.password.time.time", lambda: 1_700_000_000.0)
+    process_input(host, player, "Bea")  # type: ignore[arg-type]
+    process_input(host, player, "pw")  # type: ignore[arg-type]
+    assert player.player is None
+    assert player.auth == "code"
+    assert host.sent[-1] == "Code: "
+    process_input(host, player, _totp_code(totp_seed))  # type: ignore[arg-type]
+    assert player.player is not None
+    assert player.player.name == "Bea"
+
+
+def test_mfa_login_drops_after_three_wrong_codes(tmp_path: Path) -> None:
+    """Three wrong codes on one login drop the connection."""
+    totp_seed = TOTP_TEST_SEED
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            mfa_secret=totp_seed,
+        ),
+    )
+    host = _mfa_login_host(tmp_path)
+    player = _Player(player=None)
+    process_input(host, player, "Bea")  # type: ignore[arg-type]
+    process_input(host, player, "pw")  # type: ignore[arg-type]
+    process_input(host, player, "000000")  # type: ignore[arg-type]
+    assert host.sent[-2:] == ["Wrong code.\n", "Code: "]
+    process_input(host, player, "000001")  # type: ignore[arg-type]
+    process_input(host, player, "000002")  # type: ignore[arg-type]
+    assert host.dropped is True
+    assert player.player is None
+
+
+def test_mfa_enrolment_does_not_restore_a_nuked_player(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A code after nuke does not recreate the file or enter the room."""
+    save_player(tmp_path, SavedPlayer("Cyd", RANK_SUPER, hash_password("pw", rounds=4)))
+    host = _mfa_login_host(tmp_path)
+    boss = _staff("Boss", RANK_ADMIN)
+    host.people = [boss]
+    player = _Player(player=None)
+    monkeypatch.setattr("lupaxa.chat_server.password.time.time", lambda: 1_700_000_000.0)
+    process_input(host, player, "Cyd")  # type: ignore[arg-type]
+    process_input(host, player, "pw")  # type: ignore[arg-type]
+    assert player.auth == "mfa_enroll"
+    secret = player.pending_mfa_secret
+    delete_player(tmp_path, "Cyd")
+    code = _totp_code(secret)
+    process_input(host, player, code)  # type: ignore[arg-type]
+    assert player.player is None
+    assert load_saved(player_path(tmp_path, "Cyd")) is None
+    assert host.sent[-1] == NAME_PROMPT
+
+
+def test_mfa_super_user_enrols_on_first_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A super user with no secret sees the secret, then saves it on a match."""
+    save_player(tmp_path, SavedPlayer("Cyd", RANK_SUPER, hash_password("pw", rounds=4)))
+    host = _mfa_login_host(tmp_path)
+    player = _Player(player=None)
+    monkeypatch.setattr("lupaxa.chat_server.password.time.time", lambda: 1_700_000_000.0)
+    process_input(host, player, "Cyd")  # type: ignore[arg-type]
+    process_input(host, player, "pw")  # type: ignore[arg-type]
+    assert player.player is None
+    assert player.auth == "mfa_enroll"
+    body = "".join(host.sent)
+    assert player.pending_mfa_secret in body
+    assert "Code:" in body
+    code = _totp_code(player.pending_mfa_secret)
+    process_input(host, player, code)  # type: ignore[arg-type]
+    assert player.player is not None
+    saved = load_saved(player_path(tmp_path, "Cyd"))
+    assert saved is not None
+    assert saved.mfa_secret == player.pending_mfa_secret
+
+
+def test_mfa_super_admin_first_login_waits_for_enrolment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The config account file appears only after the enrolment code matches."""
+    host = _mfa_login_host(tmp_path, opened=False)
+    player = _Player(player=None)
+    monkeypatch.setattr("lupaxa.chat_server.password.time.time", lambda: 1_700_000_000.0)
+    process_input(host, player, "admin")  # type: ignore[arg-type]
+    process_input(host, player, "secret")  # type: ignore[arg-type]
+    process_input(host, player, "secret")  # type: ignore[arg-type]
+    assert load_saved(player_path(tmp_path, "admin")) is None
+    assert player.auth == "mfa_enroll"
+    secret = player.pending_mfa_secret
+    code = _totp_code(secret)
+    process_input(host, player, code)  # type: ignore[arg-type]
+    assert player.player is not None
+    saved = load_saved(player_path(tmp_path, "admin"))
+    assert saved is not None
+    assert saved.mfa_secret == secret
+
+
+def test_mfa_resident_without_secret_enters_on_password_alone(tmp_path: Path) -> None:
+    """A resident with no mfa_secret still enters when MFA is on."""
+    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
+    host = _mfa_login_host(tmp_path)
+    player = _Player(player=None)
+    process_input(host, player, "Bea")  # type: ignore[arg-type]
+    process_input(host, player, "pw")  # type: ignore[arg-type]
+    assert player.player is not None
+    assert player.auth == "name"
+    assert "Code:" not in "".join(host.sent)
+
+
+def test_mfa_closed_talker_skips_the_code_for_residents(tmp_path: Path) -> None:
+    """A resident is refused after the password when residents are closed."""
+    totp_seed = TOTP_TEST_SEED
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            mfa_secret=totp_seed,
+        ),
+    )
+    host = _mfa_login_host(tmp_path)
+    host._allow_residents = False
+    player = _Player(player=None)
+    process_input(host, player, "Bea")  # type: ignore[arg-type]
+    process_input(host, player, "pw")  # type: ignore[arg-type]
+    assert "Code:" not in "".join(host.sent)
+    assert host.dropped is True
+
+
+def test_mfa_reconnect_waits_for_the_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A second socket does not replace the live player until the code matches."""
+    totp_seed = TOTP_TEST_SEED
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            mfa_secret=totp_seed,
+        ),
+    )
+    host = _mfa_login_host(tmp_path)
+    live = _Player(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_RESIDENT))
+    host.people = [live]
+    newcomer = _Player(player=None, address="10.0.0.5")
+    monkeypatch.setattr("lupaxa.chat_server.password.time.time", lambda: 1_700_000_000.0)
+    process_input(host, newcomer, "Bea")  # type: ignore[arg-type]
+    process_input(host, newcomer, "pw")  # type: ignore[arg-type]
+    assert host.replaced == []
+    assert newcomer.auth == "code"
+    process_input(host, newcomer, _totp_code(totp_seed))  # type: ignore[arg-type]
+    assert host.replaced == [live]
+
+
+def test_mfa_command_syntax_when_bare(tmp_path: Path) -> None:
+    """Bare mfa prints the syntax line."""
+    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
+    bea = _staff("Bea", RANK_RESIDENT)
+    host = _mfa_command_host(tmp_path)
+    process_commands(host, bea, "mfa")  # type: ignore[arg-type]
+    assert host.sent == ["Syntax: mfa setup|mfa remove|mfa remove <name>\n"]
+
+
+def test_mfa_setup_asks_password_then_saves_secret_on_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Setup stores the secret only after password and a matching code."""
+    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
+    bea = _staff("Bea", RANK_RESIDENT)
+    host = _mfa_command_host(tmp_path)
+    monkeypatch.setattr("lupaxa.chat_server.mfa.time.time", lambda: 1_700_000_000.0)
+    process_commands(host, bea, "mfa setup")  # type: ignore[arg-type]
+    assert host.sent == ["Current password: "]
+    assert bea.auth == "mfa_pw"
+    process_input(host, bea, "pw")  # type: ignore[arg-type]
+    assert load_saved(player_path(tmp_path, "Bea")).mfa_secret is None  # type: ignore[union-attr]
+    secret = bea.pending_mfa_secret
+    assert secret in "".join(host.sent)
+    assert bea.auth == "mfa_show"
+    process_input(host, bea, _totp_code(secret))  # type: ignore[arg-type]
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_secret == secret
+    assert bea.auth == "name"
+
+
+def test_mfa_setup_wrong_password_returns_to_room(tmp_path: Path) -> None:
+    """A wrong setup password sends one line and does not ask again."""
+    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
+    bea = _staff("Bea", RANK_RESIDENT)
+    host = _mfa_command_host(tmp_path)
+    process_commands(host, bea, "mfa setup")  # type: ignore[arg-type]
+    process_input(host, bea, "no")  # type: ignore[arg-type]
+    assert host.sent[-1] == "Wrong password.\nWhat? > "
+    assert bea.auth == "name"
+
+
+def test_mfa_setup_quit_at_password_returns_to_room(tmp_path: Path) -> None:
+    """Quit at the setup password prompt returns to the room without saving."""
+    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
+    bea = _staff("Bea", RANK_RESIDENT)
+    host = _mfa_command_host(tmp_path)
+    process_commands(host, bea, "mfa setup")  # type: ignore[arg-type]
+    process_input(host, bea, "quit")  # type: ignore[arg-type]
+    assert host.sent[-1] == "What? > "
+    assert bea.auth == "name"
+    assert bea.player is not None
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_secret is None
+
+
+def test_mfa_setup_when_secret_exists(tmp_path: Path) -> None:
+    """Setup is refused when MFA is already on."""
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            mfa_secret=TOTP_TEST_SEED,
+        ),
+    )
+    bea = _staff("Bea", RANK_RESIDENT)
+    host = _mfa_command_host(tmp_path)
+    process_commands(host, bea, "mfa setup")  # type: ignore[arg-type]
+    assert host.sent == ["MFA is already on.\n"]
+
+
+def test_mfa_remove_self_clears_secret_for_resident(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Self-remove asks for password and code, then clears the file."""
+    totp_seed = TOTP_TEST_SEED
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            mfa_secret=totp_seed,
+        ),
+    )
+    bea = _staff("Bea", RANK_RESIDENT)
+    host = _mfa_command_host(tmp_path)
+    monkeypatch.setattr("lupaxa.chat_server.mfa.time.time", lambda: 1_700_000_000.0)
+    process_commands(host, bea, "mfa remove")  # type: ignore[arg-type]
+    assert host.sent == ["Current password: "]
+    process_input(host, bea, "pw")  # type: ignore[arg-type]
+    assert bea.auth == "mfa_remove_code"
+    process_input(host, bea, _totp_code(totp_seed))  # type: ignore[arg-type]
+    assert host.sent[-1] == "Your MFA has been removed.\nWhat? > "
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_secret is None
+
+
+def test_mfa_remove_self_then_setup_same_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After self-remove, setup accepts the new secret's code in the same timestep."""
+    totp_seed = TOTP_TEST_SEED
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            mfa_secret=totp_seed,
+        ),
+    )
+    bea = _staff("Bea", RANK_RESIDENT)
+    host = _mfa_command_host(tmp_path)
+    monkeypatch.setattr("lupaxa.chat_server.mfa.time.time", lambda: 1_700_000_000.0)
+    process_commands(host, bea, "mfa remove")  # type: ignore[arg-type]
+    process_input(host, bea, "pw")  # type: ignore[arg-type]
+    process_input(host, bea, _totp_code(totp_seed))  # type: ignore[arg-type]
+    assert bea.player is not None
+    process_commands(host, bea, "mfa setup")  # type: ignore[arg-type]
+    process_input(host, bea, "pw")  # type: ignore[arg-type]
+    new_secret = bea.pending_mfa_secret
+    process_input(host, bea, _totp_code(new_secret))  # type: ignore[arg-type]
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_secret == new_secret
+    assert bea.player is not None
+    assert bea.auth == "name"
+
+
+def test_mfa_remove_self_super_user_sees_warning_and_reenrols_on_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A super user who clears MFA is warned and must enrol again on the next login."""
+    totp_seed = TOTP_TEST_SEED
+    save_player(
+        tmp_path,
+        SavedPlayer("Cyd", RANK_SUPER, hash_password("pw", rounds=4), mfa_secret=totp_seed),
+    )
+    cyd = _staff("Cyd", RANK_SUPER)
+    host = _mfa_command_host(tmp_path)
+    monkeypatch.setattr("lupaxa.chat_server.mfa.time.time", lambda: 1_700_000_000.0)
+    process_commands(host, cyd, "mfa remove")  # type: ignore[arg-type]
+    process_input(host, cyd, "pw")  # type: ignore[arg-type]
+    process_input(host, cyd, _totp_code(totp_seed))  # type: ignore[arg-type]
+    assert _MFA_REMOVED_WARNING in host.sent[-1]
+    assert cyd.player is not None
+    newcomer = _Player(player=None)
+    process_input(host, newcomer, "Cyd")  # type: ignore[arg-type]
+    process_input(host, newcomer, "pw")  # type: ignore[arg-type]
+    assert newcomer.auth == "mfa_enroll"
+
+
+def test_mfa_remove_other_asks_sure_and_clears_on_yes(tmp_path: Path) -> None:
+    """An admin clears another player's MFA after yes and announces on the admin channel."""
+    totp_seed = TOTP_TEST_SEED
+    save_player(
+        tmp_path,
+        SavedPlayer("Bea", RANK_SUPER, hash_password("pw", rounds=4), mfa_secret=totp_seed),
+    )
+    save_player(tmp_path, SavedPlayer("Boss", RANK_ADMIN, hash_password("pw", rounds=4)))
+    save_player(tmp_path, SavedPlayer("Ada", RANK_ADMIN, hash_password("pw", rounds=4)))
+    boss = _staff("Boss", RANK_ADMIN)
+    ada = _staff("Ada", RANK_ADMIN)
+    bea = _staff("Bea", RANK_SUPER)
+    host = _mfa_command_host(tmp_path)
+    host.people = [boss, ada, bea]
+    process_commands(host, boss, "mfa remove Bea")  # type: ignore[arg-type]
+    assert host.sent == ["Are you sure you want to remove MFA for Bea?\n"]
+    assert boss.auth == "mfa_sure"
+    process_input(host, boss, "no")  # type: ignore[arg-type]
+    assert host.sent[-1] == "MFA remove cancelled.\nWhat? > "
+    process_commands(host, boss, "mfa remove Bea")  # type: ignore[arg-type]
+    process_input(host, boss, "yes")  # type: ignore[arg-type]
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_secret is None
+    assert bea.player is not None
+    line = "[ Admin ] Boss removes MFA for Bea.\n"
+    assert host.admin_lines == [paint_admin(ada, line)]
+
+
+def test_mfa_remove_other_clears_logged_off_player(tmp_path: Path) -> None:
+    """Removing MFA for someone who is offline still clears the file after yes."""
+    totp_seed = TOTP_TEST_SEED
+    save_player(
+        tmp_path,
+        SavedPlayer("Bea", RANK_SUPER, hash_password("pw", rounds=4), mfa_secret=totp_seed),
+    )
+    save_player(tmp_path, SavedPlayer("Boss", RANK_ADMIN, hash_password("pw", rounds=4)))
+    boss = _staff("Boss", RANK_ADMIN)
+    host = _mfa_command_host(tmp_path)
+    process_commands(host, boss, "mfa remove Bea")  # type: ignore[arg-type]
+    process_input(host, boss, "yes")  # type: ignore[arg-type]
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_secret is None
+
+
+def test_mfa_remove_other_refuses_equal_rank(tmp_path: Path) -> None:
+    """An admin cannot remove MFA for another admin."""
+    totp_seed = TOTP_TEST_SEED
+    save_player(
+        tmp_path,
+        SavedPlayer("Bea", RANK_ADMIN, hash_password("pw", rounds=4), mfa_secret=totp_seed),
+    )
+    save_player(tmp_path, SavedPlayer("Boss", RANK_ADMIN, hash_password("pw", rounds=4)))
+    boss = _staff("Boss", RANK_ADMIN)
+    host = _mfa_command_host(tmp_path)
+    process_commands(host, boss, "mfa remove Bea")  # type: ignore[arg-type]
+    assert host.sent == ["You cannot remove MFA for Bea.\n"]
+
+
+def test_mfa_remove_other_super_admin_clears_admin(tmp_path: Path) -> None:
+    """The super admin can clear a promoted admin after yes."""
+    totp_seed = TOTP_TEST_SEED
+    save_player(
+        tmp_path,
+        SavedPlayer("Bea", RANK_ADMIN, hash_password("pw", rounds=4), mfa_secret=totp_seed),
+    )
+    save_player(
+        tmp_path,
+        SavedPlayer("admin", RANK_SUPER_ADMIN, hash_password("pw", rounds=4), mfa_secret=totp_seed),
+    )
+    ada = _staff("admin", RANK_SUPER_ADMIN)
+    host = _mfa_command_host(tmp_path)
+    process_commands(host, ada, "mfa remove Bea")  # type: ignore[arg-type]
+    process_input(host, ada, "yes")  # type: ignore[arg-type]
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_secret is None
+
+
+def test_mfa_remove_other_refuses_super_admin(tmp_path: Path) -> None:
+    """Nobody can remove MFA for the super admin through the talker."""
+    totp_seed = TOTP_TEST_SEED
+    save_player(
+        tmp_path,
+        SavedPlayer("admin", RANK_SUPER_ADMIN, hash_password("pw", rounds=4), mfa_secret=totp_seed),
+    )
+    save_player(tmp_path, SavedPlayer("Boss", RANK_ADMIN, hash_password("pw", rounds=4)))
+    boss = _staff("Boss", RANK_ADMIN)
+    host = _mfa_command_host(tmp_path)
+    process_commands(host, boss, "mfa remove admin")  # type: ignore[arg-type]
+    assert host.sent == ["You cannot remove MFA for admin.\n"]
+
+
+def test_mfa_remove_other_without_secret(tmp_path: Path) -> None:
+    """Removing MFA for someone with no secret is refused."""
+    save_player(tmp_path, SavedPlayer("Bea", RANK_SUPER, hash_password("pw", rounds=4)))
+    save_player(tmp_path, SavedPlayer("Boss", RANK_ADMIN, hash_password("pw", rounds=4)))
+    boss = _staff("Boss", RANK_ADMIN)
+    host = _mfa_command_host(tmp_path)
+    process_commands(host, boss, "mfa remove Bea")  # type: ignore[arg-type]
+    assert host.sent == ["Bea has no MFA.\n"]
+
+
+def test_mfa_remove_unknown_player(tmp_path: Path) -> None:
+    """An unknown name is reported before rank or secret checks."""
+    save_player(tmp_path, SavedPlayer("Boss", RANK_ADMIN, hash_password("pw", rounds=4)))
+    boss = _staff("Boss", RANK_ADMIN)
+    host = _mfa_command_host(tmp_path)
+    process_commands(host, boss, "mfa remove Bea")  # type: ignore[arg-type]
+    assert host.sent == ["Player Bea not found.\n"]
+
+
+def test_mfa_command_missing_when_disabled(tmp_path: Path) -> None:
+    """Without the host flag, mfa is not a command."""
+    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
+    bea = _staff("Bea", RANK_RESIDENT)
+    host = _login_host(tmp_path)
+    _register_mfa_command()
+    process_commands(host, bea, "mfa")  # type: ignore[arg-type]
+    assert host.sent == ["No such command 'mfa'\n"]
 
 
 def test_a_newbie_name_enters_at_once(tmp_path: Path) -> None:
@@ -2302,7 +2808,7 @@ def test_a_newbie_name_enters_at_once(tmp_path: Path) -> None:
 
 
 def test_the_admin_name_sets_and_confirms_a_password(tmp_path: Path) -> None:
-    """The admin name with no file asks twice, saves rank admin, then enters."""
+    """The admin name with no file asks twice, saves rank super admin, then enters."""
     host = _login_host(tmp_path, opened=False)
     player = _Player(player=None)
     process_input(host, player, "admin")  # type: ignore[arg-type]
@@ -2312,11 +2818,11 @@ def test_the_admin_name_sets_and_confirms_a_password(tmp_path: Path) -> None:
     assert player.player is None
     process_input(host, player, "secret")  # type: ignore[arg-type]
     assert player.player is not None
-    assert player.player.rank == "admin"
+    assert player.player.rank == "super_admin"
     assert host.sent[-1] == "What? > "
     saved = load_saved(player_path(tmp_path, "admin"))
     assert saved is not None
-    assert saved.rank == "admin"
+    assert saved.rank == "super_admin"
     assert password_ok("secret", saved.password_hash)
     assert saved.colour is True
     assert "colour" not in player_path(tmp_path, "admin").read_text(encoding="utf-8")
@@ -3224,7 +3730,7 @@ def test_the_config_admin_can_nuke_another_admin(tmp_path: Path) -> None:
     """The account named in the config may nuke another admin."""
     _save(tmp_path, "Bea", RANK_ADMIN)
     host = _login_host(tmp_path)
-    boss = _staff("admin", RANK_ADMIN)
+    boss = _staff("admin", RANK_SUPER_ADMIN)
     host.people = [boss]
     process_commands(host, boss, "nuke Bea spam")  # type: ignore[arg-type]
     assert load_saved(player_path(tmp_path, "Bea")) is None
@@ -3246,7 +3752,7 @@ def test_the_config_admin_can_disconnect_another_admin(tmp_path: Path) -> None:
     """The account named in the config may disconnect another admin."""
     host = _login_host(tmp_path)
     bea = _staff("Bea", RANK_ADMIN)
-    boss = _staff("admin", RANK_ADMIN)
+    boss = _staff("admin", RANK_SUPER_ADMIN)
     host.people = [bea, boss]
     process_commands(host, boss, "disconnect Bea spam")  # type: ignore[arg-type]
     assert host.sent == ["You have been disconnected.\n"]
@@ -3294,9 +3800,25 @@ def test_a_resident_cannot_disconnect(tmp_path: Path) -> None:
     assert "disconnect" in command_words(RANK_ADMIN).split()
 
 
+def test_a_promoted_admin_cannot_nuke_another_admin(tmp_path: Path) -> None:
+    """Same rank is refused, and the super admin can nuke a promoted admin."""
+    _save(tmp_path, "Bea", RANK_ADMIN)
+    host = _login_host(tmp_path)
+    boss = _staff("Boss", RANK_ADMIN)
+    host.people = [boss]
+    process_commands(host, boss, "nuke Bea spam")  # type: ignore[arg-type]
+    assert host.sent == ["You cannot nuke Bea.\n"]
+    assert load_saved(player_path(tmp_path, "Bea")) is not None
+    host.sent.clear()
+    chief = _staff("admin", RANK_SUPER_ADMIN)
+    host.people.append(chief)
+    process_commands(host, chief, "nuke Bea spam")  # type: ignore[arg-type]
+    assert load_saved(player_path(tmp_path, "Bea")) is None
+
+
 def test_nuke_refusals(tmp_path: Path) -> None:
     """Unknown names and the admin are refused, and the admin file stays."""
-    _save(tmp_path, "admin", RANK_ADMIN)
+    _save(tmp_path, "admin", RANK_SUPER_ADMIN)
     host = _login_host(tmp_path)
     ada = _staff("Ada", "super")
     process_commands(host, ada, "nuke Bea spam")  # type: ignore[arg-type]
@@ -3304,13 +3826,50 @@ def test_nuke_refusals(tmp_path: Path) -> None:
     process_commands(host, ada, "nuke ADMIN spam")  # type: ignore[arg-type]
     assert host.sent == [
         "Player Bea not found.\n",
-        "The admin cannot be removed.\n",
-        "The admin cannot be removed.\n",
+        "You cannot nuke admin.\n",
+        "You cannot nuke admin.\n",
     ]
     assert load_saved(player_path(tmp_path, "admin")) is not None
     assert host.staff_lines == []
     process_commands(host, ada, "nuke Bea")  # type: ignore[arg-type]
     assert host.sent[-1] == "Syntax: nuke <name> <reason>\n"
+
+
+def test_promote_refuses_a_logged_off_player(tmp_path: Path) -> None:
+    """Promote runs only when that player is in a room."""
+    _save(tmp_path, "Bea", RANK_RESIDENT)
+    host = _login_host(tmp_path)
+    ada = _staff("Ada", RANK_ADMIN)
+    host.people = [ada]
+    process_commands(host, ada, "promote Bea")  # type: ignore[arg-type]
+    assert host.sent == ["Bea is not connected.\n"]
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.rank == "resident"
+
+
+def test_promote_refuses_a_connected_player_with_no_mfa(tmp_path: Path) -> None:
+    """A resident in the room still needs a secret when MFA is on."""
+    _save(tmp_path, "Bea", RANK_RESIDENT)
+    host = _login_host(tmp_path)
+    host._mfa_enabled = True
+    bea = _staff("Bea", RANK_RESIDENT)
+    ada = _staff("Ada", RANK_ADMIN)
+    host.people = [bea, ada]
+    process_commands(host, ada, "promote Bea")  # type: ignore[arg-type]
+    assert host.sent == ["Bea must turn on MFA first.\n"]
+
+
+def test_demote_a_logged_off_super_user_still_writes_resident(tmp_path: Path) -> None:
+    """Demote still rewrites the file when the target is not in a room."""
+    _save(tmp_path, "Bea", RANK_SUPER)
+    host = _login_host(tmp_path)
+    ada = _staff("Ada", RANK_ADMIN)
+    host.people = [ada]
+    process_commands(host, ada, "demote Bea")  # type: ignore[arg-type]
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.rank == "resident"
 
 
 def test_promote_makes_a_resident_a_super_user(tmp_path: Path) -> None:
@@ -3337,7 +3896,7 @@ def test_promote_makes_a_super_user_an_admin(tmp_path: Path) -> None:
     _save(tmp_path, "Bea", RANK_SUPER)
     bea = _staff("Bea", RANK_SUPER)
     sue = _staff("Sue", RANK_SUPER)
-    boss = _staff("admin", RANK_ADMIN)
+    boss = _staff("admin", RANK_SUPER_ADMIN)
     host = _login_host(tmp_path)
     host.people = [bea, sue, boss]
     process_commands(host, boss, "promote Bea")  # type: ignore[arg-type]
@@ -3380,7 +3939,7 @@ def test_promote_refusals(tmp_path: Path) -> None:
         ("promote Zed", "Player Zed not found.\n"),
         ("promote Dee", "Dee is not a resident.\n"),
         ("promote Cyd", "Cyd is already an admin.\n"),
-        ("promote admin", "admin is the admin.\n"),
+        ("promote admin", "admin is the super admin.\n"),
     ):
         host.sent.clear()
         process_commands(host, boss, line)  # type: ignore[arg-type]
@@ -3413,7 +3972,7 @@ def test_demote_makes_an_admin_a_super_user(tmp_path: Path) -> None:
     _save(tmp_path, "Bea", RANK_ADMIN)
     bea = _staff("Bea", RANK_ADMIN)
     sue = _staff("Sue", RANK_SUPER)
-    boss = _staff("admin", RANK_ADMIN)
+    boss = _staff("admin", RANK_SUPER_ADMIN)
     host = _login_host(tmp_path)
     host.people = [bea, sue, boss]
     process_commands(host, boss, "demote Bea")  # type: ignore[arg-type]
@@ -3453,7 +4012,7 @@ def test_demote_force_from_admin_tells_both_channels(tmp_path: Path) -> None:
     _save(tmp_path, "Bea", RANK_ADMIN)
     bea = _staff("Bea", RANK_ADMIN)
     sue = _staff("Sue", RANK_SUPER)
-    boss = _staff("admin", RANK_ADMIN)
+    boss = _staff("admin", RANK_SUPER_ADMIN)
     host = _login_host(tmp_path)
     host.people = [bea, sue, boss]
     process_commands(host, boss, "demote Bea FORCE")  # type: ignore[arg-type]
@@ -3496,8 +4055,8 @@ def test_demote_refusals(tmp_path: Path) -> None:
         ("demote Zed", "Player Zed not found.\n"),
         ("demote Cyd", "Cyd is a resident.\n"),
         ("demote Dee", "Dee cannot be demoted.\n"),
-        ("demote admin", "The admin cannot be demoted.\n"),
-        ("demote admin force", "The admin cannot be demoted.\n"),
+        ("demote admin", "The super admin cannot be demoted.\n"),
+        ("demote admin force", "The super admin cannot be demoted.\n"),
         ("demote force Bea", "Syntax: demote <name>|demote <name> force\n"),
         ("demote Bea force extra", "Syntax: demote <name>|demote <name> force\n"),
     ):
@@ -3507,7 +4066,21 @@ def test_demote_refusals(tmp_path: Path) -> None:
     assert host.staff_lines == []
     loaded = load_saved(player_path(tmp_path, "admin"))
     assert loaded is not None
-    assert loaded.rank == "admin"
+    assert loaded.rank == "super_admin"
+
+
+def test_an_old_admin_file_for_the_config_account_becomes_super_admin(tmp_path: Path) -> None:
+    """The config account stored as admin is rewritten when the file is loaded."""
+    from lupaxa.chat_server.utilities import _find_saved
+
+    _save(tmp_path, "admin", RANK_ADMIN)
+    host = _login_host(tmp_path)
+    found = _find_saved(host, "admin")  # type: ignore[arg-type]
+    assert found is not None
+    assert found.rank == "super_admin"
+    saved = load_saved(player_path(tmp_path, "admin"))
+    assert saved is not None
+    assert saved.rank == "super_admin"
 
 
 def test_finger_shows_when_they_logged_out(tmp_path: Path) -> None:
@@ -3899,6 +4472,18 @@ def test_lsu_with_nobody_to_list(tmp_path: Path) -> None:
     host.people = [_staff("Bea", RANK_RESIDENT)]
     process_commands(host, ada, "lsu")  # type: ignore[arg-type]
     assert host.sent == [" -=> There are no staff members connected currently.\n"]
+
+
+def test_lsu_lists_a_connected_super_admin(tmp_path: Path) -> None:
+    """The config super admin appears on the staff list with the Super Admin label."""
+    host = _login_host(tmp_path)
+    ada = _staff("Ada", RANK_SUPER)
+    boss = _staff("admin", RANK_SUPER_ADMIN)
+    host.people = [boss, ada]
+    process_commands(host, ada, "lsu")  # type: ignore[arg-type]
+    text = host.sent[0]
+    assert "[ Super Admin ]" in text
+    assert "admin" in text
 
 
 def test_lsn_lists_connected_newbies(tmp_path: Path) -> None:

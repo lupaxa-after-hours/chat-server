@@ -30,6 +30,8 @@ class Host(Protocol):
     _shutdown_reason: str
     _allow_newbies: bool
     _allow_residents: bool
+    _mfa_enabled: bool
+    _mfa_steps: dict[str, int]
     _timer_mark: float | None
     _timer_remainder: float
 
@@ -126,10 +128,14 @@ def _shown_name(command: Command, colour: bool) -> str:
     return command.name
 
 
-def command_words(rank: str, colour: bool = False) -> str:
+def command_words(rank: str, colour: bool = False, *, mfa_enabled: bool = False) -> str:
     """Return punctuation aliases first, then letter names this rank may use."""
     ensure_commands()
-    visible = [command for command in COMMANDS if rank_allows(rank, command.rank)]
+    visible = [
+        command
+        for command in COMMANDS
+        if rank_allows(rank, command.rank) and (mfa_enabled or command.name != "mfa")
+    ]
     marks = sorted(
         (command for command in visible if command.is_alias and not command.name.isalpha()),
         key=lambda command: command.name,

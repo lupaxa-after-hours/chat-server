@@ -47,6 +47,7 @@ def _server(
         host="127.0.0.1",
         ssh_port=ssh_port,
         ssh_host_key=tmp_path / "ssh_host_key",
+        mfa_enabled=False,
     )
     return ChatServer(config, _layout(tmp_path), HelpBook(entries=()))
 

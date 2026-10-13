@@ -72,6 +72,7 @@ alias such as `help '`. A missing topic replies `help for <topic> not found`.
 | `join`        |                   | Newbie     | Move to that player's room                  |
 | `main`        |                   | Newbie     | Move to the start room                      |
 | `map`         |                   | Newbie     | 5 by 5 map when it fits, else 3 by 3        |
+| `mfa`         |                   | Resident   | Set up or remove MFA                        |
 | `look`        |                   | Newbie     | Description, exits, and who else here       |
 | `password`    |                   | Newbie     | Replace your saved password                 |
 | `who`         | `w`               | Newbie     | Names, ranks, rooms, status, and idle       |
@@ -121,25 +122,34 @@ with a blank line above and below. When colour is on the line is cyan, and
 the terminal beeps once. `allow newbies|residents on|off` opens or closes
 logins for that rank until the server stops. Resident off blocks rank
 resident only; super users and the admin still connect. It does not change
-`allow_newbies` or `allow_residents` in the config file.
+`allow_newbies`, `allow_residents`, or `mfa_enabled` in the config file.
+
+MFA is on unless `mfa_enabled` is false in the config file, where omitted means true.
+When it is on, login asks for `Code:` after a good password when a secret is stored.
+Super users and admins must have MFA; login runs setup when they have no secret yet.
+When MFA is off, login never asks for a code and `mfa` replies `No such command 'mfa'`.
+Residents use `mfa setup` and `mfa remove`. Staff may run `mfa remove <name>` on a lower
+rank. The account named in the config is the Super Admin. If they lose their phone, clear
+`mfa_secret` in their player file by hand.
 
 `resident`, `warn`, `nuke`, `disconnect`, `promote`, and `demote` refuse your own
-name with `You cannot do that to yourself.` `nuke` and `disconnect` also
-refuse someone of your rank or higher, unless you are the account named in
-the config. A successful `resident` adds
+name with `You cannot do that to yourself.` `nuke` and `disconnect` also refuse someone of your rank or higher.
+A successful `resident` adds
 `< SU > <name> makes <name> a resident.` to the staff channel and tells the
 super user who asked that the player `is now a resident`.
 
 `promote <name>` moves a resident to super user or a super user to admin.
-Any admin may promote to super user. Only the account named in the config
+The target must be in a room. Logged off replies `Bea is not connected.`
+With MFA on, no secret replies `Bea must turn on MFA first.`
+Any admin may promote to super user. Only the Super Admin named in the config
 may promote to admin. Staff hear `< SU > Ada promotes Bea to Super User.`
 Admins hear `[ Admin ] Ada promotes Bea to Admin.` `demote <name>` moves an
 admin to super user or a super user to resident. Any admin may demote a
-super user. Only the config account may demote an admin. Admins hear
+super user. Only the Super Admin may demote an admin. Admins hear
 `[ Admin ] Ada demotes Bea from Admin.` Staff hear
 `< SU > Ada demotes Bea from Super User.` `demote <name> force` drops an
 admin or super user straight to resident; from admin the force line is sent
-on both channels. The account named in the config cannot be demoted.
+on both channels. The super admin cannot be demoted.
 
 When a named player joins or leaves, that room sees
 `[<name> has connected]` or `[<name> has disconnected]`.

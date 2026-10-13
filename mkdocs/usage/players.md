@@ -6,7 +6,7 @@ the commands that were already in the game, except `shout`, `!`, and
 rank, including a newbie. A newbie cannot use `prompt`, `save`, `retire`,
 `resident`, `warn`, `nuke`,
 `disconnect`, `su`, `se`, `st`, `au`, `ae`, `at`, `lsn`, `connections`, `promote`, `demote`,
-`allow`, or `shutdown`.
+`allow`, `shutdown`, or `mfa`.
 
 A saved name asks for a password. A wrong password is answered with
 `Wrong password.` and asked again. The third wrong password disconnects.
@@ -15,18 +15,24 @@ password. A saved player is asked for the current password, then the new
 one, twice. A saved name must be typed in the spelling it was saved with.
 Any other case is told how the name is saved and asked for again.
 
+When `mfa_enabled` is true in the config file, which is the default, a saved player with a
+secret is asked for `Code:` after the password at login. Super users and admins must turn MFA
+on; login walks them through setup when they have no secret yet. When `mfa_enabled` is false,
+login never asks for a code and the in-room `mfa` command does not exist.
+
 A saved player who logs in while that name is already in a room takes
 over that session. The old connection is told it has been reconnected
 from elsewhere. The room hears `[Bea has reconnected]`, not a disconnect
 and a connect. A super user or the admin in that room sees the address
 on that line.
 
-| Rank       | What they can do                                                                     |
-| ---------- | ------------------------------------------------------------------------------------ |
-| Newbie     | Not saved. Game commands except `shout` and `!`. No `prompt` or super-user commands. |
-| Resident   | Saved, with a password. May `shout`, `prompt`, `save`, `retire`, and `lsu`.          |
-| Super User | `resident`, `warn`, `nuke`, `disconnect`, `su`, `se`, `st`, `lsn`, `connections`.    |
-| Admin      | Also `allow`, `shutdown`, `promote`, `demote`, `au`, `ae`, and `at`.                 |
+| Rank        | What they can do                                                                    |
+| ----------- | ----------------------------------------------------------------------------------- |
+| Newbie      | Not saved. Game commands except `shout` and `!`. No `prompt` or super-user commands.|
+| Resident    | Saved, with a password. May `shout`, `prompt`, `save`, `retire`, and `lsu`.         |
+| Super User  | `resident`, `warn`, `nuke`, `disconnect`, `su`, `se`, `st`, `lsn`, `connections`.   |
+| Admin       | Also `allow`, `shutdown`, `promote`, `demote`, `au`, `ae`, and `at`.                |
+| Super Admin | The config account only. Outranks every other rank.                                 |
 
 The `players/` directory is one file per person, named by the lowercase
 name, such as `players/bea.yml`. Each file holds the saved spelling of the
@@ -37,10 +43,13 @@ the logout time and the total. The file is also written every five minutes
 while they are here, and a resident may run `save` to write it at once. The
 password is never stored as typed.
 
-The first time the admin name is typed, it has to come from localhost, and
-no other name can log in until that password is saved. The server asks for
-a password twice, saves the admin, and lets them in. After that, the admin
-can connect from any address. A super user or the admin runs
+The first time the name from the config is typed, it has to come from localhost, and
+no other name can log in until the Super Admin is saved. The server asks for a password
+twice. With `mfa_enabled` true (the default), enrolment follows; the file is written only
+after the login code matches, then they are let in. With MFA off, the two passwords save
+the Super Admin and let them in. After that, the Super Admin
+can connect from any address. Only the config account is created as super admin; promote
+never grants that rank. A super user or an admin runs
 `resident <name>` on a connected newbie, who is then asked for a password
 twice and is saved as a resident. The staff
 channel sees `< SU > <name> makes <name> a resident.` The super user who
@@ -49,22 +58,22 @@ sends a line with a blank line above and below. When colour is on the line is cy
 the terminal beeps once. `nuke <name> <reason>` deletes a saved player and
 disconnects them if they are here. A saved player may `retire` to delete
 their own file after confirmation and the password. The admin cannot
-retire. Only an admin runs `promote <name>` and `demote <name>`. Any admin
-may move someone to or from super user. Only the account named in the config
-may promote to admin or demote from admin. A player promoted to admin may
-use the admin commands, including `au`, `ae`, and `at`, and may be demoted
-again by that account. The account named in the config cannot be demoted.
+retire. Only an admin runs `promote <name>` and `demote <name>`. The target must be in a
+room; logged off replies `Bea is not connected.` With MFA on, no secret replies
+`Bea must turn on MFA first.` Any admin may move someone to or from super user. Only the
+Super Admin named in the config may promote to admin or demote from admin. A player promoted
+to admin may use the admin commands, including `au`, `ae`, and `at`, and may be demoted
+again by the Super Admin. The super admin cannot be demoted.
 An admin also runs
 `allow newbies|residents on|off`, to open or close logins until the server
 stops. Resident off blocks rank resident only; super users and the admin
-still connect. That command does not rewrite `allow_newbies` or
-`allow_residents` in the config file. Those two settings in the config file
-decide whether newbies and residents may connect when the server starts.
+still connect. That command does not rewrite `allow_newbies`, `allow_residents`, or
+`mfa_enabled` in the config file. Those settings in the config file decide whether newbies
+and residents may connect when the server starts and whether MFA is enforced.
 
 `resident`, `warn`, `nuke`, `disconnect`, `promote`, and `demote` refuse your own
-name with `You cannot do that to yourself.` `nuke` and `disconnect` also
-refuse someone of your rank or higher, unless you are the account named in
-the config. `tell` and `remote` refuse your
+name with `You cannot do that to yourself.` `nuke` and `disconnect` also refuse someone of your rank or higher.
+`tell` and `remote` refuse your
 own name with `Talking to yourself is the first sign of madness.`
 
 `examine <name>` is open to everyone. Someone in a room is shown with

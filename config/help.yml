@@ -48,6 +48,24 @@
   aliases: []
   text: |
     Show a map with your room in the centre. The map is 5 by 5 when that drawing fits your frame width, and 3 by 3 when it does not. One blank line appears above the map and one below it. Every room inside that window is shown. Your room is green when colour is on. A line is drawn where two shown rooms connect.
+- name: mfa
+  aliases: []
+  text: |
+    Set up or remove a time-based login code.
+    Bare mfa replies Syntax: mfa setup|mfa remove|mfa remove <name>.
+    mfa setup when a secret exists is MFA is already on.
+    mfa setup asks Current password:, shows the base32 secret, then Code:.
+    Nothing is stored until the code matches.
+    Self-remove asks Current password: then Code:. A missed password is Wrong password.
+    Staff who remove their own MFA stay in the room and see Your MFA has been removed. Set it up
+    again before you log out. The next login will make you set it up before you can enter.
+    A resident sees Your MFA has been removed.
+    mfa remove <name> asks Are you sure you want to remove MFA for Bea?
+    The word yes in any case clears it. Anything else is MFA remove cancelled.
+    Same rank or higher on that command is You cannot remove MFA for Bea.
+    No secret is Bea has no MFA.
+    A forced clear is announced only as [ Admin ] Ada removes MFA for Bea.
+    If the super admin loses their phone, edit their player file and clear mfa_secret by hand.
 - name: main
   aliases: []
   text: |
@@ -148,7 +166,6 @@
   aliases: []
   text: |
     Disconnect a player who is in a room. You cannot disconnect someone of your rank or higher.
-    The account named in the config may.
     They are told they have been disconnected, the room sees the usual disconnect, and the reason goes to the staff channel.
     Naming yourself replies You cannot do that to yourself.
 - name: quit
@@ -171,8 +188,7 @@
   aliases: []
   text: |
     Delete a saved player and disconnect them if they are here.
-    You cannot nuke someone of your rank or higher.
-    The account named in the config may. The admin cannot be removed.
+    Same rank or higher replies You cannot nuke {name}.
     Naming yourself replies You cannot do that to yourself.
 - name: password
   aliases: []
@@ -215,7 +231,7 @@
     Staff hear < SU > Ada promotes Bea to Super User.
     Admins hear [ Admin ] Ada promotes Bea to Admin.
     Someone who is already an admin gets Bea is already an admin.
-    The config account gets Bea is the admin.
+    The config account gets Bea is the super admin.
     A promoted admin gets Only the admin can promote Bea to Admin.
     Naming yourself replies You cannot do that to yourself.
 - name: demote
@@ -229,7 +245,7 @@
     Staff hear < SU > Ada demotes Bea from Super User.
     Force from admin sends Ada demotes Bea from Admin. on both channels.
     A resident gets Bea is a resident.
-    The config account gets The admin cannot be demoted.
+    The config account gets The super admin cannot be demoted.
     A promoted admin gets Only the admin can demote Bea from Admin.
     Naming yourself replies You cannot do that to yourself.
 - name: retire

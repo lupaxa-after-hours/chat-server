@@ -115,6 +115,7 @@ def _config(
         help=Path("help.yml"),
         players=players if players is not None else Path("players"),
         admin=admin,
+        mfa_enabled=False,
     )
 
 
@@ -154,6 +155,7 @@ def test_server_copies_allow_flags(tmp_path: Path) -> None:
         players=tmp_path,
         allow_newbies=False,
         allow_residents=True,
+        mfa_enabled=False,
     )
     server = ChatServer(config, _layout(tmp_path), HelpBook(entries=()))
     assert server._allow_newbies is False
@@ -637,7 +639,7 @@ def test_admin_sets_a_password_then_logs_in(tmp_path: Path) -> None:
     assert not thread.is_alive()
     saved = load_saved(player_path(players, "admin"))
     assert saved is not None
-    assert saved.rank == "admin"
+    assert saved.rank == "super_admin"
     assert saved.logged_out_at is not None
 
 
@@ -1612,6 +1614,7 @@ def _closed_server(
         admin="admin",
         allow_newbies=allow_newbies,
         allow_residents=allow_residents,
+        mfa_enabled=False,
     )
     server = ChatServer(config, _layout(tmp_path), HelpBook(entries=()))
     opened: list[socket.socket] = []

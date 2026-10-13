@@ -15,13 +15,14 @@ from pathlib import Path
 
 from .channel import announce_reconnect, broadcast_room_split
 from .client import Client
-from .commands_list import ensure_commands
+from .commands_list import COMMANDS, ensure_commands
 from .config import Config
 from .defaults import MAX_LINE_CHARS, MAX_OUTGOING_BYTES
 from .entry import _remember_address
 from .exceptions import ConfigError, ServerError
 from .help import HelpBook
 from .login import name_prompt, process_input, welcome_text
+from .mfa import register_mfa
 from .rooms import Layout
 from .saved_player import RANK_NEWBIE, record_saved_logout
 from .ssh import SSHListener, load_or_create_host_key
@@ -32,7 +33,20 @@ from .version import get_version
 _SELECT_TIMEOUT_SECONDS = 0.2
 _MAX_BUFFER_BYTES = MAX_LINE_CHARS * 4
 _HIDE_AUTH = frozenset(
-    {"password", "set", "confirm", "current", "renew", "renew_confirm", "retire_password"}
+    {
+        "password",
+        "set",
+        "confirm",
+        "code",
+        "mfa_enroll",
+        "mfa_pw",
+        "mfa_remove_pw",
+        "mfa_remove_code",
+        "current",
+        "renew",
+        "renew_confirm",
+        "retire_password",
+    }
 )
 
 
@@ -165,6 +179,10 @@ class ChatServer:
         self._shutdown_reason = ""
         self._allow_newbies = config.allow_newbies
         self._allow_residents = config.allow_residents
+        self._mfa_enabled = config.mfa_enabled
+        self._mfa_steps: dict[str, int] = {}
+        if self._mfa_enabled:
+            register_mfa(COMMANDS)
 
     def start(self) -> None:
         """Bind the configured listeners and print the startup lines."""
@@ -492,6 +510,10 @@ class ChatServer:
             "current",
             "renew",
             "renew_confirm",
+            "code",
+            "mfa_enroll",
+            "mfa_pw",
+            "mfa_remove_pw",
         ) or (client.player is None and client.auth == "password"):
             line = decoded.strip("\r")
             if len(line) > MAX_LINE_CHARS:

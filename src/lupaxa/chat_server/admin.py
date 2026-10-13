@@ -14,15 +14,16 @@ from .saved_player import (
     RANK_ADMIN,
     RANK_RESIDENT,
     RANK_SUPER,
+    RANK_SUPER_ADMIN,
     SavedPlayer,
     rank_label,
     save_player,
 )
 from .timer import shutdown_phrase
 from .utilities import (
-    _is_admin,
     _lookup,
     _name_of,
+    _rank_of,
     center_block,
     frame_width,
     refuses_self,
@@ -106,12 +107,19 @@ def command_promote(host: Host, client: Client, command: Command, text: str | No
     name = (text or "").strip()
     if refuses_self(host, client, name):
         return
-    if _is_admin(host, name):
-        host.send(client, f"{name} is the admin.\n")
-        return
     found, saved = _lookup(host, client, name)
     if not found:
         return
+    if saved is not None and saved.rank == RANK_SUPER_ADMIN:
+        host.send(client, f"{saved.name} is the super admin.\n")
+        return
+    if saved is not None and saved.rank in (RANK_RESIDENT, RANK_SUPER):
+        if player_named(host._clients.values(), saved.name) is None:
+            host.send(client, f"{saved.name} is not connected.\n")
+            return
+        if host._mfa_enabled and saved.mfa_secret is None:
+            host.send(client, f"{saved.name} must turn on MFA first.\n")
+            return
     if saved is None:
         refusal = (
             f"Player {name} not found.\n"
@@ -121,7 +129,7 @@ def command_promote(host: Host, client: Client, command: Command, text: str | No
         host.send(client, refusal)
         return
     if saved.rank == RANK_SUPER:
-        if not _is_admin(host, _name_of(client)):
+        if _rank_of(client) != RANK_SUPER_ADMIN:
             host.send(
                 client,
                 f"Only the admin can promote {saved.name} to {rank_label(RANK_ADMIN)}.\n",
@@ -159,11 +167,11 @@ def command_demote(host: Host, client: Client, command: Command, text: str | Non
     name, force = parsed
     if refuses_self(host, client, name):
         return
-    if _is_admin(host, name):
-        host.send(client, "The admin cannot be demoted.\n")
-        return
     found, saved = _lookup(host, client, name)
     if not found:
+        return
+    if saved is not None and saved.rank == RANK_SUPER_ADMIN:
+        host.send(client, "The super admin cannot be demoted.\n")
         return
     connected = player_named(host._clients.values(), name)
     if saved is None and connected is None:
@@ -176,7 +184,7 @@ def command_demote(host: Host, client: Client, command: Command, text: str | Non
         shown = connected.player.name if connected is not None and connected.player else name
         host.send(client, f"{shown} cannot be demoted.\n")
         return
-    if saved.rank == RANK_ADMIN and not _is_admin(host, _name_of(client)):
+    if saved.rank == RANK_ADMIN and _rank_of(client) != RANK_SUPER_ADMIN:
         host.send(
             client,
             f"Only the admin can demote {saved.name} from {rank_label(RANK_ADMIN)}.\n",

@@ -35,3 +35,7 @@ allow_newbies: true
 
 # When false, residents cannot enter while the server is running.
 allow_residents: true
+
+# When false, login never asks for a code and mfa is not a command.
+# Omit or true requires a code for super users and admins.
+mfa_enabled: true

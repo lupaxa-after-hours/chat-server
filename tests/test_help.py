@@ -210,6 +210,7 @@ def test_shipped_help_covers_every_command() -> None:
         "lsu",
         "main",
         "map",
+        "mfa",
         "nuke",
         "password",
         "promote",
@@ -288,7 +289,8 @@ def test_help_quotes_promote_demote_and_the_admin_channel() -> None:
     assert "from Super User" in demote.text
     assert "from Admin" in demote.text
     assert "force" in demote.text
-    assert "The admin cannot be demoted." in demote.text
+    assert "The super admin cannot be demoted." in demote.text
+    assert "Bea is the super admin." in promote.text
     assert "[ Admin ]" in au.text
     assert book.find("ae") is not None
     assert book.find("at") is not None
@@ -335,3 +337,15 @@ def test_help_covers_main_and_connections() -> None:
     assert "<pending>" in listed.text
     assert "telnet or ssh" in listed.text
     assert "including during the password" in listed.text
+
+
+def test_help_mfa_quotes_setup_removal_and_staff_warning() -> None:
+    """Help for mfa quotes syntax, prompts, and removal lines."""
+    book = load_help(Path("config/help.yml"))
+    mfa = book.find("mfa")
+    assert mfa is not None
+    assert "mfa setup" in mfa.text
+    assert "Current password:" in mfa.text
+    assert "Code:" in mfa.text
+    assert "Are you sure you want to remove MFA for Bea?" in mfa.text
+    assert "MFA remove cancelled." in mfa.text

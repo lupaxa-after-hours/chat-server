@@ -30,6 +30,7 @@ from .saved_player import (
     RANK_ADMIN,
     RANK_RESIDENT,
     RANK_SUPER,
+    RANK_SUPER_ADMIN,
     SavedPlayer,
     rank_allows,
     save_player,
@@ -89,7 +90,7 @@ def command_help(host: Host, client: Client, command: Command, text: str | None)
     del command
     topic = (text or "").strip()
     rank = _rank_of(client)
-    book = _visible_help(host._help, rank)
+    book = _visible_help(host._help, rank, mfa_enabled=host._mfa_enabled)
     if topic == "":
         host.send(client, format_index(book))
         return
@@ -109,7 +110,11 @@ def command_version(host: Host, client: Client, command: Command, text: str | No
 def command_commands(host: Host, client: Client, command: Command, text: str | None) -> None:
     """Reply with punctuation aliases, then letter names."""
     del command, text
-    words = command_words(_rank_of(client), colour=_colour_of(client)).split()
+    words = command_words(
+        _rank_of(client),
+        colour=_colour_of(client),
+        mfa_enabled=host._mfa_enabled,
+    ).split()
     wrapped = wrap_words(
         words,
         frame_width(client.discovered_columns, client.frame_columns),
@@ -660,7 +665,7 @@ def command_lsu(host: Host, client: Client, command: Command, text: str | None) 
         target = player_named(host._clients.values(), name)
         if target is None or target.player is None or target.room is None:
             continue
-        if target.player.rank not in (RANK_SUPER, RANK_ADMIN):
+        if target.player.rank not in (RANK_SUPER, RANK_ADMIN, RANK_SUPER_ADMIN):
             continue
         rows.append(
             (
@@ -684,14 +689,18 @@ def command_lsu(host: Host, client: Client, command: Command, text: str | None) 
     )
 
 
-def _visible_help(book: HelpBook, rank: str) -> HelpBook:
+def _visible_help(book: HelpBook, rank: str, *, mfa_enabled: bool) -> HelpBook:
     """Return the help entries ``rank`` may see."""
-    entries = tuple(entry for entry in book.entries if _help_entry_visible(entry, rank))
+    entries = tuple(
+        entry for entry in book.entries if _help_entry_visible(entry, rank, mfa_enabled)
+    )
     return HelpBook(entries=entries)
 
 
-def _help_entry_visible(entry: HelpEntry, rank: str) -> bool:
+def _help_entry_visible(entry: HelpEntry, rank: str, mfa_enabled: bool) -> bool:
     """Return whether ``rank`` may see ``entry``."""
+    if entry.name == "mfa" and not mfa_enabled:
+        return False
     tokens = (entry.name, *entry.aliases)
     commands = tuple(by_name()[token] for token in tokens if token in by_name())
     if not commands:
