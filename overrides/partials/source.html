@@ -1,0 +1,31 @@
+{#-
+  Repository link for the header.
+
+  Visible label resolution:
+  1. extra.repo_display_name, if set
+  2. else the segment after the last "/" in repo_name (org/repo → repo)
+  3. else repo_name as-is
+-#}
+{% if config.extra.repo_display_name %}
+  {% set repo_label = config.extra.repo_display_name %}
+{% elif config.repo_name and "/" in config.repo_name %}
+  {% set repo_label = config.repo_name.split("/")[-1] %}
+{% else %}
+  {% set repo_label = config.repo_name %}
+{% endif %}
+<a
+  href="{{ config.repo_url }}"
+  title="{{ lang.t('source') }}"
+  class="md-source"
+  data-md-component="source"
+  target="_blank"
+  rel="noopener"
+>
+  <div class="md-source__icon md-icon">
+    {% set icon = config.theme.icon.repo or "fontawesome/brands/git-alt" %}
+    {% include ".icons/" ~ icon ~ ".svg" %}
+  </div>
+  <div class="md-source__repository">
+    {{ repo_label }}
+  </div>
+</a>

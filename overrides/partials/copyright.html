@@ -1,0 +1,12 @@
+<div class="md-copyright notranslate" translate="no">
+  <div class="md-copyright__highlight">
+    <span class="footer-copyright"
+      >©
+      <strong translate="no">{{ config.extra.footer_name or config.site_name }}</strong>. All
+      rights reserved.</span
+    >
+    {% for tagline in config.extra.footer_taglines or [] %}
+    <span class="footer-tagline">{{ tagline }}</span>
+    {% endfor %}
+  </div>
+</div>

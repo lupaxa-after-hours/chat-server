@@ -1,0 +1,69 @@
+/* =============================================================================
+ * The Lupaxa Project Portal
+ * Design Tokens
+ * ============================================================================= */
+
+:root {
+  /* Layout */
+
+  --lupaxa-content-width: 60rem;
+  --lupaxa-header-height: 5rem;
+
+  /* Spacing */
+
+  --lupaxa-spacing-xs: 0.25rem;
+  --lupaxa-spacing-sm: 0.5rem;
+  --lupaxa-spacing-md: 1rem;
+  --lupaxa-spacing-lg: 2rem;
+  --lupaxa-spacing-xl: 3rem;
+
+  /* Brand colours */
+
+  --lupaxa-dark-blue: #111a32;
+  --lupaxa-blue: #203959;
+  --lupaxa-light-blue: #6d95d3;
+  --lupaxa-white: #ffffff;
+
+  /* Shape */
+
+  --lupaxa-radius-sm: 0.3rem;
+  --lupaxa-radius-button: 0.35rem;
+  --lupaxa-radius-card: 0.7rem;
+  --lupaxa-radius-pill: 999rem;
+
+  /* Shadows */
+
+  --lupaxa-shadow-card:
+    0 0.1rem 0.3rem rgb(0 0 0 / 4%),
+    0 0.3rem 1rem rgb(0 0 0 / 3%);
+
+  --lupaxa-shadow-card-hover:
+    0 0.2rem 0.6rem rgb(0 0 0 / 7%),
+    0 0.6rem 1.5rem rgb(0 0 0 / 7%);
+
+  --lupaxa-shadow-panel:
+    0 0.1rem 0.3rem rgb(0 0 0 / 4%),
+    0 0.3rem 1rem rgb(0 0 0 / 3%);
+
+  /* Motion */
+
+  --lupaxa-transition-fast: 160ms ease;
+  --lupaxa-transition-medium: 180ms ease;
+}
+
+/*
+ * MkDocs Material defines palette variables on the active colour scheme.
+ * Site is locked to slate; override at the same level so branding wins.
+ */
+
+[data-md-color-scheme="slate"] {
+  --md-primary-bg-color: var(--lupaxa-white);
+  --md-primary-bg-color--light: rgb(255 255 255 / 70%);
+  --md-accent-fg-color: var(--lupaxa-light-blue);
+  --md-accent-fg-color--transparent: color-mix(in srgb, var(--lupaxa-light-blue) 10%, transparent);
+  /* Never use lupaxa-dark-blue for active/link text */
+  --md-primary-fg-color: var(--lupaxa-light-blue);
+  --md-primary-fg-color--light: var(--lupaxa-light-blue);
+  --md-primary-fg-color--dark: var(--lupaxa-blue);
+  --md-typeset-a-color: var(--lupaxa-light-blue);
+}

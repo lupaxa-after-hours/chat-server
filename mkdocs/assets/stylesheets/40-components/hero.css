@@ -1,0 +1,110 @@
+/* =============================================================================
+ * Shared Hero Component (home + 404)
+ * ============================================================================= */
+
+.lupaxa-hero {
+  margin: 0 -1.2rem 1.5rem;
+  padding: 3.5rem 1.5rem 1.5rem;
+  text-align: center;
+  background:
+    radial-gradient(
+      circle at top,
+      color-mix(in srgb, var(--lupaxa-blue) 20%, transparent),
+      transparent 55%
+    ),
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--lupaxa-blue) 8%, transparent),
+      transparent
+    );
+  border-bottom: 1px solid var(--md-default-fg-color--lightest);
+}
+
+.lupaxa-hero-logo,
+.lupaxa-hero > img {
+  display: block;
+  width: min(100%, 256px);
+  height: auto;
+  margin: 0 auto 1.5rem;
+}
+
+.md-typeset .lupaxa-hero-title,
+.lupaxa-hero h1 {
+  margin: 0;
+  color: var(--md-default-fg-color--light);
+  font-size: clamp(1.9rem, 4vw, 3.6rem);
+  font-weight: 500;
+  line-height: 1.05;
+  letter-spacing: -0.035em;
+  text-decoration: none;
+}
+
+.lupaxa-hero-subtitle {
+  max-width: 48rem;
+  margin: 1.2rem auto 0;
+  color: var(--md-default-fg-color--light);
+  font-size: clamp(1rem, 2vw, 1.3rem);
+  line-height: 1.6;
+}
+
+.lupaxa-hero-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+  justify-content: center;
+  max-width: min(100%, 44rem);
+  margin-top: var(--lupaxa-spacing-lg);
+  margin-right: auto;
+  margin-left: auto;
+}
+
+.lupaxa-hero-actions .md-button {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+
+.lupaxa-error-hero {
+  margin: 0 -1.2rem 1.5rem;
+  padding: 3.5rem 1.5rem 2.5rem;
+  text-align: center;
+  background:
+    radial-gradient(
+      circle at top,
+      color-mix(in srgb, var(--lupaxa-blue) 20%, transparent),
+      transparent 55%
+    ),
+    linear-gradient(
+      180deg,
+      color-mix(in srgb, var(--lupaxa-blue) 8%, transparent),
+      transparent
+    );
+}
+
+.lupaxa-error-hero .lupaxa-hero-actions {
+  grid-template-columns: minmax(0, 16rem);
+}
+
+.lupaxa-error-code {
+  margin: 0 0 0.75rem;
+  color: var(--lupaxa-light-blue);
+  font-size: clamp(3.5rem, 10vw, 6rem);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.05em;
+}
+
+[data-md-color-scheme="slate"] .lupaxa-hero,
+[data-md-color-scheme="slate"] .lupaxa-error-hero {
+  background:
+    radial-gradient(
+      circle at top,
+      color-mix(in srgb, var(--lupaxa-blue) 18%, transparent),
+      transparent 58%
+    ),
+    linear-gradient(
+      180deg,
+      rgb(255 255 255 / 2%),
+      transparent
+    );
+}

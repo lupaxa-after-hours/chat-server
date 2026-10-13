@@ -1,0 +1,23 @@
+/* =============================================================================
+ * The Lupaxa Project Portal
+ * Global Layout
+ * ============================================================================= */
+
+.md-main__inner {
+  margin-top: 0;
+}
+
+.md-content {
+  min-width: 0;
+}
+
+.md-content__inner {
+  max-width: var(--lupaxa-content-width);
+  margin: 0 auto;
+  padding-top: 0;
+  padding-bottom: var(--lupaxa-spacing-xl);
+}
+
+.md-content__inner::before {
+  display: none;
+}

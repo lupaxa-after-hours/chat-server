@@ -1,0 +1,53 @@
+name: Publish MkDocs
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - ".github/workflows/publish-mkdocs.yml"
+      - "mkdocs/**"
+      - "mkdocs.yml"
+      - "overrides/**"
+      - "requirements.txt"
+      - "hooks/**"
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+  deployments: write
+  id-token: write
+  pages: write
+
+jobs:
+  publish-mkdocs:
+    name: Publish MkDocs
+    uses: the-lupaxa-project/workflows/.github/workflows/reusable-mkdocs-site-publisher.yml@master
+    secrets: inherit
+    with:
+      python-version: "3.13"
+      cleanup: true
+
+  generate-workflow-summary:
+    name: Generate Workflow Summary
+    needs:
+      - publish-mkdocs
+    if: always()
+    uses: the-lupaxa-project/workflows/.github/workflows/reusable-workflow-summary.yml@master
+
+  generate-workflow-notifications:
+    name: Generate Workflow Notifications
+    needs:
+      - generate-workflow-summary
+    if: always()
+    uses: the-lupaxa-project/workflows/.github/workflows/reusable-workflow-notifier.yml@master
+    with:
+      notify_on_results: "failure,timed_out"
+    secrets:
+      slack_webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}

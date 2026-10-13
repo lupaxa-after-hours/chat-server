@@ -1,0 +1,39 @@
+<!-- LUPAXA-404-TRIMMED-V3 -->
+
+{% extends "main.html" %}
+
+{% block extrahead %}
+  {{ super() }}
+
+  <meta name="robots" content="noindex, nofollow">
+{% endblock %}
+
+{# Remove the primary and secondary navigation sidebars. #}
+{% block site_nav %}
+{% endblock %}
+
+{% block content %}
+  <div class="lupaxa-error-hero">
+    <p class="lupaxa-error-code">
+      404
+    </p>
+
+    <h1 class="lupaxa-hero-title">
+      Page Not Found
+    </h1>
+
+    <p class="lupaxa-hero-subtitle">
+      The page you requested does not exist, may have moved, or the address may
+      be incorrect.
+    </p>
+
+    <p class="lupaxa-hero-actions">
+      <a
+        class="md-button md-button--primary"
+        href="{{ nav.homepage.url | url }}"
+      >
+        Return Home
+      </a>
+    </p>
+  </div>
+{% endblock %}

@@ -1,0 +1,34 @@
+/* =============================================================================
+ * Hide primary (left) site navigation; keep secondary TOC.
+ *
+ * Enabled when mkdocs.yml has:
+ *   extra:
+ *     hide_primary_sidebar: true
+ * ============================================================================= */
+
+.md-sidebar--primary {
+  display: none;
+}
+
+.lupaxa-header__drawer-button {
+  display: none !important;
+}
+
+/* Header carries page links, including on smaller viewports. */
+@media screen and (max-width: 76.234375em) {
+  .lupaxa-header__nav {
+    display: block;
+    min-width: 0;
+    overflow-x: auto;
+  }
+
+  .lupaxa-header__nav-list {
+    gap: 0;
+  }
+
+  .lupaxa-header__nav-link {
+    padding: 0 0.65rem;
+    font-size: 0.9rem;
+    white-space: nowrap;
+  }
+}

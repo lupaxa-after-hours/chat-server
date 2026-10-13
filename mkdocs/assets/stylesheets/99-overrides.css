@@ -1,0 +1,69 @@
+/* =============================================================================
+ * Accessibility and Compatibility Overrides
+ * ============================================================================= */
+
+@media (prefers-reduced-motion: reduce) {
+  .lupaxa-header__nav-link,
+  .md-typeset .grid.cards > ul > li,
+  .md-typeset .grid.cards > li,
+  .md-typeset .md-button {
+    transition: none;
+  }
+}
+
+.md-typeset a:focus-visible,
+.md-typeset .md-button:focus-visible {
+  outline: 0.15rem solid var(--lupaxa-light-blue);
+  outline-offset: 0.15rem;
+}
+
+/* Header compatibility overrides */
+
+.md-header .lupaxa-header__drawer-button,
+.md-header .md-header__button.md-logo.lupaxa-header__logo,
+.md-header .lupaxa-header__tools,
+.md-header .lupaxa-header__tools > .md-header__source,
+.md-header .lupaxa-lang-picker {
+  position: relative;
+  z-index: 50;
+  pointer-events: auto;
+}
+
+.md-header .md-header__button.md-logo.lupaxa-header__logo {
+  width: 4rem !important;
+  height: 4rem !important;
+}
+
+.md-header .md-header__button.md-logo.lupaxa-header__logo img,
+.md-header .md-header__button.md-logo.lupaxa-header__logo svg {
+  width: 4rem !important;
+  height: 4rem !important;
+  max-width: none !important;
+  max-height: none !important;
+}
+
+@media screen and (max-width: 76.234375em) {
+  .md-header .md-header__button.md-logo.lupaxa-header__logo {
+    width: 3.25rem !important;
+    height: 3.25rem !important;
+  }
+
+  .md-header .md-header__button.md-logo.lupaxa-header__logo img,
+  .md-header .md-header__button.md-logo.lupaxa-header__logo svg {
+    width: 3.25rem !important;
+    height: 3.25rem !important;
+  }
+}
+
+@media screen and (max-width: 44.984375em) and (orientation: portrait) {
+  .md-header .lupaxa-header__tools {
+    position: static;
+  }
+
+  .md-header .lupaxa-header__tools > .md-header__source {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+  }
+}

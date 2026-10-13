@@ -1,0 +1,366 @@
+"""Saved players, one bcrypt file each."""
+
+from __future__ import annotations
+
+import os
+import re
+import tempfile
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+from pathlib import Path
+
+import bcrypt
+import yaml
+
+from .defaults import DEFAULT_PASSWORD_ROUNDS
+from .exceptions import ConfigError
+from .player import Player
+
+RANK_NEWBIE = "newbie"
+RANK_RESIDENT = "resident"
+RANK_SUPER = "super"
+RANK_ADMIN = "admin"
+
+_RANK_ORDER = (RANK_NEWBIE, RANK_RESIDENT, RANK_SUPER, RANK_ADMIN)
+_SAVED_RANKS = frozenset({RANK_RESIDENT, RANK_SUPER, RANK_ADMIN})
+_RANK_LABELS = {
+    RANK_RESIDENT: "Resident",
+    RANK_SUPER: "Super User",
+    RANK_ADMIN: "Admin",
+}
+_PLAYER_KEYS = frozenset(
+    {
+        "address",
+        "colour",
+        "connected_seconds",
+        "description",
+        "hostname",
+        "ip_address",
+        "logged_out_at",
+        "lowercase_name",
+        "name",
+        "password",
+        "prompt",
+        "rank",
+    }
+)
+_SAVABLE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9]{2,19}")
+_MAX_PASSWORD_BYTES = 72
+
+
+@dataclass(frozen=True)
+class SavedPlayer:
+    """One player file: spelling, rank, bcrypt hash, and last logout."""
+
+    name: str
+    rank: str
+    password_hash: str
+    logged_out_at: datetime | None = None
+    ip_address: str | None = None
+    hostname: str = ""
+    connected_seconds: int = 0
+    prompt: str | None = None
+    lowercase_name: str = ""
+    colour: bool = True
+    description: str = ""
+
+    def __post_init__(self) -> None:
+        """Fill the key from the display spelling when the caller did not pass one."""
+        if self.lowercase_name == "":
+            object.__setattr__(self, "lowercase_name", self.name.lower())
+        if self.hostname == "" and self.ip_address:
+            object.__setattr__(self, "hostname", self.ip_address)
+
+
+def rank_allows(have: str, need: str) -> bool:
+    """Return whether ``have`` is ``need`` or a higher rank."""
+    try:
+        return _RANK_ORDER.index(have) >= _RANK_ORDER.index(need)
+    except ValueError:
+        return False
+
+
+def rank_label(rank: str) -> str:
+    """Return the label players see for a saved ``rank``.
+
+    Raises
+    ------
+    ConfigError
+        ``rank`` is not ``resident``, ``super``, or ``admin``.
+    """
+    try:
+        return _RANK_LABELS[rank]
+    except KeyError as exc:
+        raise ConfigError(f"Unknown rank {rank}.") from exc
+
+
+def savable_name(name: str) -> bool:
+    """Return whether ``name`` can be stored as a player file.
+
+    Surrounding space is left as given. A savable name is 3 to 20 ASCII letters
+    or digits and cannot start with a digit. It does not contain ``..``.
+    """
+    if name == "" or ".." in name:
+        return False
+    return _SAVABLE_NAME.fullmatch(name) is not None
+
+
+def password_problem(password: str) -> str | None:
+    """Return the sentence for a bad ``password``, or ``None`` when it is usable."""
+    if password == "":
+        return "Password cannot be empty.\n"
+    if len(password.encode("utf-8")) > _MAX_PASSWORD_BYTES:
+        return "Password is too long.\n"
+    return None
+
+
+def hash_password(password: str, *, rounds: int = DEFAULT_PASSWORD_ROUNDS) -> str:
+    """Return a bcrypt hash of ``password``."""
+    hashed = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=rounds))
+    return hashed.decode("ascii")
+
+
+def password_ok(password: str, password_hash: str) -> bool:
+    """Return whether ``password`` matches ``password_hash``."""
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    except ValueError:
+        return False
+
+
+def player_path(directory: Path, name: str) -> Path:
+    """Return the YAML path for ``name`` inside ``directory``."""
+    return directory / f"{name.lower()}.yml"
+
+
+def load_saved(path: Path) -> SavedPlayer | None:
+    """Return the player stored at ``path``, or ``None`` when that file is missing.
+
+    Raises
+    ------
+    ConfigError
+        The file exists and is not a valid player file. The message names ``path``.
+    """
+    if not path.exists():
+        return None
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"Player file {path} is not UTF-8.") from exc
+    except OSError as exc:
+        raise ConfigError(f"Cannot read player file {path}: {exc.strerror}") from exc
+    try:
+        payload = yaml.safe_load(raw_text)
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"Invalid YAML in {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ConfigError(f"Player file {path} must be a YAML mapping.")
+    extra = sorted(str(key) for key in payload if key not in _PLAYER_KEYS)
+    if extra:
+        raise ConfigError(f"Unknown player key in {path}: {', '.join(extra)}")
+    name = _player_name(path, payload.get("name"))
+    lowercase_name = _lowercase_name(path, name, payload.get("lowercase_name"))
+    rank = _player_rank(path, payload.get("rank"))
+    password_hash = _player_hash(path, payload.get("password"))
+    logged_out_at = _logged_out_at(path, payload.get("logged_out_at"))
+    ip_address = _player_address(path, payload.get("ip_address"))
+    if ip_address is None:
+        ip_address = _player_address(path, payload.get("address"))
+    hostname = _player_address(path, payload.get("hostname")) or ""
+    connected_seconds = _connected_seconds(path, payload.get("connected_seconds"))
+    prompt = _player_prompt(path, payload.get("prompt"))
+    colour = _player_colour(path, payload.get("colour"))
+    description = _player_description(path, payload.get("description"))
+    return SavedPlayer(
+        name,
+        rank,
+        password_hash,
+        logged_out_at,
+        ip_address,
+        hostname,
+        connected_seconds,
+        prompt,
+        lowercase_name,
+        colour,
+        description,
+    )
+
+
+def save_player(directory: Path, player: SavedPlayer) -> None:
+    """Write ``player`` as YAML in ``directory``.
+
+    A temporary file in ``directory`` is renamed into place.
+
+    Raises
+    ------
+    ConfigError
+        ``player.name`` cannot be saved, or the rank is not a saved rank.
+    """
+    if not savable_name(player.name):
+        raise ConfigError(f"{player.name} cannot be saved.")
+    if player.rank not in _SAVED_RANKS:
+        raise ConfigError(f"Player file for {player.name} rank must be resident, super, or admin.")
+    if player.lowercase_name != player.name.lower():
+        raise ConfigError(f"{player.name} cannot be saved.")
+    path = player_path(directory, player.lowercase_name)
+    payload: dict[str, str | int | bool] = {
+        "name": player.name,
+        "lowercase_name": player.lowercase_name,
+        "rank": player.rank,
+        "password": player.password_hash,
+    }
+    if player.logged_out_at is not None:
+        payload["logged_out_at"] = player.logged_out_at.isoformat()
+    if player.ip_address is not None:
+        payload["ip_address"] = player.ip_address
+    if player.hostname != "":
+        payload["hostname"] = player.hostname
+    if player.connected_seconds != 0:
+        payload["connected_seconds"] = player.connected_seconds
+    if player.prompt is not None:
+        payload["prompt"] = player.prompt
+    if player.colour is False:
+        payload["colour"] = False
+    if player.description != "":
+        payload["description"] = player.description
+    _replace_file(path, yaml.safe_dump(payload, sort_keys=False, allow_unicode=True))
+
+
+def record_saved_logout(directory: Path, player: Player) -> None:
+    """Write the logout time and the total seconds for a saved player."""
+    if player.rank == RANK_NEWBIE:
+        return
+    try:
+        saved = load_saved(player_path(directory, player.lowercase_name))
+        if saved is None:
+            return
+        stamped = replace(
+            saved,
+            logged_out_at=datetime.now(timezone.utc),
+            connected_seconds=player.connected_seconds,
+        )
+        save_player(directory, stamped)
+    except (ConfigError, OSError) as exc:
+        print(exc)
+
+
+def delete_player(directory: Path, name: str) -> bool:
+    """Delete the file for ``name`` and return whether it was there."""
+    if not savable_name(name):
+        return False
+    path = player_path(directory, name)
+    if not path.is_file():
+        return False
+    path.unlink()
+    return True
+
+
+def ensure_players_directory(directory: Path) -> None:
+    """Create ``directory`` when it is missing.
+
+    Raises
+    ------
+    ConfigError
+        ``directory`` exists and is not a directory.
+    """
+    if directory.exists() and not directory.is_dir():
+        raise ConfigError("players must be a directory.")
+    directory.mkdir(parents=True, exist_ok=True)
+
+
+def _lowercase_name(path: Path, name: str, raw: object) -> str:
+    """Return the key, or the folded display spelling when the file has none."""
+    if raw is None:
+        return name.lower()
+    if not isinstance(raw, str) or raw == "" or raw != name.lower():
+        raise ConfigError(f"Player file {path} lowercase_name must match the name.")
+    return raw
+
+
+def _player_name(path: Path, value: object) -> str:
+    if not isinstance(value, str) or not savable_name(value):
+        raise ConfigError(f"Player file {path} name must be savable.")
+    if path.name != f"{value.lower()}.yml":
+        raise ConfigError(f"Player file {path} name does not match the file.")
+    return value
+
+
+def _player_rank(path: Path, value: object) -> str:
+    if not isinstance(value, str) or value not in _SAVED_RANKS:
+        raise ConfigError(f"Player file {path} rank must be resident, super, or admin.")
+    return value
+
+
+def _player_hash(path: Path, value: object) -> str:
+    if not isinstance(value, str) or value == "":
+        raise ConfigError(f"Player file {path} password must be a hash.")
+    return value
+
+
+def _player_address(path: Path, value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value == "":
+        raise ConfigError(f"Player file {path} address must be a non-empty string.")
+    return value
+
+
+def _player_prompt(path: Path, value: object) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or value == "":
+        raise ConfigError(f"Player file {path} prompt must be a non-empty string.")
+    return value
+
+
+def _player_description(path: Path, value: object) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str) or value == "" or "\n" in value or len(value) > 80:
+        raise ConfigError(
+            f"Player file {path} description must be one line of at most 80 characters."
+        )
+    return value
+
+
+def _player_colour(path: Path, value: object) -> bool:
+    """Return the saved colour. A missing key means on."""
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    raise ConfigError(f"Player file {path} colour must be true or false.")
+
+
+def _connected_seconds(path: Path, value: object) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError(
+            f"Player file {path} connected_seconds must be a whole number of seconds."
+        )
+    return value
+
+
+def _logged_out_at(path: Path, value: object) -> datetime | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(f"Player file {path} logged_out_at must be a time.")
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ConfigError(f"Player file {path} logged_out_at must be a time.") from exc
+
+
+def _replace_file(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` by renaming a temporary file beside it."""
+    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    temporary = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()

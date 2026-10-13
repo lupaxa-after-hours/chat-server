@@ -1,0 +1,266 @@
+# yamllint disable rule:line-length
+- name: say
+  aliases: ["'", '"', "`"]
+  text: |
+    Speak to the other people in the room you are in. They see a line starting with - and your name and the words. ' " and ` do the same thing with no space after them.
+- name: emote
+  aliases: [":", ";"]
+  text: |
+    Act out a line in the room you are in. Other people see a line starting with - and your name and then the text. : and ; do the same thing with no space after them.
+- name: think
+  aliases: ["~"]
+  text: |
+    Share a thought with the room. Everyone sees a line starting with - and your name and thinks . o O ( ... ). ~ does the same thing with no space after it.
+- name: shout
+  aliases: ["!"]
+  text: |
+    Speak to every player who is in a room. They see a line starting with ! and your name and the words. ! does the same thing with no space after it, so !hello is shout.
+- name: shutdown
+  aliases: []
+  text: |
+    Shut the server down. shutdown <seconds> <reason> tells everyone in a room, then again at 1 minute, 30 seconds, 15 seconds, 10 seconds, and each second from 5 to 1. At 1 second they also see Shutting down now! At 0 everyone is disconnected and the server stops. shutdown now <reason> stops at once. shutdown cancel <reason> clears a countdown. A second shutdown replaces the one that is running.
+- name: tell
+  aliases: [".", ">"]
+  text: |
+    Speak to one named player, wherever they are. The name is the first word. They see a line starting with > and who told them.
+    . and > are the same command. .Bea hello and > Bea hello are tell.
+    Naming yourself replies Talking to yourself is the first sign of madness.
+- name: remote
+  aliases: [",", "<"]
+  text: |
+    Act out a line to one named player, wherever they are. The name is the first word.
+    You see You emote: Ada smiles to Bea. They see a line starting with > and Ada smiles to you.
+    , and < are the same command. ,Bea smiles and < Bea smiles are remote.
+    Naming yourself replies Talking to yourself is the first sign of madness.
+- name: go
+  aliases: []
+  text: |
+    Move through an exit. Use n, s, e, w, ne, nw, se, sw, up, down, or the long name of one of those directions. A full room refuses the move, and only you are told.
+- name: join
+  aliases: []
+  text: |
+    Move to the room a named player is in, when that room has space. The name may contain spaces.
+- name: look
+  aliases: []
+  text: |
+    Show this room's description, exits, and who else is here. You are not included, and the room is not told you arrived.
+- name: map
+  aliases: []
+  text: |
+    Show a map with your room in the centre. The map is 5 by 5 when that drawing fits your frame width, and 3 by 3 when it does not. One blank line appears above the map and one below it. Every room inside that window is shown. Your room is green when colour is on. A line is drawn where two shown rooms connect.
+- name: main
+  aliases: []
+  text: |
+    Move to the start room. The room you leave hears that you went there.
+    The start room hears that you arrived. You see the room.
+    If you are already there, nothing is said.
+    If the room is full, you stay and are told it is full.
+- name: who
+  aliases: ["w"]
+  text: |
+    List every player who is in a room. The columns are Name, Rank, Room, Status, and Idle.
+    Idle is a clock only after 10 seconds. w is the same command. wplease is not.
+    At the name prompt, who in any case shows this list and asks for a name again.
+- name: examine
+  aliases: ["x"]
+  text: |
+    Show a framed profile. The name is centered. Fields are the rank, then status when one is set,
+    how long this login has lasted, total login, and idle.
+    Idle of 10 seconds or less says Not idle at all.
+    me is you. A player is found by their name in any case.
+    Someone who is logged out shows when they left, how long ago, and their total login.
+    A super user or the admin also sees where they are logged in from, or where they were last from.
+    Examining yourself also adds Terminal Size.
+    x needs a space, so x Bea is examine.
+- name: ae
+  aliases: []
+  text: |
+    Emote on the admin channel. Admins only.
+    You see [ Admin ] You emote: waves.
+    Other admins see [ Admin ] Ada waves.
+    The line is red when colour is on.
+- name: alarm
+  aliases: []
+  text: |
+    Set a countdown for a whole number of minutes. When it reaches zero you are told the alarm has passed.
+- name: allow
+  aliases: []
+  text: |
+    Open or close new logins for newbies or for rank resident. Only the admin can use it.
+    allow newbies|residents on|off sets whether that rank may connect.
+    Closing resident logins does not block super users or the admin.
+    The change lasts until the server stops.
+    It does not change the config file. The staff channel hears who opened or closed the talker.
+- name: at
+  aliases: []
+  text: |
+    Think on the admin channel. Admins only.
+    You see [ Admin ] You think . o O ( hmm ).
+    Other admins see [ Admin ] Ada thinks . o O ( hmm ).
+    The line is red when colour is on.
+- name: au
+  aliases: []
+  text: |
+    Speak on the admin channel. Admins only.
+    You see [ Admin ] You say 'hello'.
+    Other admins see [ Admin ] Ada says 'hello'.
+    The line is red when colour is on.
+- name: auto_reply
+  aliases: []
+  text: |
+    Set a line sent back to anyone who tells or remotes you. auto_reply on its own clears it.
+    It is not saved. After a successful tell or remote, the sender sees [ Auto Reply ] and your message.
+- name: broadcast
+  aliases: []
+  text: |
+    Send a centered message to every player who is in a room. Only the admin can use it.
+    The line is red when colour is on. Two blank lines appear above and below the message.
+- name: prompt
+  aliases: []
+  text: |
+    Replace the line you type at. A resident's prompt is kept for the next login. The usual line is What? >.
+- name: term_width
+  aliases: []
+  text: |
+    Set the frame width for this connection. term_width 70 sets the frame to 70 columns. The number is from 60 up to the discovered width, or 80 before a size is known. term_width auto follows the discovered size. term_width alone prints the terminal line. It is not saved. Every rank can use this.
+- name: time
+  aliases: []
+  text: |
+    Show the current time and how long this server has been running. The time looks like Monday 12th October 2026, 13:45:03 UTC.
+- name: help
+  aliases: ["?"]
+  text: |
+    List the command names, or show the write-up for one name or alias.
+    ? is the same command with no space after it, so ?say is help say.
+- name: version
+  aliases: []
+  text: |
+    Show the version of this chat server.
+- name: colour
+  aliases: ["color"]
+  text: |
+    Turn colour on or off. colour on and colour off set it. colour on its own tells you which it is. It is on until you turn it off. A saved player keeps the choice. A newbie can use it, and that choice is kept when they become a resident.
+- name: commands
+  aliases: []
+  text: |
+    List the punctuation aliases first, then the command names in alphabetical order. staff, w, and x are listed with the names.
+- name: disconnect
+  aliases: []
+  text: |
+    Disconnect a player who is in a room. You cannot disconnect someone of your rank or higher.
+    The account named in the config may.
+    They are told they have been disconnected, the room sees the usual disconnect, and the reason goes to the staff channel.
+    Naming yourself replies You cannot do that to yourself.
+- name: quit
+  aliases: []
+  text: |
+    Leave the server. The room you are in is told that you disconnected.
+    At the name prompt, quit in any case says Goodbye! and disconnects. It cannot be a name.
+- name: recap
+  aliases: []
+  text: |
+    Change the capitalisation of your own name. The letters must stay the same.
+- name: resident
+  aliases: []
+  text: |
+    Save a connected newbie. They choose a password and become a saved player.
+    The staff channel sees < SU > <name> makes <name> a resident.
+    You also see their name is now a resident.
+    Naming yourself replies You cannot do that to yourself.
+- name: nuke
+  aliases: []
+  text: |
+    Delete a saved player and disconnect them if they are here.
+    You cannot nuke someone of your rank or higher.
+    The account named in the config may. The admin cannot be removed.
+    Naming yourself replies You cannot do that to yourself.
+- name: password
+  aliases: []
+  text: |
+    Change your saved password. You are asked for the current password, then the new one, twice.
+- name: su
+  aliases: []
+  text: |
+    Speak on the super-user channel.
+- name: se
+  aliases: []
+  text: |
+    Emote on the super-user channel.
+- name: st
+  aliases: []
+  text: |
+    Think on the super-user channel.
+- name: lsu
+  aliases: ["staff"]
+  text: |
+    List connected super users and the admin in a frame. Columns are Name, Rank, Room, Status, and Idle. staff is the same command. Every rank can use this.
+- name: lsn
+  aliases: []
+  text: |
+    List connected newbies in a frame. Columns are Name, Address, Room, and Idle. Address is the hostname, or the IP when no name was found.
+- name: connections
+  aliases: ["conns"]
+  text: |
+    List every open connection in a frame.
+    The columns are Name, Hostname, IP Address, and Type.
+    A socket with no name yet shows <pending>.
+    After a name has been typed, that name is shown, including during the password.
+    Type is telnet or ssh. conns is the same command.
+- name: promote
+  aliases: []
+  text: |
+    Make a resident a super user, or a super user an admin.
+    Any admin may promote to super user.
+    Only the config account may promote to admin.
+    Staff hear < SU > Ada promotes Bea to Super User.
+    Admins hear [ Admin ] Ada promotes Bea to Admin.
+    Someone who is already an admin gets Bea is already an admin.
+    The config account gets Bea is the admin.
+    A promoted admin gets Only the admin can promote Bea to Admin.
+    Naming yourself replies You cannot do that to yourself.
+- name: demote
+  aliases: []
+  text: |
+    Move an admin down to super user, or a super user down to resident.
+    Any admin may demote a super user to resident.
+    Only the config account may demote an admin, including with force.
+    demote <name> force drops either one straight to resident.
+    Admins hear [ Admin ] Ada demotes Bea from Admin.
+    Staff hear < SU > Ada demotes Bea from Super User.
+    Force from admin sends Ada demotes Bea from Admin. on both channels.
+    A resident gets Bea is a resident.
+    The config account gets The admin cannot be demoted.
+    A promoted admin gets Only the admin can demote Bea from Admin.
+    Naming yourself replies You cannot do that to yourself.
+- name: retire
+  aliases: []
+  text: |
+    Delete your own saved account. For saved players from resident rank upward.
+    retire asks Are you sure you want to retire?, then asks for your password,
+    then removes your file and disconnects you.
+    The admin cannot retire.
+- name: save
+  aliases: []
+  text: |
+    Write your player file now. For saved players from resident rank upward.
+    Replies Player Saved.
+- name: warn
+  aliases: []
+  text: |
+    Warn one named player. Super users and the admin can use it.
+    warn <name> <reason> sends them a line with a blank line above and below.
+    When colour is on it is cyan,
+    and the terminal beeps once.
+    The staff channel hears who was warned and why.
+    Naming yourself replies You cannot do that to yourself.
+- name: description
+  aliases: []
+  text: |
+    Set the one line shown on examine. description on its own clears it.
+    At most 80 characters. A newbie starts as I am new here, and that line is cleared when they become a resident.
+    A description you type is saved.
+- name: status
+  aliases: []
+  text: |
+    Set the status shown on examine, who, and lsu. status on its own clears it.
+    At most 20 characters. It is not saved.

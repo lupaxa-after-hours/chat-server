@@ -1,0 +1,208 @@
+/* =============================================================================
+ * The Lupaxa Project Portal
+ * Responsive Behaviour
+ * ============================================================================= */
+
+@media screen and (max-width: 76.234375em) {
+  :root {
+    --lupaxa-header-height: 4rem;
+  }
+
+  .md-header {
+    color: var(--lupaxa-white);
+    background-color: var(--lupaxa-blue);
+  }
+
+  .lupaxa-header__inner {
+    min-height: var(--lupaxa-header-height);
+  }
+
+  .lupaxa-header__drawer-button {
+    display: inline-flex;
+    order: -1;
+    margin-right: var(--lupaxa-spacing-xs);
+  }
+
+  .lupaxa-header__nav {
+    display: none;
+  }
+
+  .md-header__button.md-logo.lupaxa-header__logo {
+    width: 3.25rem;
+    height: 3.25rem;
+    margin-right: var(--lupaxa-spacing-sm);
+  }
+
+  .md-header__button.md-logo.lupaxa-header__logo img,
+  .md-header__button.md-logo.lupaxa-header__logo svg {
+    width: 3.25rem;
+    height: 3.25rem;
+    max-width: none;
+    max-height: none;
+    object-fit: contain;
+  }
+
+  /* Tablet / landscape: full GitHub chip + picker, inset from the screen edge. */
+  .lupaxa-header__tools {
+    margin-right: max(var(--lupaxa-spacing-md), env(safe-area-inset-right, 0px));
+  }
+
+  .lupaxa-lang-picker {
+    display: flex;
+    margin-right: 0;
+  }
+
+  .md-sidebar--primary {
+    z-index: 30;
+  }
+
+  /* Drop the TOC with the left nav. Material otherwise keeps it until ~60em. */
+  .md-sidebar--secondary {
+    display: none !important;
+  }
+
+  .md-overlay {
+    z-index: 20;
+  }
+
+  .md-nav--primary .md-nav__title,
+  .md-nav--primary .md-nav__title[for="__drawer"] {
+    color: var(--lupaxa-white);
+    background-color: var(--lupaxa-blue);
+  }
+
+  [data-md-color-scheme="slate"]
+    .md-sidebar--primary
+    .md-nav--primary
+    .md-nav__link {
+    color: var(--lupaxa-white) !important;
+  }
+
+  [data-md-color-scheme="slate"]
+    .md-sidebar--primary
+    .md-nav--primary
+    .md-nav__link:hover,
+  [data-md-color-scheme="slate"]
+    .md-sidebar--primary
+    .md-nav--primary
+    .md-nav__link:focus {
+    color: var(--lupaxa-light-blue) !important;
+  }
+
+  [data-md-color-scheme="slate"]
+    .md-sidebar--primary
+    .md-nav--primary
+    .md-nav__link--active {
+    color: var(--lupaxa-light-blue) !important;
+    font-weight: 700;
+  }
+
+  .md-sidebar--primary
+    .md-nav--primary
+    label.md-nav__link[for="__toc"] {
+    display: none !important;
+  }
+
+  .md-sidebar--primary
+    .md-nav--primary
+    label.md-nav__link[for="__toc"]
+    + a.md-nav__link {
+    display: flex !important;
+  }
+
+  .md-nav--primary .md-nav__link {
+    color: var(--lupaxa-white);
+  }
+
+  .md-nav--primary .md-nav__link:hover,
+  .md-nav--primary .md-nav__link:focus {
+    color: var(--lupaxa-light-blue);
+  }
+
+  .md-nav--primary .md-nav__link--active {
+    color: var(--lupaxa-light-blue);
+    font-weight: 700;
+  }
+
+  .md-content__inner {
+    margin-right: 0.625rem;
+    margin-left: 0.625rem;
+  }
+
+  .lupaxa-hero,
+  .lupaxa-error-hero {
+    margin-right: -0.625rem;
+    margin-left: -0.625rem;
+  }
+
+  .md-typeset .grid.cards.about-principles,
+  .md-typeset .grid.cards.about-build {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media screen and (max-width: 44.984375em) {
+  .lupaxa-hero,
+  .lupaxa-error-hero {
+    margin-bottom: var(--lupaxa-spacing-lg);
+    padding: 2.5rem 1rem 2.25rem;
+  }
+
+  .lupaxa-hero-logo,
+  .lupaxa-hero > img {
+    width: min(90%, 256px);
+  }
+
+  .lupaxa-hero-actions,
+  .about-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .lupaxa-hero-actions .md-button,
+  .about-actions .md-button {
+    width: 100%;
+    text-align: center;
+  }
+
+  .md-typeset .grid.cards,
+  .md-typeset .grid.cards.about-summary,
+  .md-typeset .grid.cards.about-principles,
+  .md-typeset .grid.cards.about-build {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .md-typeset h2 {
+    margin-top: 2.25rem;
+  }
+
+  .about-introduction {
+    padding: 1.2rem;
+  }
+
+  .about-name {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .about-name-mark {
+    padding-bottom: var(--lupaxa-spacing-md);
+    border-bottom: 1px solid var(--md-default-fg-color--lightest);
+  }
+}
+
+/* Portrait phone only (~720px). Tablets and landscape keep the full GitHub chip. */
+@media screen and (max-width: 44.984375em) and (orientation: portrait) {
+  .lupaxa-header__tools .md-source__repository {
+    display: none;
+  }
+
+  .lupaxa-header__tools .md-source {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .lupaxa-lang-picker {
+    margin-left: 0;
+  }
+}

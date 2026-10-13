@@ -1,0 +1,51 @@
+/* =============================================================================
+ * The Lupaxa Project Portal
+ * Print
+ * ============================================================================= */
+
+@media print {
+  .md-header,
+  .md-tabs,
+  .md-sidebar,
+  .md-footer,
+  .lupaxa-hero-actions,
+  .about-actions {
+    display: none !important;
+  }
+
+  .md-content__inner {
+    max-width: none;
+    margin: 0;
+    padding: 0;
+  }
+
+  .lupaxa-hero,
+  .lupaxa-error-hero {
+    margin: 0 0 var(--lupaxa-spacing-lg);
+    padding: 0 0 var(--lupaxa-spacing-md);
+    background: none;
+    border-bottom: 1px solid #999999;
+  }
+
+  .md-typeset .grid.cards {
+    display: block;
+  }
+
+  .md-typeset .grid.cards > ul > li,
+  .md-typeset .grid.cards > li,
+  .about-introduction,
+  .about-name {
+    break-inside: avoid;
+    box-shadow: none;
+  }
+
+  .md-typeset a[href]::after {
+    content: " (" attr(href) ")";
+    font-size: 0.85em;
+  }
+
+  .md-typeset a[href^="#"]::after,
+  .md-typeset a[href^="javascript:"]::after {
+    content: "";
+  }
+}

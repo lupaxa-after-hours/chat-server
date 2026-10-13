@@ -1,0 +1,230 @@
+/* =============================================================================
+ * The Lupaxa Project Portal
+ * Custom Header Navigation
+ * ============================================================================= */
+
+.md-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  color: var(--lupaxa-white);
+  background-color: var(--lupaxa-blue);
+}
+
+.md-header__inner {
+  position: relative;
+}
+
+.lupaxa-header__inner {
+  display: flex;
+  width: 100%;
+  min-height: var(--lupaxa-header-height);
+  align-items: center;
+  gap: 0;
+}
+
+/* Brand mark */
+
+.md-header__button.md-logo.lupaxa-header__logo {
+  display: inline-flex;
+  flex: 0 0 auto;
+  width: 4rem;
+  height: 4rem;
+  align-items: center;
+  justify-content: center;
+  margin: 0 0.75rem 0 -0.25rem;
+  padding: 0;
+  border-radius: 50%;
+}
+
+.md-header__button.md-logo.lupaxa-header__logo img,
+.md-header__button.md-logo.lupaxa-header__logo svg {
+  display: block;
+  width: 4rem;
+  height: 4rem;
+  max-width: none;
+  max-height: none;
+  object-fit: contain;
+}
+
+/* Primary desktop navigation */
+
+.lupaxa-header__nav {
+  position: relative;
+  z-index: 2;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-self: stretch;
+  pointer-events: auto;
+}
+
+.lupaxa-header__nav-list {
+  display: flex;
+  height: 100%;
+  align-items: stretch;
+  gap: var(--lupaxa-spacing-xs);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  pointer-events: auto;
+}
+
+.lupaxa-header__nav-item {
+  display: flex;
+  height: 100%;
+  align-items: stretch;
+  margin: 0;
+  padding: 0;
+  pointer-events: auto;
+}
+
+.lupaxa-header__nav-link {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  height: 100%;
+  align-items: center;
+  padding: 0 1rem;
+  color: rgb(255 255 255 / 72%);
+  font-size: 1rem;
+  font-weight: 500;
+  line-height: 1.2;
+  white-space: nowrap;
+  text-decoration: none;
+  background: none;
+  border-radius: 0;
+  box-shadow: none;
+  pointer-events: auto;
+  transition:
+    color var(--lupaxa-transition-fast),
+    font-weight var(--lupaxa-transition-fast);
+}
+
+.lupaxa-header__nav-link:hover,
+.lupaxa-header__nav-link:focus-visible {
+  color: var(--lupaxa-white);
+  font-weight: 700;
+  background: none;
+  box-shadow: none;
+}
+
+.lupaxa-header__nav-item--active .lupaxa-header__nav-link {
+  color: var(--lupaxa-white);
+  font-weight: 700;
+  background: none;
+  box-shadow: none;
+}
+
+.lupaxa-header__nav-label {
+  text-decoration: none;
+}
+
+.lupaxa-header__nav-item--active .lupaxa-header__nav-label {
+  text-decoration: underline;
+  text-decoration-color: var(--lupaxa-light-blue);
+  text-decoration-thickness: 2px;
+  text-underline-offset: 0.12em;
+  text-decoration-skip-ink: auto;
+}
+
+/* Material controls — GitHub + language picker as one right-hand group */
+
+.lupaxa-header__tools {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  margin-left: auto;
+  pointer-events: auto;
+}
+
+.lupaxa-header__drawer-button {
+  display: none;
+  margin: 0;
+  color: var(--lupaxa-white);
+}
+
+/* Repository link (top right) */
+
+.lupaxa-header__tools > .md-header__source {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  width: auto;
+  max-width: none;
+  padding-right: 0;
+  pointer-events: auto;
+}
+
+.md-header__source .md-source {
+  color: rgb(255 255 255 / 85%);
+  text-decoration: none;
+}
+
+.md-header__source .md-source:hover,
+.md-header__source .md-source:focus-visible {
+  color: var(--lupaxa-white);
+}
+
+.md-header__source .md-source__repository {
+  max-width: 14rem;
+}
+
+/* Language preference */
+
+.lupaxa-lang-picker {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  margin-left: 1rem;
+  padding: 0;
+}
+
+.lupaxa-lang-picker__select {
+  color: var(--lupaxa-white);
+  font: inherit;
+  font-size: 0.85rem;
+  font-weight: 600;
+  line-height: 1.4;
+  appearance: none;
+  cursor: pointer;
+  background-color: rgb(255 255 255 / 10%);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23ffffff'%3E%3Cpath d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.35rem center;
+  background-size: 0.9rem;
+  border: 1px solid rgb(255 255 255 / 28%);
+  border-radius: var(--lupaxa-radius-button);
+  padding: 0.35rem 1.35rem 0.35rem 0.55rem;
+}
+
+.lupaxa-lang-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  padding: 0.4rem 1rem;
+  color: var(--lupaxa-white);
+  background-color: color-mix(in srgb, var(--lupaxa-blue) 82%, black);
+}
+
+.lupaxa-lang-fallback[hidden] {
+  display: none;
+}
+
+.lupaxa-lang-fallback__text {
+  margin: 0;
+  font-size: 0.9rem;
+}
+
+.lupaxa-lang-fallback__dismiss {
+  color: var(--lupaxa-white);
+  font-size: 0.85rem;
+  background: none;
+  border: 1px solid rgb(255 255 255 / 40%);
+  border-radius: var(--lupaxa-radius-pill);
+  padding: 0.15rem 0.7rem;
+}

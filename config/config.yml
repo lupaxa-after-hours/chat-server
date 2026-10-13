@@ -1,0 +1,37 @@
+# IP address to bind. 0.0.0.0 listens on every interface.
+host: 0.0.0.0
+
+# TCP port for telnet, from 1 to 65535. Omit this when only ssh_port is set.
+port: 9000
+
+# TCP port for SSH, from 1 to 65535. Omit this to leave SSH off.
+ssh_port: 9022
+
+# Rooms file. A relative path is read from this file's directory.
+rooms: rooms.yml
+
+# Room id where a new player appears. It must be a room in the rooms file.
+start: reception
+
+# Help file. A relative path is read from this file's directory.
+help: help.yml
+
+# Directory of one file per saved player. A relative path is read from
+# this file's directory. The server creates it when it is missing.
+players: players
+
+# Name of the admin. The first login of this name has to come from localhost.
+admin: admin
+
+# Minutes a connection may take to enter a room. A whole number of at least 1.
+login_timeout: 3
+
+# Fork into the background after the listening lines.
+# Omit or false stays in the foreground.
+background: false
+
+# When false, new players cannot enter while the server is running.
+allow_newbies: true
+
+# When false, residents cannot enter while the server is running.
+allow_residents: true

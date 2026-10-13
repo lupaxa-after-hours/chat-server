@@ -1,0 +1,98 @@
+/* =============================================================================
+ * Tables
+ *
+ * Material wraps tables in `.md-typeset__scrollwrap` > `.md-typeset__table` and
+ * defaults the table to `display: inline-block` with horizontal padding on the
+ * wrapper. That shrinks the visible table vs adjacent code blocks. Force the
+ * wrappers and table to the full content width, then apply column proportions.
+ * ============================================================================= */
+
+.md-typeset .md-typeset__scrollwrap {
+  display: block !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  margin: 0;
+}
+
+/* Material: display:inline-block; padding:0 .8rem — padding is what leaves a
+   visible gap vs full-width code fences. */
+.md-typeset .md-typeset__table {
+  display: block !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  margin-bottom: 0.5em;
+  padding: 0 !important;
+  box-sizing: border-box;
+}
+
+.md-typeset .md-typeset__table table,
+.md-typeset table:not([class]) {
+  display: table !important;
+  width: 100% !important;
+  max-width: 100% !important;
+  table-layout: fixed;
+  margin: 0 !important;
+  overflow: visible;
+}
+
+.md-typeset table:not([class]) th,
+.md-typeset table:not([class]) td,
+.md-typeset .md-typeset__table table th,
+.md-typeset .md-typeset__table table td {
+  vertical-align: top;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+}
+
+.md-typeset table:not([class]) th,
+.md-typeset .md-typeset__table table th {
+  color: var(--lupaxa-white);
+  background-color: var(--lupaxa-blue);
+  border-color: color-mix(in srgb, var(--lupaxa-blue) 85%, var(--lupaxa-white));
+  font-weight: 650;
+}
+
+.md-typeset table:not([class]) th a,
+.md-typeset .md-typeset__table table th a {
+  color: var(--lupaxa-white);
+}
+
+/* 2 columns — label | description */
+.md-typeset table:not([class]) tr > :nth-child(1):nth-last-child(2),
+.md-typeset .md-typeset__table table tr > :nth-child(1):nth-last-child(2) {
+  width: 32%;
+}
+
+.md-typeset table:not([class]) tr > :nth-child(2):nth-last-child(1),
+.md-typeset .md-typeset__table table tr > :nth-child(2):nth-last-child(1) {
+  width: 68%;
+}
+
+/* 3 columns — key | meta | description */
+.md-typeset table:not([class]) tr > :nth-child(1):nth-last-child(3),
+.md-typeset .md-typeset__table table tr > :nth-child(1):nth-last-child(3) {
+  width: 18%;
+}
+
+.md-typeset table:not([class]) tr > :nth-child(2):nth-last-child(2),
+.md-typeset .md-typeset__table table tr > :nth-child(2):nth-last-child(2) {
+  width: 22%;
+}
+
+.md-typeset table:not([class]) tr > :nth-child(3):nth-last-child(1),
+.md-typeset .md-typeset__table table tr > :nth-child(3):nth-last-child(1) {
+  width: 60%;
+}
+
+/* 4 columns — even split */
+.md-typeset table:not([class]) tr > :nth-child(1):nth-last-child(4),
+.md-typeset table:not([class]) tr > :nth-child(2):nth-last-child(3),
+.md-typeset table:not([class]) tr > :nth-child(3):nth-last-child(2),
+.md-typeset table:not([class]) tr > :nth-child(4):nth-last-child(1),
+.md-typeset .md-typeset__table table tr > :nth-child(1):nth-last-child(4),
+.md-typeset .md-typeset__table table tr > :nth-child(2):nth-last-child(3),
+.md-typeset .md-typeset__table table tr > :nth-child(3):nth-last-child(2),
+.md-typeset .md-typeset__table table tr > :nth-child(4):nth-last-child(1) {
+  width: 25%;
+}

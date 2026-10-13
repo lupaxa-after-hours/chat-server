@@ -1,0 +1,78 @@
+/* =============================================================================
+ * Buttons
+ * ============================================================================= */
+
+.md-typeset .md-button {
+  padding: 0.65rem 1rem;
+  color: var(--lupaxa-blue);
+  font-weight: 600;
+  border-color: var(--lupaxa-blue);
+  border-width: 1px;
+  border-radius: var(--lupaxa-radius-button);
+  transition:
+    color var(--lupaxa-transition-fast),
+    background-color var(--lupaxa-transition-fast),
+    border-color var(--lupaxa-transition-fast);
+}
+
+.md-typeset .md-button:hover,
+.md-typeset .md-button:focus {
+  color: var(--lupaxa-white);
+  background-color: var(--lupaxa-blue);
+  border-color: var(--lupaxa-blue);
+}
+
+.md-typeset .md-button--primary {
+  color: var(--lupaxa-white);
+  background-color: var(--lupaxa-blue);
+  border-color: var(--lupaxa-blue);
+}
+
+.md-typeset .md-button--primary:hover,
+.md-typeset .md-button--primary:focus {
+  color: var(--lupaxa-dark-blue);
+  background-color: var(--lupaxa-light-blue);
+  border-color: var(--lupaxa-light-blue);
+}
+
+.md-typeset .md-button.lupaxa-button {
+  min-width: 10rem;
+  padding: 0.65rem 1rem;
+  color: var(--lupaxa-white);
+  font: inherit;
+  font-weight: 600;
+  line-height: 1.4;
+  text-align: center;
+  text-decoration: none;
+  appearance: none;
+  cursor: pointer;
+  background-color: var(--lupaxa-blue);
+  border: 1px solid var(--lupaxa-blue);
+  border-radius: var(--lupaxa-radius-button);
+  box-shadow: none;
+  transition:
+    color var(--lupaxa-transition-fast),
+    background-color var(--lupaxa-transition-fast),
+    border-color var(--lupaxa-transition-fast);
+}
+
+.md-typeset .md-button.lupaxa-button:hover,
+.md-typeset .md-button.lupaxa-button:focus,
+.md-typeset .md-button.lupaxa-button:focus-visible {
+  color: var(--lupaxa-dark-blue);
+  background-color: var(--lupaxa-light-blue);
+  border-color: var(--lupaxa-light-blue);
+}
+
+.md-typeset .md-button.lupaxa-button:active {
+  transform: translateY(1px);
+}
+
+.md-typeset .md-button.lupaxa-button:disabled {
+  color: var(--lupaxa-dark-blue);
+  cursor: default;
+  background-color: var(--lupaxa-light-blue);
+  border-color: var(--lupaxa-light-blue);
+  opacity: 0.4;
+  transform: none;
+}

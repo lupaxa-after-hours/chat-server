@@ -1,0 +1,62 @@
+name: Validate MkDocs
+
+on:
+  push:
+    paths:
+      - ".github/workflows/validate-mkdocs.yml"
+      - ".markdownlint.yml"
+      - ".markdownlintignore"
+      - ".markdownlint-cli2.jsonc"
+      - "mkdocs/**"
+      - "mkdocs.yml"
+      - "overrides/**"
+      - "requirements.txt"
+
+  pull_request:
+    paths:
+      - ".github/workflows/validate-mkdocs.yml"
+      - ".markdownlint.yml"
+      - ".markdownlintignore"
+      - ".markdownlint-cli2.jsonc"
+      - "mkdocs/**"
+      - "mkdocs.yml"
+      - "overrides/**"
+      - "requirements.txt"
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  validate-mkdocs:
+    name: Validate MkDocs
+    uses: the-lupaxa-project/workflows/.github/workflows/reusable-mkdocs-site-validator.yml@master
+    with:
+      python-version: "3.13"
+      lint-markdown: true
+      markdown-glob: "mkdocs/**/*.md"
+      markdownlint-config: ".markdownlint.yml"
+
+  generate-workflow-summary:
+    name: Generate Workflow Summary
+    needs:
+      - validate-mkdocs
+    if: always()
+    uses: the-lupaxa-project/workflows/.github/workflows/reusable-workflow-summary.yml@master
+
+  generate-workflow-notifications:
+    name: Generate Workflow Notifications
+    needs:
+      - generate-workflow-summary
+    if: always()
+    uses: the-lupaxa-project/workflows/.github/workflows/reusable-workflow-notifier.yml@master
+    with:
+      notify_on_results: "failure,timed_out"
+    secrets:
+      slack_webhook_url: ${{ secrets.SLACK_WEBHOOK_URL }}

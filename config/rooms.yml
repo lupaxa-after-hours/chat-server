@@ -1,0 +1,84 @@
+reception:
+  description: The front desk faces the street. A bell sits on the counter.
+  max_occupancy: 8
+  exits:
+    n: open_office
+    e: meeting_room
+    w: kitchen
+    s: hallway
+kitchen:
+  description: The kitchen smells of coffee. Mugs crowd the sink.
+  max_occupancy: 4
+  exits:
+    n: staff_room
+    e: reception
+meeting_room:
+  description: A long table, a whiteboard, and chairs that do not match.
+  max_occupancy: 6
+  exits:
+    w: reception
+hallway:
+  description: A short corridor. Two doors face each other.
+  max_occupancy: 4
+  exits:
+    n: reception
+    e: mens
+    w: womens
+mens:
+  description: A cubicle and a sink. The lock sticks.
+  max_occupancy: 1
+  exits:
+    w: hallway
+womens:
+  description: A cubicle and a mirror. The tap drips.
+  max_occupancy: 1
+  exits:
+    e: hallway
+open_office:
+  description: Rows of desks under a flickering light.
+  max_occupancy: 10
+  exits:
+    n: corridor
+    s: reception
+    w: staff_room
+    e: server_room
+corridor:
+  description: A long carpeted passage. Doors face each other.
+  max_occupancy: 6
+  exits:
+    s: open_office
+    e: accounts
+    w: human_resources
+accounts:
+  description: Filing cabinets, and a calculator that never sleeps.
+  max_occupancy: 6
+  exits:
+    w: corridor
+human_resources:
+  description: A quiet office. Forms wait in a neat stack.
+  max_occupancy: 4
+  exits:
+    e: corridor
+staff_room:
+  description: Soft chairs, a fridge, and a pile of mugs that escaped the kitchen.
+  max_occupancy: 4
+  exits:
+    s: kitchen
+    e: open_office
+    w: balcony
+balcony:
+  description: A railing and a view of the street. The wind gets in.
+  max_occupancy: 4
+  exits:
+    e: staff_room
+server_room:
+  description: Racks hum in the cold. A ladder stands under a hatch.
+  max_occupancy: 2
+  exits:
+    w: open_office
+    up: plant_room
+plant_room:
+  description: Pipes and a roof hatch. The wind gets in.
+  max_occupancy: 2
+  exits:
+    down: server_room

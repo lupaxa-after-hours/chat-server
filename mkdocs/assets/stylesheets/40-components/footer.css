@@ -1,0 +1,78 @@
+/* =============================================================================
+ * Site Footer
+ * ============================================================================= */
+
+.md-footer,
+.md-footer-meta {
+  color: var(--lupaxa-white);
+  background-color: var(--lupaxa-blue);
+}
+
+.md-footer-meta {
+  position: relative;
+  padding: 0.7rem 1rem;
+  border-top:
+    1px solid
+    color-mix(
+      in srgb,
+      var(--lupaxa-white) 12%,
+      transparent
+    );
+}
+
+.md-footer-meta__inner {
+  position: relative;
+  z-index: 0;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+}
+
+.md-footer-meta__inner a {
+  position: relative;
+  z-index: 2;
+  pointer-events: auto;
+}
+
+.footer-home-link {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.md-copyright {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  color: var(--lupaxa-white);
+  text-align: center;
+}
+
+.md-copyright__highlight {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  align-items: center;
+}
+
+.footer-copyright {
+  color: var(--lupaxa-white);
+  font-weight: 600;
+  line-height: 1.25;
+  opacity: 0.9;
+  letter-spacing: -0.02em;
+}
+
+.footer-tagline {
+  color: var(--lupaxa-white);
+  font-weight: 300;
+  line-height: 1.25;
+}
+
+.footer-copyright,
+.footer-tagline {
+  font-size: clamp(0.7rem, 0.68rem + 0.1vw, 0.8rem);
+}

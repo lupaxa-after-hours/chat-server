@@ -1,0 +1,18 @@
+{#-
+  This file overrides Material for MkDocs' default content partial.
+
+  The automatic fallback H1 has intentionally been removed so that every
+  visible heading and all page content must be supplied by the Markdown page.
+-#}
+
+{% include "partials/tags.html" %}
+
+{% include "partials/actions.html" %}
+
+{{ page.content }}
+
+{% include "partials/source-file.html" %}
+
+{% include "partials/feedback.html" %}
+
+{% include "partials/comments.html" %}
