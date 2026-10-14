@@ -27,7 +27,7 @@ from lupaxa.chat_server.channel import (
     paint_admin,
     paint_staff,
 )
-from lupaxa.chat_server.colour import cyan, green, plain_len, red, yellow
+from lupaxa.chat_server.colour import center_block, cyan, green, plain_len, red, yellow
 from lupaxa.chat_server.commands import command_remote, command_save, command_tell
 from lupaxa.chat_server.commands_list import Command, command_words, wrap_words
 from lupaxa.chat_server.config import Config
@@ -83,7 +83,6 @@ from lupaxa.chat_server.timer import (
     process_timer,
 )
 from lupaxa.chat_server.utilities import (
-    center_block,
     examine_frame,
     frame_width,
     list_frame,

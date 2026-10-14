@@ -13,7 +13,7 @@ from .channel import (
     player_named,
 )
 from .client import Client
-from .colour import red
+from .colour import center_block, red
 from .commands_list import COMMANDS, Command, Host
 from .exceptions import ConfigError
 from .globals import CANNOT_NOW
@@ -33,7 +33,6 @@ from .utilities import (
     _lookup,
     _name_of,
     _rank_of,
-    center_block,
     frame_width,
     refuses_self,
 )

@@ -7,7 +7,6 @@ import socket
 from collections.abc import Sequence
 
 from .client import Client
-from .colour import center_block as center_block
 from .colour import cyan, green, plain_len, red
 from .commands_list import Host
 from .exceptions import ConfigError

@@ -17,7 +17,7 @@ from .channel import (
     who,
 )
 from .client import Client
-from .colour import green
+from .colour import center_block, green
 from .commands_list import COMMANDS, Command, Host, by_name, command_words, wrap_words
 from .defaults import DEFAULT_ENTERMSG, DEFAULT_PROMPT
 from .exceptions import ConfigError
@@ -43,7 +43,6 @@ from .utilities import (
     _rank_of,
     _saved_players,
     _width_ceiling,
-    center_block,
     examine_frame,
     examine_idle,
     frame_width,

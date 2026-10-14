@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from .channel import broadcast_admin
 from .client import Client
+from .colour import center_block
 from .commands_list import Host, by_name
 from .entry import _ask, _enter, _restart_login, name_taken_reply, player_prompt
 from .exceptions import ConfigError
@@ -31,7 +32,7 @@ from .password import (
     set_password_prompt,
 )
 from .saved_player import RANK_NEWBIE
-from .utilities import _find_saved, center_block, frame_width
+from .utilities import _find_saved, frame_width
 
 AGREE_PROMPT = "Do you agree to these rules: "
 
