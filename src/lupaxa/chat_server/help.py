@@ -5,14 +5,13 @@ from __future__ import annotations
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Protocol
 
 import yaml
 
+from .colour import center_block
+from .config import Config
 from .exceptions import ConfigError
-
-if TYPE_CHECKING:
-    from .commands_list import Host
 
 _HELP_KEYS = frozenset({"name", "aliases", "text", "example", "see_also", "notes"})
 _NO_IMPLICIT_SCALAR = frozenset(
@@ -103,8 +102,6 @@ def format_page(
     visible: frozenset[str],
 ) -> str:
     """Return one centered help box, ending with a newline."""
-    from .utilities import center_block
-
     longest = _longest_token(entry, syntax, visible)
     outer = _outer_width(width, longest)
     inner = outer - 2
@@ -236,7 +233,16 @@ def help_stamp(path: Path) -> HelpStamp:
     return HelpStamp(info.st_mtime_ns, info.st_size)
 
 
-def load_help_into(host: Host) -> str | None:
+class _HelpTarget(Protocol):
+    """The host fields a help reload writes."""
+
+    _config: Config
+    _help: HelpBook
+    _help_stamp: HelpStamp
+    _help_failed: HelpStamp | None
+
+
+def load_help_into(host: _HelpTarget) -> str | None:
     """Replace the host book. Return the load error when the old book stays."""
     path = host._config.help
     stamp = help_stamp(path)
