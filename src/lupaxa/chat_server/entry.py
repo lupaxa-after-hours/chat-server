@@ -44,6 +44,8 @@ def _ask(client: Client, stage: str, name: str, saved: SavedPlayer | None) -> No
     client.pending_name = name
     client.pending_saved = saved
     client.pending_password = ""
+    client.pending_current_password = ""
+    client.pending_mfa_secret = ""
     client.pending_issuer = ""
     client.password_failures = 0
 
@@ -167,6 +169,8 @@ def _load_profile(host: Host, user: Player) -> None:
     user.flushed_seconds = saved.connected_seconds
     if saved.prompt is not None:
         user.prompt = saved.prompt
+    if saved.entermsg is not None:
+        user.entermsg = saved.entermsg
     user.colour = saved.colour
     user.description = saved.description
 

@@ -19,14 +19,21 @@ with it, customise it, add to it, and make it your own.
 A multi-room TCP chat server. Each player picks a name, starts in the
 room named by `start`, and talks to the other people in that room.
 
+## Key Features
+
+- Telnet, SSH, or both. SSH has no SSH password. The chat name is still the first prompt.
+- Saved players, bcrypt passwords, and ranks from newbie through Super Admin.
+- MFA with a six-digit code. The secret is sealed in the player file with the password.
+- Rooms, a map, tells, shouts, and staff tools for residents, super users, and admins.
+
 ## Install
 
 ```bash
 pip install lupaxa-chat-server
 ```
 
-Requires Python 3.10+. PyYAML, bcrypt, and AsyncSSH are the runtime
-dependencies.
+Requires Python 3.10+. AsyncSSH, bcrypt, colorama, cryptography, PyYAML,
+and qrcode are the runtime dependencies.
 
 ## Run
 
@@ -44,9 +51,8 @@ the help file yourself.
 
 ## Documentation
 
-The site source is in `mkdocs/`.
-
 - [Getting Started](mkdocs/getting-started.md) covers the config file and how to run.
+- [Security](mkdocs/security/index.md) covers the checks on a connection, including [SSH](mkdocs/security/ssh.md) and [MFA](mkdocs/security/mfa.md).
 - [Connect](mkdocs/usage/index.md), [Players](mkdocs/usage/players.md), [Rooms](mkdocs/usage/rooms.md), and [Commands](mkdocs/usage/commands.md) are how a player uses it.
 - [Reference](mkdocs/reference.md) is the config keys, ranks, and public names.
 - [Examples](mkdocs/examples.md) is a short telnet session and the SSH command.

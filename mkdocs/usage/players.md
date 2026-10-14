@@ -15,10 +15,11 @@ password. A saved player is asked for the current password, then the new
 one, twice. A saved name must be typed in the spelling it was saved with.
 Any other case is told how the name is saved and asked for again.
 
-When `mfa_enabled` is true in the config file, which is the default, a saved player with a
-secret is asked for `Code:` after the password at login. Super users and admins must turn MFA
-on; login walks them through setup when they have no secret yet. When `mfa_enabled` is false,
-login never asks for a code and the in-room `mfa` command does not exist.
+When `mfa_enabled` is true in the config file, which is the default, a saved
+player with a secret is asked for `Code:` after the password. Super users
+and admins must turn MFA on. Login walks them through setup when they have
+no secret yet. When `mfa_enabled` is false, login never asks for a code and
+the in-room `mfa` command does not exist. See [MFA](../security/mfa.md).
 
 A saved player who logs in while that name is already in a room takes
 over that session. The old connection is told it has been reconnected

@@ -11,6 +11,7 @@ from .commands_list import Command, Host
 from .entry import _restart_login, player_prompt
 from .exceptions import ConfigError
 from .globals import CANNOT_NOW, MAX_PASSWORD_FAILURES
+from .mfa_seal import refresh_mfa_secret, seal_mfa_secret
 from .password import _mfa_enrolment_text, code_prompt, current_password_prompt
 from .saved_player import (
     RANK_RESIDENT,
@@ -159,6 +160,7 @@ def _process_mfa_pw(host: Host, client: Client, line: str) -> None:
         _restart_login(client)
         host.send(client, f"Wrong password.\n{player_prompt(client)}")
         return
+    client.pending_password = line
     secret = new_secret()
     client.pending_mfa_secret = secret
     client.auth = "mfa_show"
@@ -198,14 +200,23 @@ def _process_mfa_show(host: Host, client: Client, line: str) -> None:
         _restart_login(client)
         host.send(client, f"{CANNOT_NOW}{player_prompt(client)}")
         return
+    seal_password = client.pending_password
     try:
-        save_player(host._roster_dir, replace(saved, mfa_secret=secret))
+        save_player(
+            host._roster_dir,
+            replace(
+                saved,
+                mfa_secret=seal_mfa_secret(seal_password, secret),
+                mfa_on=True,
+            ),
+        )
     except (ConfigError, OSError) as exc:
         print(exc)
         _restart_login(client)
         host.send(client, f"{CANNOT_NOW}{player_prompt(client)}")
         return
     client.pending_mfa_secret = ""
+    client.pending_password = ""
     _restart_login(client)
     host.send(client, player_prompt(client))
 
@@ -231,6 +242,7 @@ def _process_mfa_remove_pw(host: Host, client: Client, line: str) -> None:
         _restart_login(client)
         host.send(client, f"Wrong password.\n{player_prompt(client)}")
         return
+    client.pending_password = line
     client.auth = "mfa_remove_code"
     client.password_failures = 0
     host.send(client, code_prompt())
@@ -257,8 +269,13 @@ def _process_mfa_remove_code(host: Host, client: Client, line: str) -> None:
         _restart_login(client)
         host.send(client, f"{CANNOT_NOW}{player_prompt(client)}")
         return
+    plain, _stored, opened = refresh_mfa_secret(client.pending_password, saved.mfa_secret)
+    if not opened or plain is None:
+        _restart_login(client)
+        host.send(client, f"Wrong password.\n{player_prompt(client)}")
+        return
     used = host._mfa_steps.get(user.name.lower())
-    step = verify_totp(saved.mfa_secret, line.strip(), now=int(time.time()), used=used)
+    step = verify_totp(plain, line.strip(), now=int(time.time()), used=used)
     if step is None:
         client.password_failures += 1
         host.send(client, "Wrong code.\n")
@@ -270,6 +287,7 @@ def _process_mfa_remove_code(host: Host, client: Client, line: str) -> None:
     record_mfa_step(host._mfa_steps, user.name.lower(), step)
     if not _clear_mfa_secret(host, client, saved):
         return
+    client.pending_password = ""
     _restart_login(client)
     host.send(client, f"{_removed_line(saved.rank)}{player_prompt(client)}")
 
@@ -307,7 +325,7 @@ def _process_mfa_sure(host: Host, client: Client, line: str) -> None:
 
 def _clear_mfa_secret(host: Host, client: Client, saved: SavedPlayer) -> bool:
     try:
-        save_player(host._roster_dir, replace(saved, mfa_secret=None))
+        save_player(host._roster_dir, replace(saved, mfa_secret=None, mfa_on=False))
     except (ConfigError, OSError) as exc:
         print(exc)
         _restart_login(client)

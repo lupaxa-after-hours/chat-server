@@ -53,6 +53,18 @@ class Config:
     mfa_enabled: bool = True
 
 
+def load_banner(config_path: Path) -> str:
+    """Return the banner file that sits beside ``config_path``."""
+    path = config_path.parent / "files" / "banner.msg"
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"Cannot read banner file {path}: {exc.strerror}.") from exc
+    except UnicodeDecodeError as exc:
+        message = f"Banner file {path} is not valid UTF-8: {exc.reason}."
+        raise ConfigError(message) from exc
+
+
 def load_config(path: Path) -> Config:
     """Return a config loaded from ``path``.
 

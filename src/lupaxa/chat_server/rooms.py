@@ -14,7 +14,7 @@ from .exceptions import ConfigError
 
 _ROOM_ID = re.compile(r"^[a-z0-9_]+$")
 _EXIT_CODES = frozenset({"n", "s", "e", "w", "ne", "nw", "se", "sw", "up", "down"})
-_ROOM_KEYS = frozenset({"description", "max_occupancy", "exits"})
+_ROOM_KEYS = frozenset({"description", "max_occupancy", "exits", "enter"})
 _NO_IMPLICIT_SCALAR = frozenset(
     {"tag:yaml.org,2002:bool", "tag:yaml.org,2002:null"},
 )
@@ -44,19 +44,6 @@ _VECTORS = {
     "sw": (-1, 1),
 }
 
-_ARRIVAL = {
-    "n": "from the south",
-    "s": "from the north",
-    "e": "from the west",
-    "w": "from the east",
-    "ne": "from the south-west",
-    "sw": "from the north-east",
-    "nw": "from the south-east",
-    "se": "from the north-west",
-    "up": "from below",
-    "down": "from above",
-}
-
 
 class _LayoutYamlLoader(yaml.SafeLoader):
     """SafeLoader that keeps YAML 1.1 bool/null words as plain strings."""
@@ -80,6 +67,7 @@ class Room:
     description: str
     max_occupancy: int
     exits: Mapping[str, str]
+    enter: str | None = None
 
 
 @dataclass(frozen=True)
@@ -461,18 +449,35 @@ def _box_lines(name: str, width: int, *, here: bool = False) -> list[str]:
     ]
 
 
+def spoken_line(name: str | None, sentence: str) -> str:
+    """Return ``name`` plus ``sentence``, with one closing mark."""
+    if not name:
+        return ""
+    text = sentence.strip()
+    if text[-1:] not in ".!?":
+        text += "."
+    return f"{name} {text}\n"
+
+
+def _room_enter(room_id: str, value: object) -> str | None:
+    """Return a one-line enter sentence, or None when it was left out."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ConfigError(f"Room {room_id} enter must be a string.")
+    if "\n" in value:
+        raise ConfigError(f"Room {room_id} enter must be one line.")
+    text = value.strip()
+    if text == "":
+        return None
+    return text
+
+
 def leave_line(name: str | None, code: str, destination: str) -> str:
     """Return the line the room being left sees."""
     if name is None:
         return ""
     return f"{name} goes {_DIRECTION_NAMES[code]} to {destination}.\n"
-
-
-def arrive_line(name: str | None, code: str) -> str:
-    """Return the line the room being entered sees."""
-    if name is None:
-        return ""
-    return f"{name} arrives {_ARRIVAL[code]}.\n"
 
 
 def full_line(display_name: str) -> str:
@@ -548,4 +553,9 @@ def _room(room_id: str, body: object) -> Room:
         if not isinstance(target, str):
             raise ConfigError(f"Room {room_id} exit {direction} must name a room.")
         cleaned[direction] = target
-    return Room(description=description, max_occupancy=occupancy, exits=cleaned)
+    return Room(
+        description=description,
+        max_occupancy=occupancy,
+        exits=cleaned,
+        enter=_room_enter(room_id, body.get("enter")),
+    )

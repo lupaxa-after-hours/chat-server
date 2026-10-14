@@ -19,13 +19,13 @@ from .channel import (
 from .client import Client
 from .colour import green
 from .commands_list import COMMANDS, Command, Host, by_name, command_words, wrap_words
-from .defaults import DEFAULT_PROMPT
+from .defaults import DEFAULT_ENTERMSG, DEFAULT_PROMPT
 from .exceptions import ConfigError
 from .globals import CANNOT_NOW
-from .help import HelpBook, HelpEntry, format_entry, format_index
+from .help import HelpBook, HelpEntry, format_page
 from .parse import parse_direction
 from .player import Player
-from .rooms import arrive_line, cannot_go_line, full_line, leave_line
+from .rooms import cannot_go_line, full_line, leave_line, spoken_line
 from .saved_player import (
     RANK_ADMIN,
     RANK_RESIDENT,
@@ -43,13 +43,11 @@ from .utilities import (
     _rank_of,
     _saved_players,
     _width_ceiling,
-    arrives_line,
     center_block,
     examine_frame,
     examine_idle,
     frame_width,
     goes_to_line,
-    leaves_for_line,
     list_frame,
     shown_rank,
     shown_rank_cell,
@@ -86,19 +84,35 @@ def command_think(host: Host, client: Client, command: Command, text: str | None
 
 
 def command_help(host: Host, client: Client, command: Command, text: str | None) -> None:
-    """Reply with the help index, one topic, or a not-found line."""
+    """Reply with one help page, or a not-found line."""
     del command
     topic = (text or "").strip()
+    if topic == "":
+        return
     rank = _rank_of(client)
     book = _visible_help(host._help, rank, mfa_enabled=host._mfa_enabled)
-    if topic == "":
-        host.send(client, format_index(book))
-        return
     entry = book.find(topic)
     if entry is None:
         host.send(client, f"help for {topic} not found\n")
         return
-    host.send(client, format_entry(entry))
+    visible = frozenset(item.name for item in book.entries)
+    page = format_page(
+        entry,
+        _help_syntax(entry.name),
+        frame_width(client.discovered_columns, client.frame_columns),
+        visible=visible,
+    )
+    host.send(client, f"\n\n{page}\n")
+
+
+def _help_syntax(name: str) -> str | None:
+    """Return the command syntax, the command name, or None when it is not a command."""
+    command = by_name().get(name)
+    if command is None:
+        return None
+    if command.syntax is None:
+        return name
+    return command.syntax
 
 
 def command_version(host: Host, client: Client, command: Command, text: str | None) -> None:
@@ -171,17 +185,22 @@ def command_go(host: Host, client: Client, command: Command, text: str | None) -
         host.send(client, full_line(layout.display_name(destination)))
         return
     origin = client.room
-    broadcast_room(
-        host,
-        origin,
-        leave_line(client.name, code, layout.display_name(destination)),
-        skip=client,
-    )
+    destination_room = layout.rooms[destination]
+    if destination_room.enter:
+        leaving = spoken_line(client.name, destination_room.enter)
+    else:
+        leaving = leave_line(client.name, code, layout.display_name(destination))
+    broadcast_room(host, origin, leaving, skip=client)
     client.room = destination
     brief = layout.brief(destination, others(host._clients.values(), destination, client))
     if not host.send(client, brief):
         return
-    broadcast_room(host, destination, arrive_line(client.name, code), skip=client)
+    broadcast_room(
+        host,
+        destination,
+        spoken_line(client.name, _enter_sentence(client)),
+        skip=client,
+    )
 
 
 def command_main(host: Host, client: Client, command: Command, text: str | None) -> None:
@@ -199,12 +218,22 @@ def command_main(host: Host, client: Client, command: Command, text: str | None)
         host.send(client, full_line(label))
         return
     origin = client.room
-    broadcast_room(host, origin, goes_to_line(client.name, label), skip=client)
+    start_room = layout.rooms[destination]
+    if start_room.enter:
+        leaving = spoken_line(client.name, start_room.enter)
+    else:
+        leaving = goes_to_line(client.name, label)
+    broadcast_room(host, origin, leaving, skip=client)
     client.room = destination
     brief = layout.brief(destination, others(host._clients.values(), destination, client))
     if not host.send(client, brief):
         return
-    broadcast_room(host, destination, arrives_line(client.name), skip=client)
+    broadcast_room(
+        host,
+        destination,
+        spoken_line(client.name, _enter_sentence(client)),
+        skip=client,
+    )
 
 
 def command_map(host: Host, client: Client, command: Command, text: str | None) -> None:
@@ -485,6 +514,27 @@ def command_prompt(host: Host, client: Client, command: Command, text: str | Non
     host.send(client, "Prompt set.\n")
 
 
+def command_entermsg(host: Host, client: Client, command: Command, text: str | None) -> None:
+    """Set or clear the sentence people hear when this player enters."""
+    del command
+    user = client.player
+    if user is None:
+        return
+    chosen = (text or "").strip()
+    if chosen == "":
+        user.entermsg = DEFAULT_ENTERMSG
+        _keep_entermsg(host, user, None)
+        host.send(client, "Enter message cleared.\n")
+        return
+    if len(chosen) > 80:
+        host.send(client, "An enter message is at most 80 characters.\n")
+        return
+    user.entermsg = chosen
+    kept = None if chosen == DEFAULT_ENTERMSG else chosen
+    _keep_entermsg(host, user, kept)
+    host.send(client, "Enter message set.\n")
+
+
 def command_save(host: Host, client: Client, command: Command, text: str | None) -> None:
     """Write this resident's live profile to the player file."""
     if (text or "").strip() != "":
@@ -497,14 +547,16 @@ def command_save(host: Host, client: Client, command: Command, text: str | None)
         saved = _find_saved(host, user.name)
         if saved is None:
             raise ConfigError("No saved player.")
-        kept = None if user.prompt == DEFAULT_PROMPT else user.prompt
+        kept_prompt = None if user.prompt == DEFAULT_PROMPT else user.prompt
+        kept_entermsg = None if user.entermsg == DEFAULT_ENTERMSG else user.entermsg
         save_player(
             host._roster_dir,
             replace(
                 saved,
                 description=user.description,
                 colour=user.colour,
-                prompt=kept,
+                prompt=kept_prompt,
+                entermsg=kept_entermsg,
                 connected_seconds=user.connected_seconds,
             ),
         )
@@ -600,6 +652,9 @@ def command_who(host: Host, client: Client, command: Command, text: str | None) 
         )
         for name, rank, room_id, status, idle in who(host._clients.values())
     ]
+    if not rows:
+        host.send(client, " -=> There is currently no one connected\n")
+        return
     host.send(
         client,
         list_frame(
@@ -646,12 +701,22 @@ def command_join(host: Host, client: Client, command: Command, text: str | None)
         host.send(client, full_line(label))
         return
     origin = client.room
-    broadcast_room(host, origin, leaves_for_line(client.name, label), skip=client)
+    broadcast_room(
+        host,
+        origin,
+        spoken_line(client.name, f"goes to join {target.name}"),
+        skip=client,
+    )
     client.room = destination
     brief = layout.brief(destination, others(host._clients.values(), destination, client))
     if not host.send(client, brief):
         return
-    broadcast_room(host, destination, arrives_line(client.name), skip=client)
+    broadcast_room(
+        host,
+        destination,
+        spoken_line(client.name, _enter_sentence(client)),
+        skip=client,
+    )
 
 
 def command_lsu(host: Host, client: Client, command: Command, text: str | None) -> None:
@@ -795,6 +860,25 @@ def _keep_prompt(host: Host, user: Player, chosen: str) -> None:
         print(exc)
 
 
+def _keep_entermsg(host: Host, user: Player, chosen: str | None) -> None:
+    """Write ``chosen`` onto the player file. None removes the key."""
+    try:
+        saved = _find_saved(host, user.name)
+        if saved is None:
+            return
+        save_player(host._roster_dir, replace(saved, entermsg=chosen))
+    except (ConfigError, OSError) as exc:
+        print(exc)
+
+
+def _enter_sentence(client: Client) -> str:
+    """Return this player's arrive sentence, or the default."""
+    user = client.player
+    if user is None:
+        return DEFAULT_ENTERMSG
+    return user.entermsg
+
+
 COMMANDS.extend(
     (
         Command("say", command_say, False, "say <message>"),
@@ -814,8 +898,8 @@ COMMANDS.extend(
         Command("remote", command_remote, False, "remote <name> <message>"),
         Command(",", command_remote, True, "remote <name> <message>"),
         Command("<", command_remote, True, "remote <name> <message>"),
-        Command("help", command_help, False, None),
-        Command("?", command_help, True, None),
+        Command("help", command_help, False, "help <topic>"),
+        Command("?", command_help, True, "help <topic>"),
         Command("version", command_version, False, None),
         Command("commands", command_commands, False, None),
         Command("quit", command_quit, False, None),
@@ -836,6 +920,13 @@ COMMANDS.extend(
         Command("status", command_status, False, "status <status>"),
         Command("auto_reply", command_auto_reply, False, "auto_reply <message>"),
         Command("prompt", command_prompt, False, "prompt <prompt>", rank=RANK_RESIDENT),
+        Command(
+            "entermsg",
+            command_entermsg,
+            False,
+            "entermsg <sentence>",
+            rank=RANK_RESIDENT,
+        ),
         Command("save", command_save, False, "save", rank=RANK_RESIDENT),
         Command("retire", command_retire, False, "retire", rank=RANK_RESIDENT),
         Command("term_width", command_term_width, False, "term_width <width>|auto"),

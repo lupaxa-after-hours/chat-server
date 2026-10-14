@@ -29,7 +29,7 @@ def consider_name(line: str, taken: set[str]) -> NameDecision:
     """Accept ``line`` as a name, or explain why it was refused.
 
     A blank line returns an empty reply. The caller must not send that reply.
-    ``me``, ``who``, and ``quit`` in any case are reserved and are refused
+    ``me``, ``who``, ``quit``, ``ssh``, and ``telnet`` in any case are reserved and are refused
     before a player file is opened.
     """
     stripped = line.strip()
@@ -105,6 +105,8 @@ def process_commands(host: Host, client: Client, line: str) -> None:
             "command_auto_reply",
             "command_colour",
             "command_description",
+            "command_entermsg",
+            "command_network",
             "command_retire",
             "command_save",
             "command_status",

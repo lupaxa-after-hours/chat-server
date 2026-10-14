@@ -4,12 +4,21 @@ from __future__ import annotations
 
 from dataclasses import replace
 
-from .channel import broadcast_admin, broadcast_all, broadcast_staff, paint_admin, player_named
+from .channel import (
+    broadcast_admin,
+    broadcast_all,
+    broadcast_staff,
+    match_online_player,
+    paint_admin,
+    player_named,
+)
 from .client import Client
 from .colour import red
 from .commands_list import COMMANDS, Command, Host
 from .exceptions import ConfigError
 from .globals import CANNOT_NOW
+from .help import load_help_into
+from .net import network_box
 from .saved_player import (
     RANK_ADMIN,
     RANK_RESIDENT,
@@ -221,6 +230,20 @@ def _demote_args(text: str | None) -> tuple[str, bool] | None:
     return None
 
 
+def command_reload(host: Host, client: Client, command: Command, text: str | None) -> None:
+    """Read the help file again when the type is help."""
+    del command
+    kind = (text or "").strip()
+    if kind != "help":
+        host.send(client, f"reload for {kind} not found\n")
+        return
+    error = load_help_into(host)
+    if error is None:
+        host.send(client, "Help reloaded.\n")
+        return
+    host.send(client, f"Cannot reload help: {error}\n")
+
+
 def command_shutdown(host: Host, client: Client, command: Command, text: str | None) -> None:
     """Start, replace, cancel, or finish the one server countdown."""
     parts = (text or "").strip().split(None, 1)
@@ -251,6 +274,31 @@ def command_shutdown(host: Host, client: Client, command: Command, text: str | N
     broadcast_all(host, shutdown_phrase(seconds, reason), skip=None)
     if seconds == 1:
         broadcast_all(host, "Shutting down now!\n", skip=None)
+
+
+def command_network(host: Host, client: Client, command: Command, text: str | None) -> None:
+    """Show combined, port, or one connection's counters."""
+    del command
+    parts = (text or "").split()
+    if len(parts) > 1:
+        host.send(client, "Syntax: network [telnet|ssh|<player>]\n")
+        return
+    if not parts:
+        counter = host._combined_net
+    elif parts[0].lower() == "telnet":
+        counter = host._telnet_net
+    elif parts[0].lower() == "ssh":
+        counter = host._ssh_net
+    else:
+        found, error = match_online_player(host._clients.values(), parts[0])
+        if error is not None:
+            host.send(client, error)
+            return
+        if found is None or found.player is None:
+            host.send(client, f"Player {parts[0]} not found.\n")
+            return
+        counter = found.net
+    host.send(client, network_box(counter))
 
 
 def _set_rank(host: Host, client: Client, saved: SavedPlayer, rank: str) -> bool:
@@ -293,6 +341,14 @@ COMMANDS.extend(
             command_shutdown,
             False,
             "shutdown <seconds> <reason>",
+            rank=RANK_ADMIN,
+        ),
+        Command("reload", command_reload, False, "reload <type>", rank=RANK_ADMIN),
+        Command(
+            "network",
+            command_network,
+            False,
+            "network [telnet|ssh|<player>]",
             rank=RANK_ADMIN,
         ),
     )

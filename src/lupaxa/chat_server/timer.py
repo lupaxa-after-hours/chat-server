@@ -1,4 +1,4 @@
-"""Idle, alarm, login timeout, and shutdown ticks."""
+"""Idle, alarm, login timeout, shutdown, and help reload ticks."""
 
 from __future__ import annotations
 
@@ -6,13 +6,16 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
-from .channel import broadcast_all
+from .channel import broadcast_admin, broadcast_all
 from .commands_list import Host
 from .exceptions import ConfigError
+from .help import help_stamp, load_help_into
+from .net import roll
 from .player import Player
 from .saved_player import RANK_NEWBIE, load_saved, player_path, save_player
 
 _FLUSH_SECONDS = 300
+_HELP_CHECK_SECONDS = 300
 _SHUTDOWN_MARKS = frozenset({60, 30, 15, 10, 5, 4, 3, 2})
 
 
@@ -74,6 +77,21 @@ def apply_shutdown_tick(host: Host, whole: int) -> bool:
     return False
 
 
+def apply_net_tick(host: Host, whole: int) -> None:
+    """Subtract ``whole`` from the countdown and roll every counter at 0."""
+    if whole <= 0:
+        return
+    host._net_count -= whole
+    if host._net_count > 0:
+        return
+    host._net_count = 10
+    roll(host._telnet_net)
+    roll(host._ssh_net)
+    roll(host._combined_net)
+    for client in host._clients.values():
+        roll(client.net)
+
+
 def process_timer(host: Host) -> None:
     """Advance idle and alarm counters by the seconds elapsed since the last loop."""
     now = time.monotonic()
@@ -82,6 +100,7 @@ def process_timer(host: Host) -> None:
     host._timer_remainder = remainder
     if whole <= 0:
         return
+    apply_net_tick(host, whole)
     for client in list(host._clients.values()):
         user = client.player
         if user is None:
@@ -95,6 +114,29 @@ def process_timer(host: Host) -> None:
     if host.is_stopping():
         return
     apply_login_timeouts(host, now)
+    apply_help_check(host, whole)
+
+
+def apply_help_check(host: Host, whole: int) -> None:
+    """Reload help after each further 300 seconds when the file stamp is new."""
+    if whole <= 0 or host.is_stopping():
+        return
+    host._help_check_seconds += whole
+    if host._help_check_seconds < _HELP_CHECK_SECONDS:
+        return
+    host._help_check_seconds %= _HELP_CHECK_SECONDS
+    _reload_help_if_changed(host)
+
+
+def _reload_help_if_changed(host: Host) -> None:
+    """Load a new stamp. Announce a failure once for that stamp."""
+    stamp = help_stamp(host._config.help)
+    if stamp == host._help_stamp or stamp == host._help_failed:
+        return
+    error = load_help_into(host)
+    if error is None:
+        return
+    broadcast_admin(host, f"[ Admin ] Cannot reload help: {error}\n")
 
 
 def apply_login_timeouts(host: Host, now: float) -> None:

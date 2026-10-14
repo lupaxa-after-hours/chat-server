@@ -7,8 +7,7 @@
 site_name: Chat Server
 
 site_description: >-
-  A multi-room TCP chat server. Players pick a name, start in one room,
-  and talk to the other people there.
+  A multi-room TCP chat server with telnet, SSH, saved players, and MFA.
 
 site_author: The Lupaxa Project
 
@@ -96,6 +95,10 @@ hooks:
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
+  - Security:
+      - security/index.md
+      - SSH: security/ssh.md
+      - MFA: security/mfa.md
   - Usage:
       - Connect: usage/index.md
       - Players: usage/players.md

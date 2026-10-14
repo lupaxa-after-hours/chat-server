@@ -12,3 +12,10 @@ with it, customise it, add to it, and make it your own.
 
 A multi-room TCP chat server. Each player picks a name, starts in the
 room named by `start`, and talks to the other people in that room.
+
+## Key Features
+
+- Telnet, SSH, or both. SSH has no SSH password. The chat name is still the first prompt.
+- Saved players, bcrypt passwords, and ranks from newbie through Super Admin.
+- MFA with a six-digit code. The secret is sealed in the player file with the password.
+- Rooms, a map, tells, shouts, and staff tools for residents, super users, and admins.

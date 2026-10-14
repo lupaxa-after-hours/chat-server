@@ -183,8 +183,8 @@ class SSHListener:
         remote.setblocking(False)
         peer = process.get_extra_info("peername")
         host = peer[0] if isinstance(peer, tuple) else "unknown"
-        self._handoff(game, str(host), process.get_terminal_type() is not None)
         self._report_width(process, game)
+        self._handoff(game, str(host), process.get_terminal_type() is not None)
         loop = asyncio.get_running_loop()
         to_game = asyncio.ensure_future(self._to_game(process, remote, loop, game))
         try:

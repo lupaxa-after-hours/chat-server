@@ -42,6 +42,9 @@ def test_bind_failure_exits_1(tmp_path: Path, capsys: pytest.CaptureFixture[str]
         encoding="utf-8",
     )
     (tmp_path / "help.yml").write_text("[]\n", encoding="utf-8")
+    files = tmp_path / "files"
+    files.mkdir()
+    (files / "banner.msg").write_text("Hello\n", encoding="utf-8")
     path.write_text(
         f"port: {port}\nrooms: rooms.yml\nstart: reception\nhelp: help.yml\n",
         encoding="utf-8",
@@ -62,6 +65,9 @@ def _ready(tmp_path: Path, text: str) -> Path:
         encoding="utf-8",
     )
     (tmp_path / "help.yml").write_text("[]\n", encoding="utf-8")
+    files = tmp_path / "files"
+    files.mkdir()
+    (files / "banner.msg").write_text("Hello\n", encoding="utf-8")
     path = tmp_path / "chat.yaml"
     path.write_text(text, encoding="utf-8")
     return path

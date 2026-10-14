@@ -8,8 +8,8 @@ The server will not start without a config file. There is no default path.
 pip install lupaxa-chat-server
 ```
 
-Requires Python 3.10 or newer. PyYAML, bcrypt, and AsyncSSH are the
-runtime dependencies.
+Requires Python 3.10 or newer. AsyncSSH, bcrypt, colorama, cryptography,
+PyYAML, and qrcode are the runtime dependencies.
 
 `config/config.yml`, `config/rooms.yml`, and `config/help.yml` in this
 repository are templates. After `pip install lupaxa-chat-server`, create
@@ -29,6 +29,7 @@ python -m lupaxa.chat_server -c config/config.yml
 host: 0.0.0.0
 port: 9000
 # ssh_port: 9022
+# mfa_enabled: true
 rooms: rooms.yml
 start: reception
 help: help.yml
@@ -55,10 +56,11 @@ saved. `login_timeout` is how many minutes a connection may take to enter
 a room. It defaults to 3 and must be a whole number of at least 1.
 
 SSH listens on `ssh_port` when it is set. The first start writes
-`ssh_host_key` beside the config file and reuses it. Connect with
-`ssh -p 9022 127.0.0.1`. There is no SSH password. The first prompt is
-still the chat name. A terminal shows what you type, except a password.
-Telnet hides passwords the same way when the client honours echo control.
+`ssh_host_key` beside the config file and reuses it. There is no SSH
+password. The first prompt is still the chat name. See [SSH](security/ssh.md).
+
+MFA is on unless `mfa_enabled` is false. A saved player with a secret is
+asked for a code after the password. See [MFA](security/mfa.md).
 
 The files under `config/` are one example: an office that starts in
 `reception`. Replace the rooms file and `start` with any layout. A string,
@@ -74,5 +76,3 @@ startup.
 On startup the process prints the version and the listen address.
 `background: true` forks after those lines. The parent exits 0. The child
 keeps serving, and later output is discarded.
-
-The pages of this site are the files under `mkdocs/`.

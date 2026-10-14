@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import selectors
 import socket
 import threading
 import time
@@ -15,8 +16,10 @@ from lupaxa.chat_server.channel import player_named
 from lupaxa.chat_server.client import Client
 from lupaxa.chat_server.config import Config
 from lupaxa.chat_server.defaults import DEFAULT_HOST
+from lupaxa.chat_server.entry import name_taken_reply
 from lupaxa.chat_server.exceptions import ConfigError
-from lupaxa.chat_server.help import HelpBook
+from lupaxa.chat_server.help import HelpBook, HelpEntry
+from lupaxa.chat_server.login import welcome_text
 from lupaxa.chat_server.player import Player
 from lupaxa.chat_server.rooms import Layout, load_layout
 from lupaxa.chat_server.saved_player import (
@@ -145,6 +148,67 @@ def _hears_nothing(client: socket.socket) -> bool:
         client.settimeout(2)
 
 
+_TEST_HELP = HelpBook(entries=(HelpEntry("disclaimer", (), "Be kind."),))
+
+
+def _accept_disclaimer(client: socket.socket) -> None:
+    _read_until(client, b"Do you agree to these rules: ")
+    client.sendall(b"yes\n")
+
+
+def test_a_blank_line_during_the_disclaimer_asks_again(tmp_path: Path) -> None:
+    """A blank line during agree must not re-prompt for a name."""
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    client: socket.socket | None = None
+    try:
+        client = _connect(server._config.port)
+        _read_until(client, b"Please enter your name: ")
+        client.sendall(b"Ada\n")
+        _read_until(client, b"Do you agree to these rules: ")
+        client.sendall(b"\n")
+        reply = _read_until(client, b"Do you agree to these rules: ")
+        assert b"Do you agree to these rules: " in reply
+        assert b"Please enter your name:" not in reply
+        client.sendall(b"yes\n")
+        assert b"What? > " in _read_until(client, b"What? > ")
+    finally:
+        if client is not None:
+            client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+
+
+def test_a_name_at_the_disclaimer_holds_the_name(tmp_path: Path) -> None:
+    """A second connection with the same name is sent back to the name prompt."""
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    first: socket.socket | None = None
+    second: socket.socket | None = None
+    try:
+        first = _connect(server._config.port)
+        _read_until(first, b"Please enter your name: ")
+        first.sendall(b"Ada\n")
+        _read_until(first, b"Do you agree to these rules: ")
+        second = _connect(server._config.port)
+        _read_until(second, b"Please enter your name: ")
+        second.sendall(b"Ada\n")
+        reply = _read_until(second, b"Please enter your name: ")
+        assert name_taken_reply("Ada").encode() in reply
+        assert b"Be kind." not in reply
+        first.sendall(b"yes\n")
+        assert b"What? > " in _read_until(first, b"What? > ")
+    finally:
+        if first is not None:
+            first.close()
+        if second is not None:
+            second.close()
+        server.shutdown()
+        thread.join(timeout=2)
+
+
 def test_server_copies_allow_flags(tmp_path: Path) -> None:
     """Startup copies the file. It does not keep a second default."""
     config = Config(
@@ -157,7 +221,7 @@ def test_server_copies_allow_flags(tmp_path: Path) -> None:
         allow_residents=True,
         mfa_enabled=False,
     )
-    server = ChatServer(config, _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(config, _layout(tmp_path), _TEST_HELP)
     assert server._allow_newbies is False
     assert server._allow_residents is True
 
@@ -168,7 +232,7 @@ def test_the_server_records_when_it_was_created(tmp_path: Path) -> None:
     server = ChatServer(
         _config(players=_players(tmp_path)),
         _layout(tmp_path),
-        HelpBook(entries=()),
+        _TEST_HELP,
     )
     after = datetime.now(timezone.utc)
     assert server.started_at.tzinfo is timezone.utc
@@ -177,9 +241,7 @@ def test_the_server_records_when_it_was_created(tmp_path: Path) -> None:
 
 def test_say_reaches_the_other_client(tmp_path: Path) -> None:
     """A named player's say line is delivered to the other player."""
-    server = ChatServer(
-        _config(players=_players(tmp_path)), _layout(tmp_path), HelpBook(entries=())
-    )
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     left: socket.socket | None = None
@@ -191,6 +253,8 @@ def test_say_reaches_the_other_client(tmp_path: Path) -> None:
         assert b"Please enter your name: " in _read_until(right, b"Please enter your name: ")
         left.sendall(b"Ada\n")
         right.sendall(b"Bea\n")
+        _accept_disclaimer(left)
+        _accept_disclaimer(right)
         assert b"[Bea has connected]\n" in _read_until(left, b"[Bea has connected]\n")
         left.sendall(b"say hello\n")
         heard = _read_until(right, b"- Ada says 'hello'\n")
@@ -211,7 +275,7 @@ def test_tell_and_shout_cross_rooms(tmp_path: Path) -> None:
     players.mkdir()
     save_player(players, SavedPlayer("admin", RANK_ADMIN, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Ada", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    server = ChatServer(_config(players=players), _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     ada: socket.socket | None = None
@@ -228,6 +292,7 @@ def test_tell_and_shout_cross_rooms(tmp_path: Path) -> None:
         ada.sendall(b"pw\n")
         assert b"What? > " in _read_until(ada, b"What? > ")
         bea.sendall(b"Bea\n")
+        _accept_disclaimer(bea)
         assert b"[Bea has connected]\n" in _read_until(ada, b"[Bea has connected]\n")
         bea.sendall(b"go west\n")
         assert b"Bea goes west to Kitchen.\n" in _read_until(ada, b"Bea goes west to Kitchen.\n")
@@ -262,9 +327,7 @@ def test_tell_and_shout_cross_rooms(tmp_path: Path) -> None:
 
 def test_overlong_line_disconnects(tmp_path: Path) -> None:
     """More than 1024 characters after stripping drops the client."""
-    server = ChatServer(
-        _config(players=_players(tmp_path)), _layout(tmp_path), HelpBook(entries=())
-    )
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     client: socket.socket | None = None
@@ -289,9 +352,7 @@ def test_overlong_line_disconnects(tmp_path: Path) -> None:
 
 def test_idle_reader_is_dropped_when_outgoing_exceeds_cap(tmp_path: Path) -> None:
     """A client that stops reading is dropped once queued output exceeds 64 KiB."""
-    server = ChatServer(
-        _config(players=_players(tmp_path)), _layout(tmp_path), HelpBook(entries=())
-    )
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     sender: socket.socket | None = None
@@ -303,6 +364,8 @@ def test_idle_reader_is_dropped_when_outgoing_exceeds_cap(tmp_path: Path) -> Non
         assert b"Please enter your name: " in _read_until(idle, b"Please enter your name: ")
         sender.sendall(b"Ada\n")
         idle.sendall(b"Bea\n")
+        _accept_disclaimer(sender)
+        _accept_disclaimer(idle)
         assert b"[Bea has connected]\n" in _read_until(sender, b"[Bea has connected]\n")
         sender.setblocking(False)
         needle = b"[Bea has disconnected]\n"
@@ -342,9 +405,7 @@ def test_idle_reader_is_dropped_when_outgoing_exceeds_cap(tmp_path: Path) -> Non
 
 def test_say_stays_in_the_room(tmp_path: Path) -> None:
     """A say in Kitchen is not delivered to Reception."""
-    server = ChatServer(
-        _config(players=_players(tmp_path)), _layout(tmp_path), HelpBook(entries=())
-    )
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     left: socket.socket | None = None
@@ -356,6 +417,8 @@ def test_say_stays_in_the_room(tmp_path: Path) -> None:
         _read_until(right, b"Please enter your name: ")
         left.sendall(b"Ada\n")
         right.sendall(b"Bea\n")
+        _accept_disclaimer(left)
+        _accept_disclaimer(right)
         _read_until(left, b"[Bea has connected]\n")
         left.sendall(b"go west\n")
         heard = _read_until(left, b"  east -> Reception\n")
@@ -377,9 +440,7 @@ def test_say_stays_in_the_room(tmp_path: Path) -> None:
 def test_full_reception_disconnects_the_new_name(tmp_path: Path) -> None:
     """A full Reception closes the connection and does not keep the name."""
     text = _TINY.replace("max_occupancy: 4", "max_occupancy: 1", 1)
-    server = ChatServer(
-        _config(players=_players(tmp_path)), _layout(tmp_path, text), HelpBook(entries=())
-    )
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path, text), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     first: socket.socket | None = None
@@ -388,15 +449,18 @@ def test_full_reception_disconnects_the_new_name(tmp_path: Path) -> None:
         first = _connect(server._config.port)
         _read_until(first, b"Please enter your name: ")
         first.sendall(b"Ada\n")
+        _accept_disclaimer(first)
         _read_until(first, b"  west  -> Kitchen\n")
         second = _connect(server._config.port)
         _read_until(second, b"Please enter your name: ")
         second.sendall(b"Bea\n")
+        _accept_disclaimer(second)
         assert b"Reception is full.\n" in _read_until(second, b"Reception is full.\n")
         assert second.recv(64) == b""
         second = _connect(server._config.port)
         _read_until(second, b"Please enter your name: ")
         second.sendall(b"Bea\n")
+        _accept_disclaimer(second)
         assert b"Reception is full.\n" in _read_until(second, b"Reception is full.\n")
     finally:
         if first is not None:
@@ -409,9 +473,7 @@ def test_full_reception_disconnects_the_new_name(tmp_path: Path) -> None:
 
 def test_full_room_refuses_the_move(tmp_path: Path) -> None:
     """Toilet holds one person. The second player stays in Reception."""
-    server = ChatServer(
-        _config(players=_players(tmp_path)), _layout(tmp_path), HelpBook(entries=())
-    )
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     left: socket.socket | None = None
@@ -423,6 +485,8 @@ def test_full_room_refuses_the_move(tmp_path: Path) -> None:
         _read_until(right, b"Please enter your name: ")
         left.sendall(b"Ada\n")
         right.sendall(b"Bea\n")
+        _accept_disclaimer(left)
+        _accept_disclaimer(right)
         _read_until(left, b"[Bea has connected]\n")
         left.sendall(b"go south\n")
         _read_until(left, b"What? > ")
@@ -443,9 +507,7 @@ def test_full_room_refuses_the_move(tmp_path: Path) -> None:
 
 def test_missing_exit_is_told_to_the_mover(tmp_path: Path) -> None:
     """A real direction with no exit does not move the player."""
-    server = ChatServer(
-        _config(players=_players(tmp_path)), _layout(tmp_path), HelpBook(entries=())
-    )
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     client: socket.socket | None = None
@@ -453,6 +515,7 @@ def test_missing_exit_is_told_to_the_mover(tmp_path: Path) -> None:
         client = _connect(server._config.port)
         _read_until(client, b"Please enter your name: ")
         client.sendall(b"Ada\n")
+        _accept_disclaimer(client)
         _read_until(client, b"  west  -> Kitchen\n")
         client.sendall(b"go north\n")
         assert b"You cannot go north.\n" in _read_until(client, b"You cannot go north.\n")
@@ -465,9 +528,7 @@ def test_missing_exit_is_told_to_the_mover(tmp_path: Path) -> None:
 
 def test_arrival_is_told_to_the_new_room(tmp_path: Path) -> None:
     """Someone already in Kitchen hears Ada arrive from the east."""
-    server = ChatServer(
-        _config(players=_players(tmp_path)), _layout(tmp_path), HelpBook(entries=())
-    )
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     first: socket.socket | None = None
@@ -479,13 +540,13 @@ def test_arrival_is_told_to_the_new_room(tmp_path: Path) -> None:
         _read_until(second, b"Please enter your name: ")
         first.sendall(b"Bea\n")
         second.sendall(b"Ada\n")
+        _accept_disclaimer(first)
+        _accept_disclaimer(second)
         _read_until(first, b"[Ada has connected]\n")
         first.sendall(b"go west\n")
         _read_until(first, b"  east -> Reception\n")
         second.sendall(b"go west\n")
-        assert b"Ada arrives from the east.\n" in _read_until(
-            first, b"Ada arrives from the east.\n"
-        )
+        assert b"Ada arrives.\n" in _read_until(first, b"Ada arrives.\n")
     finally:
         if first is not None:
             first.close()
@@ -504,7 +565,7 @@ arena:
   exits: {}
 """
     server = ChatServer(
-        _config("arena", players=_players(tmp_path)), _layout(tmp_path, text), HelpBook(entries=())
+        _config("arena", players=_players(tmp_path)), _layout(tmp_path, text), _TEST_HELP
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -514,10 +575,12 @@ arena:
         first = _connect(server._config.port)
         _read_until(first, b"Please enter your name: ")
         first.sendall(b"Ada\n")
+        _accept_disclaimer(first)
         assert b"A court.\n" in _read_until(first, b"Exits: none.\n")
         second = _connect(server._config.port)
         _read_until(second, b"Please enter your name: ")
         second.sendall(b"Bea\n")
+        _accept_disclaimer(second)
         assert b"Arena is full.\n" in _read_until(second, b"Arena is full.\n")
     finally:
         if first is not None:
@@ -531,14 +594,12 @@ arena:
 def test_unknown_start_room_is_rejected(tmp_path: Path) -> None:
     """The configured start room must exist in the rooms file."""
     with pytest.raises(ConfigError, match="arena"):
-        ChatServer(_config("arena"), _layout(tmp_path), HelpBook(entries=()))
+        ChatServer(_config("arena"), _layout(tmp_path), _TEST_HELP)
 
 
 def test_empty_return_shows_the_prompt_again(tmp_path: Path) -> None:
     """Enter at the name prompt and at What? > prints that prompt again."""
-    server = ChatServer(
-        _config(players=_players(tmp_path)), _layout(tmp_path), HelpBook(entries=())
-    )
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     client: socket.socket | None = None
@@ -548,6 +609,7 @@ def test_empty_return_shows_the_prompt_again(tmp_path: Path) -> None:
         client.sendall(b"\n")
         assert b"Please enter your name: " in _read_until(client, b"Please enter your name: ")
         client.sendall(b"Ada\n")
+        _accept_disclaimer(client)
         _read_until(client, b"What? > ")
         client.sendall(b"\n")
         heard = _read_until(client, b"What? > ")
@@ -564,7 +626,7 @@ def test_empty_password_line_at_set_prompt_is_rejected(tmp_path: Path) -> None:
     """A blank line at Set a password reaches login and is refused."""
     players = tmp_path / "players"
     players.mkdir()
-    server = ChatServer(_config(players=players), _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     client: socket.socket | None = None
@@ -588,7 +650,7 @@ def test_admin_sets_a_password_then_logs_in(tmp_path: Path) -> None:
     """The admin name sets a password once, then needs it to come back."""
     players = tmp_path / "players"
     players.mkdir()
-    server = ChatServer(_config(players=players), _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     opened: list[socket.socket] = []
@@ -612,6 +674,7 @@ def test_admin_sets_a_password_then_logs_in(tmp_path: Path) -> None:
 
         watcher = connect()
         watcher.sendall(b"Ada\n")
+        _accept_disclaimer(watcher)
         _read_until(watcher, b"What? > ")
 
         failing = connect()
@@ -648,7 +711,7 @@ def test_a_saved_name_answers_for_its_own_spelling(tmp_path: Path) -> None:
     players = tmp_path / "players"
     players.mkdir()
     config = _config(players=players, admin="Boss")
-    server = ChatServer(config, _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(config, _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     opened: list[socket.socket] = []
@@ -684,7 +747,7 @@ def test_a_super_user_saves_a_newbie_as_a_resident(tmp_path: Path) -> None:
     players = tmp_path / "players"
     players.mkdir()
     save_player(players, SavedPlayer("admin", "admin", hash_password("pw", rounds=4)))
-    server = ChatServer(_config(players=players), _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     opened: list[socket.socket] = []
@@ -704,6 +767,7 @@ def test_a_super_user_saves_a_newbie_as_a_resident(tmp_path: Path) -> None:
 
         bea = connect()
         bea.sendall(b"Bea\n")
+        _accept_disclaimer(bea)
         _read_until(bea, b"What? > ")
         bea.sendall(b"shout hi\n")
         assert b"No such command 'shout'\n" in _read_until(bea, b"What? > ")
@@ -738,7 +802,7 @@ def test_resident_disconnect_before_confirm_writes_nothing(tmp_path: Path) -> No
     players = tmp_path / "players"
     players.mkdir()
     save_player(players, SavedPlayer("admin", "admin", hash_password("pw", rounds=4)))
-    server = ChatServer(_config(players=players), _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     opened: list[socket.socket] = []
@@ -758,6 +822,7 @@ def test_resident_disconnect_before_confirm_writes_nothing(tmp_path: Path) -> No
 
         bea = connect()
         bea.sendall(b"Bea\n")
+        _accept_disclaimer(bea)
         _read_until(bea, b"What? > ")
 
         boss.sendall(b"resident Bea\n")
@@ -785,7 +850,7 @@ def test_the_super_user_channel_does_not_reach_a_resident(tmp_path: Path) -> Non
     save_player(players, SavedPlayer("admin", "admin", hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Ada", RANK_SUPER, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    server = ChatServer(_config(players=players), _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     opened: list[socket.socket] = []
@@ -831,7 +896,7 @@ def test_staff_in_the_room_see_the_connect_address(tmp_path: Path) -> None:
     save_player(players, SavedPlayer("admin", RANK_ADMIN, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Ada", RANK_SUPER, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Cyd", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    server = ChatServer(_config(players=players), _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     opened: list[socket.socket] = []
@@ -851,6 +916,7 @@ def test_staff_in_the_room_see_the_connect_address(tmp_path: Path) -> None:
         opened.append(client)
         _read_until(client, b"Please enter your name: ")
         client.sendall(name + b"\n")
+        _accept_disclaimer(client)
         _read_until(client, b"What? > ")
         return client
 
@@ -910,7 +976,7 @@ def test_a_reported_width_is_stored_on_the_client(tmp_path: Path) -> None:
     server = ChatServer(
         _config(players=tmp_path / "players"),
         _layout(tmp_path),
-        HelpBook(entries=()),
+        _TEST_HELP,
     )
     left, right = socket.socketpair()
     try:
@@ -930,12 +996,37 @@ def test_a_reported_width_is_stored_on_the_client(tmp_path: Path) -> None:
         server.shutdown()
 
 
+def test_queued_ssh_width_centers_the_welcome_banner(tmp_path: Path) -> None:
+    """A terminal size queued before handoff shapes the welcome banner."""
+    banner = "X\n"
+    server = ChatServer(
+        _config(players=tmp_path / "players"),
+        _layout(tmp_path),
+        _TEST_HELP,
+        banner=banner,
+    )
+    left, right = socket.socketpair()
+    try:
+        right.settimeout(1)
+        server._note_width(left, 100, 24)
+        server._hand_session(left, "127.0.0.1", terminal=True)
+        server._take_ssh()
+        data = right.recv(4096).decode("utf-8").replace("\r\n", "\n")
+        assert data == welcome_text(banner, 100)
+        assert data != welcome_text(banner, 80)
+        assert left not in server._widths
+    finally:
+        left.close()
+        right.close()
+        server.shutdown()
+
+
 def test_apply_widths_leaves_frame_columns_unchanged(tmp_path: Path) -> None:
     """A reported size updates discovery only; manual frame width stays put."""
     server = ChatServer(
         _config(players=tmp_path / "players"),
         _layout(tmp_path),
-        HelpBook(entries=()),
+        _TEST_HELP,
     )
     left, right = socket.socketpair()
     try:
@@ -957,7 +1048,7 @@ def test_a_resolved_name_is_stored_on_the_client(tmp_path: Path) -> None:
     server = ChatServer(
         _config(players=tmp_path / "players"),
         _layout(tmp_path),
-        HelpBook(entries=()),
+        _TEST_HELP,
     )
     left, right = socket.socketpair()
     try:
@@ -981,7 +1072,7 @@ def test_a_stale_hostname_lookup_is_ignored(tmp_path: Path) -> None:
     server = ChatServer(
         _config(players=tmp_path / "players"),
         _layout(tmp_path),
-        HelpBook(entries=()),
+        _TEST_HELP,
     )
     left, right = socket.socketpair()
     try:
@@ -1001,7 +1092,7 @@ def test_a_hostname_for_a_gone_client_is_dropped(tmp_path: Path) -> None:
     server = ChatServer(
         _config(players=tmp_path / "players"),
         _layout(tmp_path),
-        HelpBook(entries=()),
+        _TEST_HELP,
     )
     left, right = socket.socketpair()
     try:
@@ -1020,7 +1111,7 @@ def test_telnet_only_applies_a_queued_hostname(tmp_path: Path) -> None:
     server = ChatServer(
         _config(players=tmp_path / "players"),
         _layout(tmp_path),
-        HelpBook(entries=()),
+        _TEST_HELP,
     )
     assert server._wake_r is None
     server._resolve_hostname = lambda _ip: "ada.example"
@@ -1052,7 +1143,7 @@ def test_a_width_queued_before_the_client_is_kept(tmp_path: Path) -> None:
     server = ChatServer(
         _config(players=tmp_path / "players"),
         _layout(tmp_path),
-        HelpBook(entries=()),
+        _TEST_HELP,
     )
     left, right = socket.socketpair()
     try:
@@ -1076,7 +1167,7 @@ def test_lsn_lists_the_connected_newbies_with_their_address(tmp_path: Path) -> N
     save_player(players, SavedPlayer("admin", RANK_ADMIN, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Ada", RANK_SUPER, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Cyd", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    server = ChatServer(_config(players=players), _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     opened: list[socket.socket] = []
@@ -1089,6 +1180,8 @@ def test_lsn_lists_the_connected_newbies_with_their_address(tmp_path: Path) -> N
         if password is not None:
             _read_until(client, b"Password: ")
             client.sendall(password + b"\n")
+        else:
+            _accept_disclaimer(client)
         _read_until(client, b"What? > ")
         return client
 
@@ -1119,7 +1212,7 @@ def test_a_reconnect_takeover_keeps_the_newcomers_columns(tmp_path: Path) -> Non
     server = ChatServer(
         _config(players=tmp_path / "players"),
         _layout(tmp_path),
-        HelpBook(entries=()),
+        _TEST_HELP,
     )
     old_sock, old_peer = socket.socketpair()
     new_sock, new_peer = socket.socketpair()
@@ -1195,7 +1288,7 @@ def test_a_saved_player_reconnects_over_a_live_session(
     save_player(players, SavedPlayer("Cyd", RANK_RESIDENT, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Ada", RANK_SUPER, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Dee", RANK_SUPER, hash_password("pw", rounds=4)))
-    server = ChatServer(_config(players=players), _layout(tmp_path, _TINY), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path, _TINY), _TEST_HELP)
     server._resolve_hostname = lambda ip: ip
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1271,7 +1364,7 @@ def test_a_saved_player_reconnect_restores_telnet_echo(tmp_path: Path) -> None:
     players.mkdir()
     save_player(players, SavedPlayer("admin", RANK_ADMIN, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    server = ChatServer(_config(players=players), _layout(tmp_path, _TINY), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path, _TINY), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     opened: list[socket.socket] = []
@@ -1318,7 +1411,7 @@ def test_record_logout_saves_the_total_and_the_time_in_one_write(tmp_path: Path)
     players.mkdir()
     save_player(players, SavedPlayer("admin", RANK_ADMIN, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    server = ChatServer(_config(players=players), _layout(tmp_path, _TINY), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path, _TINY), _TEST_HELP)
     left, right = socket.socketpair()
     other, extra = socket.socketpair()
     try:
@@ -1348,7 +1441,7 @@ def test_record_logout_saves_the_total_and_the_time_in_one_write(tmp_path: Path)
 def test_shutdown_now_stops_the_server_and_closes_every_connection(tmp_path: Path) -> None:
     """Now reaches the rooms only, then both sockets close and the server thread ends."""
     players = _players(tmp_path)
-    server = ChatServer(_config(players=players), _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     opened: list[socket.socket] = []
@@ -1407,9 +1500,7 @@ def test_telnet_naws_sets_the_discovered_size_and_not_the_manual_width(
     assert client.discovered_columns == 255
     assert client.discovered_rows == 24
 
-    server = ChatServer(
-        _config(players=_players(tmp_path)), _layout(tmp_path), HelpBook(entries=())
-    )
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     peer: socket.socket | None = None
@@ -1439,7 +1530,7 @@ def test_telnet_hides_the_login_password(tmp_path: Path) -> None:
     players.mkdir()
     save_player(players, SavedPlayer("admin", RANK_ADMIN, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Bea", RANK_RESIDENT, hash_password("swordfish", rounds=4)))
-    server = ChatServer(_config(players=players), _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     client: socket.socket | None = None
@@ -1469,9 +1560,7 @@ def test_telnet_hides_the_login_password(tmp_path: Path) -> None:
 
 def test_telnet_strips_negotiation_before_the_name(tmp_path: Path) -> None:
     """A telnet DO sequence is not part of the name."""
-    server = ChatServer(
-        _config(players=_players(tmp_path)), _layout(tmp_path), HelpBook(entries=())
-    )
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     client: socket.socket | None = None
@@ -1479,6 +1568,7 @@ def test_telnet_strips_negotiation_before_the_name(tmp_path: Path) -> None:
         client = _connect(server._config.port)
         _read_until(client, b"Please enter your name: ")
         client.sendall(b"\xff\xfd\x01Nia\n")
+        _accept_disclaimer(client)
         heard = _read_until(client, b"The front desk")
         assert b"\xff" not in heard
     finally:
@@ -1494,7 +1584,7 @@ def test_telnet_backspace_edits_a_password(tmp_path: Path) -> None:
     players.mkdir()
     save_player(players, SavedPlayer("admin", RANK_ADMIN, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Bea", RANK_RESIDENT, hash_password("swordfish", rounds=4)))
-    server = ChatServer(_config(players=players), _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     client: socket.socket | None = None
@@ -1520,7 +1610,7 @@ def test_telnet_hides_each_password_change_prompt(tmp_path: Path) -> None:
     players.mkdir()
     save_player(players, SavedPlayer("admin", RANK_ADMIN, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Bea", RANK_RESIDENT, hash_password("swordfish", rounds=4)))
-    server = ChatServer(_config(players=players), _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     client: socket.socket | None = None
@@ -1559,7 +1649,7 @@ def test_telnet_password_change_cr_nul_then_login(tmp_path: Path) -> None:
     players.mkdir()
     save_player(players, SavedPlayer("admin", RANK_ADMIN, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Bea", RANK_RESIDENT, hash_password("swordfish", rounds=4)))
-    server = ChatServer(_config(players=players), _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(_config(players=players), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     client: socket.socket | None = None
@@ -1616,7 +1706,7 @@ def _closed_server(
         allow_residents=allow_residents,
         mfa_enabled=False,
     )
-    server = ChatServer(config, _layout(tmp_path), HelpBook(entries=()))
+    server = ChatServer(config, _layout(tmp_path), _TEST_HELP)
     opened: list[socket.socket] = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1824,6 +1914,7 @@ def test_closed_open_talker_has_no_status_line(tmp_path: Path) -> None:
     try:
         client = _connect_login(server, opened)
         client.sendall(b"Ada\n")
+        _accept_disclaimer(client)
         heard = _read_until(client, b"What? > ")
         assert b"The front desk faces the street." in heard
         assert b"[ Status ]" not in heard
@@ -1866,9 +1957,7 @@ def test_closed_resident_no_status_when_only_newbies_closed(tmp_path: Path) -> N
 
 def test_telnet_drops_a_client_with_an_endless_negotiation(tmp_path: Path) -> None:
     """An unfinished subnegotiation cannot grow without bound."""
-    server = ChatServer(
-        _config(players=_players(tmp_path)), _layout(tmp_path), HelpBook(entries=())
-    )
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     client: socket.socket | None = None
@@ -1887,3 +1976,125 @@ def test_telnet_drops_a_client_with_an_endless_negotiation(tmp_path: Path) -> No
             client.close()
         server.shutdown()
         thread.join(timeout=2)
+
+
+class _ScriptedSocket:
+    """A socket whose send results are queued. A result may be an exception."""
+
+    def __init__(self, results: list[int | BaseException]) -> None:
+        self.results = results
+
+    def send(self, data: bytes) -> int:
+        result = self.results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    def close(self) -> None:
+        return None
+
+
+def test_a_telnet_read_counts_the_port_and_the_connection(tmp_path: Path) -> None:
+    """Bytes read on telnet update telnet, combined, and that client."""
+    left, right = socket.socketpair()
+    left.setblocking(False)
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
+    client = Client(sock=left, address="127.0.0.1", accepted_at=0.0)
+    server._clients[left] = client
+    server._selector.register(left, selectors.EVENT_READ)
+    try:
+        right.sendall(b"hello")
+        server._read(left)
+        assert client.net.in_current == 5
+        assert client.net.in_pack_current == 1
+        assert server._telnet_net.in_current == 5
+        assert server._ssh_net.in_current == 0
+        assert server._combined_net.in_current == 5
+    finally:
+        right.close()
+        server.close()
+
+
+def test_an_ssh_read_does_not_touch_telnet(tmp_path: Path) -> None:
+    """An SSH client updates the SSH counter."""
+    left, right = socket.socketpair()
+    left.setblocking(False)
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
+    client = Client(sock=left, address="127.0.0.1", accepted_at=0.0, ssh=True)
+    server._clients[left] = client
+    server._selector.register(left, selectors.EVENT_READ)
+    try:
+        right.sendall(b"ab")
+        server._read(left)
+        assert server._ssh_net.in_current == 2
+        assert server._telnet_net.in_current == 0
+        assert server._combined_net.in_current == 2
+    finally:
+        right.close()
+        server.close()
+
+
+def test_a_partial_write_counts_only_the_bytes_sent(tmp_path: Path) -> None:
+    """Send returning 4 of 7 bytes is one 4-byte packet. The rest blocks."""
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
+    sock = _ScriptedSocket([4, BlockingIOError()])
+    client = Client(sock=sock, address="127.0.0.1", accepted_at=0.0)  # type: ignore[arg-type]
+    client.outgoing = bytearray(b"hello!!")
+    server._clients[sock] = client  # type: ignore[index]
+    server._selector.modify = lambda *_args: None  # type: ignore[method-assign]
+    assert server._flush(client) is True
+    assert client.net.out_current == 4
+    assert client.net.out_pack_current == 1
+    assert server._telnet_net.out_current == 4
+    assert bytes(client.outgoing) == b"o!!"
+
+
+def test_an_empty_read_and_a_zero_write_are_not_packets(tmp_path: Path) -> None:
+    """A closed read and a zero send do not increment the counters."""
+    left, right = socket.socketpair()
+    left.setblocking(False)
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
+    client = Client(sock=left, address="127.0.0.1", accepted_at=0.0)
+    server._clients[left] = client
+    server._selector.register(left, selectors.EVENT_READ)
+    right.close()
+    server._read(left)
+    assert client.net.in_pack_current == 0
+    sock = _ScriptedSocket([0])
+    other = Client(sock=sock, address="127.0.0.1", accepted_at=0.0)  # type: ignore[arg-type]
+    other.outgoing = bytearray(b"hi")
+    server._clients[sock] = other  # type: ignore[index]
+    server._flush(other)
+    assert other.net.out_pack_current == 0
+
+
+def test_a_blocked_write_is_not_a_packet(tmp_path: Path) -> None:
+    """BlockingIOError leaves the counters alone."""
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
+    sock = _ScriptedSocket([BlockingIOError()])
+    client = Client(sock=sock, address="127.0.0.1", accepted_at=0.0)  # type: ignore[arg-type]
+    client.outgoing = bytearray(b"hi")
+    server._clients[sock] = client  # type: ignore[index]
+    server._selector.modify = lambda *_args: None  # type: ignore[method-assign]
+    server._flush(client)
+    assert client.net.out_pack_current == 0
+    assert bytes(client.outgoing) == b"hi"
+
+
+def test_reconnect_adds_the_new_socket_without_resetting(tmp_path: Path) -> None:
+    """The surviving connection keeps its rates and gains the new totals."""
+    server = ChatServer(_config(players=_players(tmp_path)), _layout(tmp_path), _TEST_HELP)
+    live_sock, _other = socket.socketpair()
+    new_sock, _new_other = socket.socketpair()
+    live = Client(sock=live_sock, address="127.0.0.1", accepted_at=0.0)
+    newcomer = Client(sock=new_sock, address="127.0.0.1", accepted_at=1.0)
+    live.net.in_total = 10
+    live.net.in_bps = 2
+    newcomer.net.in_total = 7
+    newcomer.net.in_current = 3
+    server._clients[live_sock] = live
+    server._clients[new_sock] = newcomer
+    server._replace_socket(live, newcomer)
+    assert live.net.in_total == 17
+    assert live.net.in_current == 3
+    assert live.net.in_bps == 2

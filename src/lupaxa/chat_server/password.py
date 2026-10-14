@@ -18,6 +18,7 @@ from .entry import (
 )
 from .exceptions import ConfigError
 from .globals import CANNOT_NOW, MAX_PASSWORD_FAILURES, NAME_PROMPT
+from .mfa_seal import refresh_mfa_secret, seal_mfa_secret
 from .saved_player import (
     RANK_NEWBIE,
     RANK_RESIDENT,
@@ -86,22 +87,64 @@ def _mfa_enrolment_text(host: Host, client: Client, name: str, secret: str) -> s
     return "\n".join(parts) + " "
 
 
-def _after_password(host: Host, client: Client, saved: SavedPlayer) -> None:
+def _after_password(host: Host, client: Client, saved: SavedPlayer, password: str) -> None:
     """Enter, ask for a code, or start forced enrolment after a good password."""
+    plain, stored, opened = refresh_mfa_secret(password, saved.mfa_secret)
+    if stored != saved.mfa_secret or (opened and plain is not None and not saved.mfa_on):
+        updated = replace(
+            saved,
+            mfa_secret=stored,
+            mfa_on=True if opened and plain is not None else saved.mfa_on,
+        )
+        try:
+            save_player(host._roster_dir, updated)
+        except (ConfigError, OSError) as exc:
+            print(exc)
+            _restart_login(client)
+            host.send(client, f"That name cannot be used right now.\n{NAME_PROMPT}")
+            return
+        saved = updated
+    client.pending_saved = saved
+    client.pending_mfa_secret = plain or ""
     if saved.rank == RANK_RESIDENT and not host._allow_residents:
         host.send(client, "The talker is closed.\n")
         host.drop(client, announce=False)
         return
-    secret = saved.mfa_secret
-    if not host._mfa_enabled or (saved.rank == RANK_RESIDENT and secret is None):
+    if not host._mfa_enabled:
         _enter_fresh(host, client, saved)
         return
-    client.password_failures = 0
-    if secret is not None:
+    if saved.rank == RANK_RESIDENT and saved.mfa_secret is None and not saved.mfa_on:
+        _enter_fresh(host, client, saved)
+        return
+    if not opened or (saved.mfa_on and plain is None):
+        host.send(client, "Your MFA has been removed.\n")
+        if rank_allows(saved.rank, RANK_SUPER):
+            client.pending_password = password
+            client.pending_mfa_secret = new_secret()
+            client.auth = "mfa_enroll"
+            host.send(
+                client,
+                _mfa_enrolment_text(host, client, saved.name, client.pending_mfa_secret),
+            )
+            return
+        try:
+            cleared = replace(saved, mfa_on=False, mfa_secret=None)
+            save_player(host._roster_dir, cleared)
+        except (ConfigError, OSError) as exc:
+            print(exc)
+            _restart_login(client)
+            host.send(client, f"That name cannot be used right now.\n{NAME_PROMPT}")
+            return
+        _enter_fresh(host, client, cleared)
+        return
+    if plain is not None:
+        client.password_failures = 0
         client.auth = "code"
+        client.pending_password = ""
         host.send(client, code_prompt())
         return
     if rank_allows(saved.rank, RANK_SUPER):
+        client.pending_password = password
         client.pending_mfa_secret = new_secret()
         client.auth = "mfa_enroll"
         host.send(client, _mfa_enrolment_text(host, client, saved.name, client.pending_mfa_secret))
@@ -118,7 +161,7 @@ def _process_password(host: Host, client: Client, line: str) -> None:
         return
     if password_ok(line, saved.password_hash):
         client.password_failures = 0
-        _after_password(host, client, saved)
+        _after_password(host, client, saved, line)
         return
     client.password_failures += 1
     host.send(client, "Wrong password.\n")
@@ -141,7 +184,7 @@ def _process_code(host: Host, client: Client, line: str) -> None:
             _restart_login(client)
             host.send(client, NAME_PROMPT)
             return
-        secret = saved.mfa_secret
+        secret = client.pending_mfa_secret
         name = saved.name
     used = host._mfa_steps.get(name.lower())
     step = verify_totp(secret, line.strip(), now=int(time.time()), used=used)
@@ -167,13 +210,22 @@ def _process_code(host: Host, client: Client, line: str) -> None:
                 _restart_login(client)
                 host.send(client, NAME_PROMPT)
                 return
+            seal_password = client.pending_password
             try:
-                save_player(host._roster_dir, replace(fresh, mfa_secret=secret))
+                save_player(
+                    host._roster_dir,
+                    replace(
+                        fresh,
+                        mfa_secret=seal_mfa_secret(seal_password, secret),
+                        mfa_on=True,
+                    ),
+                )
             except (ConfigError, OSError) as exc:
                 print(exc)
                 _restart_login(client)
                 host.send(client, f"That name cannot be used right now.\n{NAME_PROMPT}")
                 return
+            client.pending_password = ""
             _enter_fresh(host, client, fresh)
             return
         password = client.pending_password
@@ -186,7 +238,8 @@ def _process_code(host: Host, client: Client, line: str) -> None:
                 name,
                 RANK_SUPER_ADMIN,
                 hash_password(password),
-                mfa_secret=secret,
+                mfa_secret=seal_mfa_secret(password, secret),
+                mfa_on=True,
             )
             save_player(host._roster_dir, record)
         except (ConfigError, OSError) as exc:
@@ -194,6 +247,7 @@ def _process_code(host: Host, client: Client, line: str) -> None:
             _restart_login(client)
             host.send(client, f"That name cannot be used right now.\n{NAME_PROMPT}")
             return
+        client.pending_password = ""
         _enter(host, client, name, RANK_SUPER_ADMIN)
         return
     assert saved is not None  # noqa: S101
@@ -233,6 +287,7 @@ def _process_current(host: Host, client: Client, line: str) -> None:
         _restart_login(client)
         host.send(client, f"Wrong password.\n{player_prompt(client)}")
         return
+    client.pending_current_password = line
     client.auth = "renew"
     host.send(client, set_password_prompt())
 
@@ -313,13 +368,27 @@ def _process_renew_confirm(host: Host, client: Client, line: str) -> None:
         _restart_login(client)
         host.send(client, f"{CANNOT_NOW}{player_prompt(client)}")
         return
+    current = client.pending_current_password
+    plain, stored, opened = refresh_mfa_secret(current, saved.mfa_secret)
+    if opened and plain is not None:
+        plain, stored, opened = refresh_mfa_secret(line, plain)
     try:
-        save_player(host._roster_dir, replace(saved, password_hash=hash_password(line)))
+        save_player(
+            host._roster_dir,
+            replace(
+                saved,
+                password_hash=hash_password(line),
+                mfa_secret=stored,
+                mfa_on=saved.mfa_on,
+            ),
+        )
     except (ConfigError, OSError) as exc:
         print(exc)
         _restart_login(client)
         host.send(client, f"{CANNOT_NOW}{player_prompt(client)}")
         return
+    client.pending_password = ""
+    client.pending_current_password = ""
     _restart_login(client)
     host.send(client, f"Password changed.\n{player_prompt(client)}")
 

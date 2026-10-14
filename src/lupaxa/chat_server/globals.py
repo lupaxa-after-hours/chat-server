@@ -31,4 +31,4 @@ NAME_PROMPT = "Please enter your name: "
 MAX_PASSWORD_FAILURES = 3
 CANNOT_NOW = "That name cannot be used right now.\n"
 LOCALHOST = frozenset({"127.0.0.1", "::1"})
-RESERVED_NAMES = frozenset({"me", "who", "quit"})
+RESERVED_NAMES = frozenset({"me", "who", "quit", "ssh", "telnet"})

@@ -1,5 +1,6 @@
 reception:
   description: The front desk faces the street. A bell sits on the counter.
+  enter: walks up to the front desk
   max_occupancy: 8
   exits:
     n: open_office
@@ -8,17 +9,20 @@ reception:
     s: hallway
 kitchen:
   description: The kitchen smells of coffee. Mugs crowd the sink.
+  enter: heads into the kitchen
   max_occupancy: 4
   exits:
     n: staff_room
     e: reception
 meeting_room:
   description: A long table, a whiteboard, and chairs that do not match.
+  enter: steps into the meeting room
   max_occupancy: 6
   exits:
     w: reception
 hallway:
   description: A short corridor. Two doors face each other.
+  enter: steps into the hallway
   max_occupancy: 4
   exits:
     n: reception
@@ -26,16 +30,19 @@ hallway:
     w: womens
 mens:
   description: A cubicle and a sink. The lock sticks.
+  enter: "goes into the men's room"
   max_occupancy: 1
   exits:
     w: hallway
 womens:
   description: A cubicle and a mirror. The tap drips.
+  enter: "goes into the women's room"
   max_occupancy: 1
   exits:
     e: hallway
 open_office:
   description: Rows of desks under a flickering light.
+  enter: walks into the open office
   max_occupancy: 10
   exits:
     n: corridor
@@ -44,6 +51,7 @@ open_office:
     e: server_room
 corridor:
   description: A long carpeted passage. Doors face each other.
+  enter: steps into the corridor
   max_occupancy: 6
   exits:
     s: open_office
@@ -51,16 +59,19 @@ corridor:
     w: human_resources
 accounts:
   description: Filing cabinets, and a calculator that never sleeps.
+  enter: goes into accounts
   max_occupancy: 6
   exits:
     w: corridor
 human_resources:
   description: A quiet office. Forms wait in a neat stack.
+  enter: goes into human resources
   max_occupancy: 4
   exits:
     e: corridor
 staff_room:
   description: Soft chairs, a fridge, and a pile of mugs that escaped the kitchen.
+  enter: slips into the staff room
   max_occupancy: 4
   exits:
     s: kitchen
@@ -68,17 +79,20 @@ staff_room:
     w: balcony
 balcony:
   description: A railing and a view of the street. The wind gets in.
+  enter: steps out onto the balcony
   max_occupancy: 4
   exits:
     e: staff_room
 server_room:
   description: Racks hum in the cold. A ladder stands under a hatch.
+  enter: opens the door and enters the server room
   max_occupancy: 2
   exits:
     w: open_office
     up: plant_room
 plant_room:
   description: Pipes and a roof hatch. The wind gets in.
+  enter: climbs the ladder into the plant room
   max_occupancy: 2
   exits:
     down: server_room

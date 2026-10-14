@@ -8,14 +8,17 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from .client import Client
 from .colour import cyan, plain_len, red
 from .config import Config
-from .help import HelpBook
+from .help import HelpBook, HelpStamp
 from .rooms import Layout
 from .saved_player import RANK_ADMIN, RANK_NEWBIE, RANK_SUPER, rank_allows
+
+if TYPE_CHECKING:
+    from .net import NetStats
 
 
 class Host(Protocol):
@@ -25,6 +28,9 @@ class Host(Protocol):
     _config: Config
     _layout: Layout
     _help: HelpBook
+    _help_stamp: HelpStamp
+    _help_failed: HelpStamp | None
+    _help_check_seconds: int
     _roster_dir: Path
     _shutdown_seconds: int | None
     _shutdown_reason: str
@@ -34,6 +40,10 @@ class Host(Protocol):
     _mfa_steps: dict[str, int]
     _timer_mark: float | None
     _timer_remainder: float
+    _net_count: int
+    _telnet_net: NetStats
+    _ssh_net: NetStats
+    _combined_net: NetStats
 
     @property
     def _clients(self) -> Mapping[socket.socket, Client]:

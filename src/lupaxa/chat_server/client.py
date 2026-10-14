@@ -4,9 +4,19 @@ from __future__ import annotations
 
 import socket
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from .player import Player
 from .saved_player import SavedPlayer
+
+if TYPE_CHECKING:
+    from .net import NetStats
+
+
+def _default_net_stats() -> NetStats:
+    from .net import NetStats as stats
+
+    return stats()
 
 
 @dataclass
@@ -21,6 +31,7 @@ class Client:
     pending_name: str = ""
     pending_saved: SavedPlayer | None = None
     pending_password: str = ""
+    pending_current_password: str = ""
     pending_mfa_secret: str = ""
     pending_issuer: str = ""
     password_failures: int = 0
@@ -35,6 +46,7 @@ class Client:
     discovered_columns: int | None = None
     discovered_rows: int | None = None
     frame_columns: int | None = None
+    net: NetStats = field(default_factory=_default_net_stats)
 
     def __post_init__(self) -> None:
         """Use the IP as the hostname until a lookup replaces it."""

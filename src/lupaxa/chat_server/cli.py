@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from .config import load_config
+from .config import load_banner, load_config
 from .exceptions import ChatError
 from .help import load_help
 from .rooms import load_layout
@@ -78,7 +78,8 @@ def main(argv: list[str] | None = None) -> int:
         layout = load_layout(config.rooms)
         help_book = load_help(config.help)
         ensure_players_directory(config.players)
-        server = ChatServer(config, layout, help_book)
+        banner = load_banner(Path(args.config))
+        server = ChatServer(config, layout, help_book, banner)
         try:
             server.start()
             if config.background:

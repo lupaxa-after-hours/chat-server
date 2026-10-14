@@ -13,7 +13,7 @@ import pytest
 
 from lupaxa.chat_server.config import Config
 from lupaxa.chat_server.exceptions import ServerError
-from lupaxa.chat_server.help import HelpBook
+from lupaxa.chat_server.help import HelpBook, HelpEntry
 from lupaxa.chat_server.rooms import Layout, load_layout
 from lupaxa.chat_server.server import ChatServer
 from lupaxa.chat_server.ssh import SSHListener, load_or_create_host_key
@@ -25,6 +25,8 @@ reception:
   max_occupancy: 4
   exits: {}
 """
+
+_TEST_HELP = HelpBook(entries=(HelpEntry("disclaimer", (), "Be kind."),))
 
 
 def _layout(tmp_path: Path) -> Layout:
@@ -49,7 +51,7 @@ def _server(
         ssh_host_key=tmp_path / "ssh_host_key",
         mfa_enabled=False,
     )
-    return ChatServer(config, _layout(tmp_path), HelpBook(entries=()))
+    return ChatServer(config, _layout(tmp_path), _TEST_HELP)
 
 
 def _free_port() -> int:
@@ -360,6 +362,11 @@ def test_ssh_without_a_terminal_does_not_echo_the_name(tmp_path: Path) -> None:
                 data += chunk
             prompt_end = len(data)
             process.stdin.write(b"Nia\n")
+            while b"Do you agree to these rules: " not in data:
+                chunk = await process.stdout.read(64)
+                assert chunk
+                data += chunk
+            process.stdin.write(b"yes\r")
             while b"The front desk" not in data:
                 chunk = await process.stdout.read(64)
                 assert chunk
@@ -585,6 +592,38 @@ def test_a_failed_host_key_write_leaves_no_partial_file(tmp_path: Path) -> None:
     with pytest.raises(ServerError, match="Could not write SSH host key"):
         load_or_create_host_key(path)
     assert not path.exists()
+
+
+def test_session_stores_terminal_size_before_handoff(tmp_path: Path) -> None:
+    """Width is queued before the game thread wakes for the welcome banner."""
+    from unittest.mock import MagicMock
+
+    key = load_or_create_host_key(tmp_path / "ssh_host_key")
+    order: list[str] = []
+
+    def handoff(sock: socket.socket, host: str, terminal: bool) -> None:
+        del sock, host, terminal
+        order.append("handoff")
+
+    def note_width(sock: socket.socket, columns: int, rows: int) -> None:
+        del sock, columns, rows
+        order.append("width")
+
+    listener = SSHListener("127.0.0.1", _free_port(), key, handoff, note_width)
+
+    async def stop_relay(*_args: object) -> None:
+        return
+
+    listener._to_game = stop_relay  # type: ignore[method-assign]
+    listener._to_ssh = stop_relay  # type: ignore[method-assign]
+
+    process = MagicMock()
+    process.get_extra_info.return_value = ("127.0.0.1", 12345)
+    process.get_terminal_type.return_value = "xterm"
+    process.get_terminal_size.return_value = (80, 24)
+
+    asyncio.run(listener._session(process))
+    assert order == ["width", "handoff"]
 
 
 def test_a_listener_thread_crash_raises_from_start(

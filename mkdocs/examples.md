@@ -5,10 +5,11 @@ Telnet is on port 9000 and SSH is on port 9022.
 
 ## Telnet
 
+On connect the server shows `config/files/banner.msg` centered, with two blank
+lines above it and two below it, and no version line.
+
 ```text
 $ nc 127.0.0.1 9000
-Welcome to Chat Server
-Version <version>
 
 Please enter your name: Ada
 The front desk faces the street. A bell sits on the counter.
@@ -35,7 +36,7 @@ Goodbye!
 ```
 
 The room Ada left sees `Ada goes west to Kitchen.` The kitchen, if anyone
-is already there, sees `Ada arrives from the east.`
+is already there, sees `Ada arrives.`
 
 ## SSH
 
@@ -43,5 +44,6 @@ is already there, sees `Ada arrives from the east.`
 ssh -p 9022 127.0.0.1
 ```
 
-There is no SSH password. The first prompt is still the chat name. A
-terminal shows what you type, except a password.
+There is no SSH password. The first prompt is still the chat name. The
+host key is `ssh_host_key` beside the config. See [SSH](security/ssh.md).
+A saved name with MFA is then asked for a code. See [MFA](security/mfa.md).

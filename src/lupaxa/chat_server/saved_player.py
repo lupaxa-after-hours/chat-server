@@ -14,6 +14,7 @@ import yaml
 
 from .defaults import DEFAULT_PASSWORD_ROUNDS
 from .exceptions import ConfigError
+from .mfa_seal import legacy_mfa_secret
 from .player import Player
 
 RANK_NEWBIE = "newbie"
@@ -36,10 +37,12 @@ _PLAYER_KEYS = frozenset(
         "colour",
         "connected_seconds",
         "description",
+        "entermsg",
         "hostname",
         "ip_address",
         "logged_out_at",
         "lowercase_name",
+        "mfa_on",
         "mfa_secret",
         "name",
         "password",
@@ -67,6 +70,8 @@ class SavedPlayer:
     colour: bool = True
     description: str = ""
     mfa_secret: str | None = None
+    mfa_on: bool = False
+    entermsg: str | None = None
 
     def __post_init__(self) -> None:
         """Fill the key from the display spelling when the caller did not pass one."""
@@ -185,6 +190,8 @@ def load_saved(path: Path) -> SavedPlayer | None:
     colour = _player_colour(path, payload.get("colour"))
     description = _player_description(path, payload.get("description"))
     mfa_secret = _player_mfa_secret(path, payload.get("mfa_secret"))
+    mfa_on = _player_mfa_on(path, payload.get("mfa_on"))
+    entermsg = _player_entermsg(path, payload.get("entermsg"))
     return SavedPlayer(
         name,
         rank,
@@ -198,6 +205,8 @@ def load_saved(path: Path) -> SavedPlayer | None:
         colour,
         description,
         mfa_secret,
+        mfa_on,
+        entermsg,
     )
 
 
@@ -242,6 +251,10 @@ def save_player(directory: Path, player: SavedPlayer) -> None:
         payload["description"] = player.description
     if player.mfa_secret is not None:
         payload["mfa_secret"] = player.mfa_secret
+    if player.mfa_on:
+        payload["mfa_on"] = True
+    if player.entermsg is not None:
+        payload["entermsg"] = player.entermsg
     _replace_file(path, yaml.safe_dump(payload, sort_keys=False, allow_unicode=True))
 
 
@@ -338,7 +351,29 @@ def _player_mfa_secret(path: Path, value: object) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str) or value == "":
-        raise ConfigError(f"Player file {path} mfa_secret must be a base32 secret.")
+        raise ConfigError(
+            f"Player file {path} mfa_secret must be a sealed secret or a base32 secret."
+        )
+    if value.startswith("enc1$") or legacy_mfa_secret(value):
+        return value
+    raise ConfigError(f"Player file {path} mfa_secret must be a sealed secret or a base32 secret.")
+
+
+def _player_mfa_on(path: Path, value: object) -> bool:
+    """Return whether this file still shows that MFA was on."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    raise ConfigError(f"Player file {path} mfa_on must be true or false.")
+
+
+def _player_entermsg(path: Path, value: object) -> str | None:
+    """Return a custom enter sentence, or None for the default."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or value == "" or "\n" in value or len(value) > 80:
+        raise ConfigError(f"Player file {path} entermsg must be one line of at most 80 characters.")
     return value
 
 

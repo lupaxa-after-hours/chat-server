@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from .defaults import DEFAULT_PROMPT
+from .defaults import DEFAULT_ENTERMSG, DEFAULT_PROMPT
 
 
 @dataclass
@@ -26,6 +26,7 @@ class Player:
     description: str = ""
     status: str = ""
     auto_reply: str = ""
+    entermsg: str = DEFAULT_ENTERMSG
 
     def __post_init__(self) -> None:
         """Fill the key from the display spelling when the caller did not pass one."""

@@ -40,9 +40,7 @@ def apply_asset_version(html: str, paths: list[str], version: str) -> str:
         return html
     unique = sorted({path for path in paths if path}, key=len, reverse=True)
     joined = "|".join(re.escape(path) for path in unique)
-    pattern = re.compile(
-        rf'(?P<attr>href|src)="(?P<before>[^"?]*?)(?P<path>{joined})(?:\?[^"]*)?"'
-    )
+    pattern = re.compile(rf'(?P<attr>href|src)="(?P<before>[^"?]*?)(?P<path>{joined})(?:\?[^"]*)?"')
     return pattern.sub(
         rf'\g<attr>="\g<before>\g<path>?v={version}"',
         html,

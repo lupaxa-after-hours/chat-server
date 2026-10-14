@@ -106,7 +106,7 @@ def terminal_size_value(
         and discovered_columns > 0
         and discovered_rows > 0
     ):
-        return f"{width}x{discovered_rows}  ({discovered_columns}x{discovered_rows} discovered)"
+        return f"{width}x{discovered_rows} ({discovered_columns}x{discovered_rows} discovered)"
     return f"{width}  (Pending)"
 
 
@@ -303,20 +303,6 @@ def goes_to_line(name: str | None, destination: str) -> str:
     if not name:
         return ""
     return f"{name} goes to {destination}.\n"
-
-
-def leaves_for_line(name: str | None, destination: str) -> str:
-    """Return the line a room sees when a player leaves to join someone."""
-    if not name:
-        return ""
-    return f"{name} leaves for {destination}.\n"
-
-
-def arrives_line(name: str | None) -> str:
-    """Return the line a room sees when a player arrives by joining."""
-    if not name:
-        return ""
-    return f"{name} arrives.\n"
 
 
 def _name_of(client: Client) -> str:

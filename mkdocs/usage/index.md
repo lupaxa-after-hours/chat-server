@@ -55,6 +55,6 @@ that connection.
 A connection that has not entered a room within `login_timeout` minutes is
 told `Login timed out.` and dropped. Typing does not start that clock again.
 
-SSH uses the same name prompt. There is no SSH password. A terminal shows
-what you type, except a password. Telnet hides passwords the same way when
-the client honours echo control.
+SSH uses the same name prompt. There is no SSH password. See
+[SSH](../security/ssh.md). A saved name then follows the same password and
+[MFA](../security/mfa.md) path as telnet.

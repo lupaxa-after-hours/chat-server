@@ -20,14 +20,21 @@ from .config import Config
 from .defaults import MAX_LINE_CHARS, MAX_OUTGOING_BYTES
 from .entry import _remember_address
 from .exceptions import ConfigError, ServerError
-from .help import HelpBook
+from .help import HelpBook, HelpStamp, help_stamp
 from .login import name_prompt, process_input, welcome_text
 from .mfa import register_mfa
+from .net import NetStats, add_counts, note_traffic
 from .rooms import Layout
 from .saved_player import RANK_NEWBIE, record_saved_logout
 from .ssh import SSHListener, load_or_create_host_key
 from .timer import process_timer
-from .utilities import disconnected_from_line, disconnected_line, display_address, lookup_hostname
+from .utilities import (
+    disconnected_from_line,
+    disconnected_line,
+    display_address,
+    frame_width,
+    lookup_hostname,
+)
 from .version import get_version
 
 _SELECT_TIMEOUT_SECONDS = 0.2
@@ -149,13 +156,30 @@ def _strip_telnet(client: Client, chunk: bytes) -> bytes:
 class ChatServer:
     """Bind ``0.0.0.0`` and serve until ``shutdown``."""
 
-    def __init__(self, config: Config, layout: Layout, help_book: HelpBook) -> None:
-        """Keep ``config``, ``layout``, and the help book. The socket opens in ``start``."""
+    def __init__(
+        self,
+        config: Config,
+        layout: Layout,
+        help_book: HelpBook,
+        banner: str = "",
+    ) -> None:
+        """Keep ``config``, ``layout``, the help book, and the banner.
+
+        The socket opens in ``start``.
+        """
         if config.start not in layout.rooms:
             raise ConfigError(f"Start room {config.start} is not in {config.rooms}.")
         self._config = config
         self._layout = layout
         self._help = help_book
+        self._banner = banner
+        self._net_count = 10
+        self._telnet_net = NetStats()
+        self._ssh_net = NetStats()
+        self._combined_net = NetStats()
+        self._help_stamp = help_stamp(config.help)
+        self._help_failed: HelpStamp | None = None
+        self._help_check_seconds = 0
         self.started_at = datetime.now(timezone.utc)
         self._roster_dir: Path = config.players
         self._stop = threading.Event()
@@ -347,7 +371,8 @@ class ChatServer:
         self._selector.register(sock, selectors.EVENT_READ)
         print(f"Accepting connection from {host}")
         self._send_bytes(client, bytes((255, 253, 31)))
-        self.send(client, welcome_text(get_version()))
+        width = frame_width(client.discovered_columns, client.frame_columns)
+        self.send(client, welcome_text(self._banner, width))
         self._start_hostname_lookup(client)
 
     def _hand_session(self, sock: socket.socket, host: str, terminal: bool) -> None:
@@ -384,7 +409,16 @@ class ChatServer:
             self._clients[sock] = client
             self._selector.register(sock, selectors.EVENT_READ)
             print(f"Accepting connection from {host}")
-            self.send(client, welcome_text(get_version()))
+            with self._handoff_lock:
+                stored = self._widths.pop(sock, None)
+                if stored is not None:
+                    columns, rows = stored
+                    if columns > 0:
+                        client.discovered_columns = columns
+                    if rows > 0:
+                        client.discovered_rows = rows
+            width = frame_width(client.discovered_columns, client.frame_columns)
+            self.send(client, welcome_text(self._banner, width))
             self._start_hostname_lookup(client)
 
     def _note_width(self, sock: socket.socket, columns: int, rows: int) -> None:
@@ -453,6 +487,11 @@ class ChatServer:
             client.hostname = found
             _remember_address(self, client)
 
+    def _count(self, client: Client, direction: str, size: int) -> None:
+        """Record ``size`` on this client's port, the combined counter, and the client."""
+        port = self._ssh_net if client.ssh else self._telnet_net
+        note_traffic(port, self._combined_net, client.net, direction, size)
+
     def _read(self, sock: socket.socket) -> None:
         client = self._clients.get(sock)
         if client is None:
@@ -467,6 +506,7 @@ class ChatServer:
         if chunk == b"":
             self.drop(client, announce=True)
             return
+        self._count(client, "in", len(chunk))
         self._feed(sock, chunk)
 
     def _feed(self, sock: socket.socket, chunk: bytes) -> None:
@@ -505,6 +545,7 @@ class ChatServer:
 
     def _handle_line(self, client: Client, decoded: str) -> None:
         if client.auth in (
+            "agree",
             "set",
             "confirm",
             "current",
@@ -545,7 +586,9 @@ class ChatServer:
             user = client.player
             if user is not None and user.rank == RANK_NEWBIE:
                 claimed.add(user.name.lower())
-            elif user is None and client.auth in ("set", "confirm") and client.pending_name:
+            elif (
+                user is None and client.auth in ("set", "confirm", "agree") and client.pending_name
+            ):
                 claimed.add(client.pending_name.lower())
         return claimed
 
@@ -555,6 +598,7 @@ class ChatServer:
         The old socket is offered one line. No logout is written and the room
         is not told about a disconnect.
         """
+        add_counts(live.net, newcomer.net)
         old = live.sock
         live.outgoing.clear()
         with contextlib.suppress(OSError):
@@ -662,6 +706,7 @@ class ChatServer:
             if sent == 0:
                 self.drop(client, announce=True)
                 return False
+            self._count(client, "out", sent)
             del client.outgoing[:sent]
         self._selector.modify(client.sock, selectors.EVENT_READ)
         return True
@@ -697,7 +742,7 @@ class ChatServer:
     def _unregister(self, sock: socket.socket) -> None:
         try:
             self._selector.unregister(sock)
-        except KeyError:
+        except (KeyError, ValueError):
             return
 
 

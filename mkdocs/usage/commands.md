@@ -22,8 +22,9 @@ remote. Naming yourself on `tell` or `remote` replies
 joined a room is not found.
 
 `who` lists each player who is in a room, in a frame with the name, rank,
-room players see, status, and an idle clock after 10 seconds. `w` is the
-same command. `wplease` is not. `status` sets the status others see on
+room players see, status, and an idle clock after 10 seconds. When nobody
+is in a room it replies `-=> There is currently no one connected`. `w` is
+the same command. `wplease` is not. `status` sets the status others see on
 examine, `who`, and `lsu`. At most 20 characters. `status` on its own
 clears it. It is not saved. `auto_reply` sets a line returned to anyone who
 `tell`s or `remote`s you. `auto_reply` on its own clears it. It is not saved.
@@ -49,21 +50,26 @@ zero. Typing a command sets that idle time back to zero. After each
 command, the player gets a prompt, `What? >`, including when the command
 failed. `prompt <prompt>` replaces that line. A custom prompt is stored
 with a space at the end. It is for residents and above, and a resident's
-prompt is kept for the next login. `colour on`
+prompt is kept for the next login. `entermsg <sentence>` sets the line
+others hear when you enter a room. It is for residents and above. The
+default is `arrives.` The sentence is at most 80 characters. Bare
+`entermsg` clears a saved line. `colour on`
 and `colour off` turn colour on and off. `colour` on its own tells you
 which it is. `color` is the same command. It is on by default, a newbie
 can use it, and a saved player keeps the choice. `description`
 sets the one line others see on examine. A newbie starts as
 `I am new here`, and that line is cleared when they become a resident.
-`help` lists
-the command names. `?` is the same command with no space after it, so `?say` is `help say`.
-`help <command>` shows the write-up from the help file, including for an
-alias such as `help '`. A missing topic replies `help for <topic> not found`.
+`help` replies `Syntax: help <topic>`. `?` is the same command with no
+space after it, so `?say` is `help say`. `help <topic>` shows a centered
+page, with a blank line above the box and below it. A command page includes
+the syntax. A topic that is not a command shows the paragraph, and See Also
+when one is set. A missing topic replies `help for <topic> not found`.
 
 | Command       | Aliases           | Rank       | Effect                                      |
 | ------------- | ----------------- | ---------- | ------------------------------------------- |
 | `say`         | `'`, `"`, `` ` `` | Newbie     | Say to the room                             |
 | `emote`       | `:`, `;`          | Newbie     | Emote to the room                           |
+| `entermsg`    |                   | Resident   | Set the arrive sentence                     |
 | `think`       | `~`               | Newbie     | Think to the room                           |
 | `shout`       | `!`               | Resident   | Shout to every room                         |
 | `tell`        | `.`, `>`          | Newbie     | Tell one player                             |
@@ -110,6 +116,7 @@ alias such as `help '`. A missing topic replies `help for <topic> not found`.
 | `promote`     |                   | Admin      | Move a resident or super user up one rank   |
 | `demote`      |                   | Admin      | Move an admin or super user down one rank   |
 | `shutdown`    |                   | Admin      | Count down, then stop the server            |
+| `reload`      |                   | Admin      | Read the help file again                    |
 
 A command with no text, where text is required, replies with that
 command's syntax, such as `Syntax: tell <name> <message>`. An unknown word
@@ -124,13 +131,9 @@ logins for that rank until the server stops. Resident off blocks rank
 resident only; super users and the admin still connect. It does not change
 `allow_newbies`, `allow_residents`, or `mfa_enabled` in the config file.
 
-MFA is on unless `mfa_enabled` is false in the config file, where omitted means true.
-When it is on, login asks for `Code:` after a good password when a secret is stored.
-Super users and admins must have MFA; login runs setup when they have no secret yet.
-When MFA is off, login never asks for a code and `mfa` replies `No such command 'mfa'`.
-Residents use `mfa setup` and `mfa remove`. Staff may run `mfa remove <name>` on a lower
-rank. The account named in the config is the Super Admin. If they lose their phone, clear
-`mfa_secret` in their player file by hand.
+MFA is on unless `mfa_enabled` is false. Residents use `mfa setup` and
+`mfa remove`. Staff may run `mfa remove <name>` on a lower rank. See
+[MFA](../security/mfa.md).
 
 `resident`, `warn`, `nuke`, `disconnect`, `promote`, and `demote` refuse your own
 name with `You cannot do that to yourself.` `nuke` and `disconnect` also refuse someone of your rank or higher.

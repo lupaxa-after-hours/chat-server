@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from lupaxa.chat_server.config import DEFAULT_HOST, Config, load_config
+from lupaxa.chat_server.config import DEFAULT_HOST, Config, load_banner, load_config
 from lupaxa.chat_server.exceptions import ConfigError
 
 
@@ -352,6 +352,32 @@ def test_allow_flags_must_be_booleans(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="allow_newbies must be true or false"):
         load_config(path)
+
+
+def test_load_banner_reads_the_file_beside_the_config(tmp_path: Path) -> None:
+    """The banner is files/banner.msg next to the config file."""
+    files = tmp_path / "files"
+    files.mkdir()
+    (files / "banner.msg").write_text("Hello\n", encoding="utf-8")
+    assert load_banner(tmp_path / "config.yml") == "Hello\n"
+
+
+def test_load_banner_rejects_a_missing_file(tmp_path: Path) -> None:
+    """A missing banner stops startup."""
+    config = tmp_path / "config.yml"
+    banner = tmp_path / "files" / "banner.msg"
+    with pytest.raises(ConfigError, match=rf"Cannot read banner file {banner}: .+\."):
+        load_banner(config)
+
+
+def test_load_banner_rejects_text_that_is_not_utf8(tmp_path: Path) -> None:
+    """A banner that is not UTF-8 stops startup."""
+    files = tmp_path / "files"
+    files.mkdir()
+    (files / "banner.msg").write_bytes(b"caf\xe9\n")
+    banner = files / "banner.msg"
+    with pytest.raises(ConfigError, match=rf"Banner file {banner} is not valid UTF-8: .+\."):
+        load_banner(tmp_path / "config.yml")
 
 
 def test_mfa_enabled_defaults_to_true_and_rejects_a_number(tmp_path: Path) -> None:

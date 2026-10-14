@@ -37,8 +37,8 @@ from lupaxa.chat_server.globals import NAME_PROMPT
 from lupaxa.chat_server.help import (
     HelpBook,
     HelpEntry,
-    format_entry,
-    format_index,
+    HelpStamp,
+    help_stamp,
     load_help,
 )
 from lupaxa.chat_server.login import (
@@ -48,6 +48,7 @@ from lupaxa.chat_server.login import (
     process_login,
     welcome_text,
 )
+from lupaxa.chat_server.net import NetStats
 from lupaxa.chat_server.parse import consider_name, parse_direction, process_commands
 from lupaxa.chat_server.password import confirm_password_prompt
 from lupaxa.chat_server.player import Player
@@ -75,7 +76,12 @@ from lupaxa.chat_server.su import (
     command_warn,
 )
 from lupaxa.chat_server.time import clock_phrase, duration_phrase, idle_clock
-from lupaxa.chat_server.timer import consume_seconds, note_connected_time, process_timer
+from lupaxa.chat_server.timer import (
+    apply_net_tick,
+    consume_seconds,
+    note_connected_time,
+    process_timer,
+)
 from lupaxa.chat_server.utilities import (
     center_block,
     examine_frame,
@@ -114,6 +120,7 @@ class _Player:
     pending_name: str = ""
     pending_saved: SavedPlayer | None = None
     pending_password: str = ""
+    pending_current_password: str = ""
     pending_mfa_secret: str = ""
     pending_issuer: str = ""
     password_failures: int = 0
@@ -125,6 +132,7 @@ class _Player:
     discovered_rows: int | None = 24
     frame_columns: int | None = None
     sent: list[str] = field(default_factory=list)
+    net: NetStats = field(default_factory=NetStats)
 
     def __post_init__(self) -> None:
         if self.hostname == "":
@@ -152,6 +160,10 @@ class _Host:
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     _timer_mark: float | None = None
     _timer_remainder: float = 0.0
+    _net_count: int = 10
+    _telnet_net: NetStats = field(default_factory=NetStats)
+    _ssh_net: NetStats = field(default_factory=NetStats)
+    _combined_net: NetStats = field(default_factory=NetStats)
     _shutdown_seconds: int | None = None
     _shutdown_reason: str = ""
     _allow_newbies: bool = True
@@ -185,6 +197,9 @@ class _Host:
         )
     )
     _help: HelpBook = field(default_factory=lambda: HelpBook(entries=()))
+    _help_stamp: HelpStamp = field(default_factory=lambda: HelpStamp(-1, -1))
+    _help_failed: HelpStamp | None = None
+    _help_check_seconds: int = 0
     _roster_dir: Path = Path("players")
     _client_map: dict[str, _Player] | None = None
 
@@ -294,7 +309,9 @@ class _Host:
             user = person.player
             if user is not None and user.rank == RANK_NEWBIE:
                 claimed.add(user.name.lower())
-            elif user is None and person.auth in ("set", "confirm") and person.pending_name:
+            elif (
+                user is None and person.auth in ("set", "confirm", "agree") and person.pending_name
+            ):
                 claimed.add(person.pending_name.lower())
         return claimed
 
@@ -441,6 +458,7 @@ def _route_scans_to_the_host_fake(monkeypatch: pytest.MonkeyPatch) -> None:
             if hasattr(module, name):
                 monkeypatch.setattr(module, name, func)
     monkeypatch.setattr(timer_api, "broadcast_all", broadcast_all)
+    monkeypatch.setattr(timer_api, "broadcast_admin", broadcast_admin)
 
 
 def _run(line: str, player: _Player | None = None) -> tuple[_Host, _Player]:
@@ -450,12 +468,15 @@ def _run(line: str, player: _Player | None = None) -> tuple[_Host, _Player]:
     return host, current
 
 
-def test_welcome_ends_with_the_prompt() -> None:
-    """The name prompt stays on the same line as the cursor."""
-    version = get_version()
-    text = welcome_text(version)
-    assert text == (f"Welcome to Chat Server\nVersion {version}\n\nPlease enter your name: ")
-    assert text.endswith(name_prompt())
+def test_welcome_centers_the_banner() -> None:
+    """Connect shows the banner, two blank lines, and no version."""
+    banner = "+---+\n| Hi |\n+---+\n"
+    text = welcome_text(banner, 11)
+    assert "Version" not in text
+    assert "Chat Server" not in text
+    assert text.startswith("\n\n")
+    assert text.endswith("\n\nPlease enter your name: ")
+    assert "  | Hi |" in text
     assert not text.endswith("\n")
 
 
@@ -615,8 +636,7 @@ def test_glued_command_name_is_unknown() -> None:
 def test_help_version_and_commands() -> None:
     """Local replies do not go to the room."""
     help_result, _player = _run("help")
-    visible = command_api._visible_help(_SHIPPED_HELP, RANK_NEWBIE, mfa_enabled=False)
-    assert help_result.sent == [format_index(visible)]
+    assert help_result.sent == ["Syntax: help <topic>\n"]
     assert help_result.room_lines == []
 
     version_result, _player = _run("version")
@@ -632,7 +652,8 @@ def test_help_version_and_commands() -> None:
     assert listed.sent == [f"Commands available:\n{wrapped}\n"]
     assert command_words(RANK_RESIDENT) == (
         "! \" ' , . : ; < > ? ` ~ alarm auto_reply color colour commands description emote "
-        "examine go help join look lsu main map password prompt quit recap remote retire save say "
+        "entermsg examine go help join look lsu main map password prompt quit recap remote "
+        "retire save say "
         "shout "
         "staff status tell term_width think time version w who x"
     )
@@ -717,16 +738,20 @@ def test_help_shows_an_entry_or_says_it_is_missing() -> None:
     host = _Host(_help=book)
     player = _Player()
     process_commands(host, player, "help say")  # type: ignore[arg-type]
-    assert host.sent == [
-        "say\nAliases: ' \" `\nSpeak to the other people in the room you are in.\n"
-    ]
+    page = host.sent[0]
+    assert page.startswith("\n\n")
+    assert page.endswith("\n\n")
+    assert "Command : say" in page
+    assert "Syntax  : say <message>" in page
+    assert "Aliases : ' \" `" in page
     assert host.room_lines == []
 
     host = _Host(_help=book)
     process_commands(host, _Player(), "help '")  # type: ignore[arg-type]
-    assert host.sent == [
-        "say\nAliases: ' \" `\nSpeak to the other people in the room you are in.\n"
-    ]
+    alias_page = host.sent[0]
+    assert "Command : say" in alias_page
+    assert "Syntax  : say <message>" in alias_page
+    assert "Aliases : ' \" `" in alias_page
 
     host = _Host(_help=book)
     process_commands(host, _Player(), "help nope")  # type: ignore[arg-type]
@@ -738,13 +763,59 @@ def test_help_shows_an_entry_or_says_it_is_missing() -> None:
     assert host.sent == ["help for say please not found\n"]
 
 
+def test_help_for_a_topic_that_is_not_a_command() -> None:
+    """A topic with no command shows the paragraph, and an alias still opens it."""
+    book = HelpBook(
+        entries=(
+            HelpEntry("hours", ("closing",), "The office closes at six."),
+            HelpEntry("look", (), "Show this room."),
+        )
+    )
+    host = _Host(_help=book)
+    player = _Player()
+    process_commands(host, player, "help hours")  # type: ignore[arg-type]
+    page = host.sent[0]
+    assert page.startswith("\n\n")
+    assert page.endswith("\n\n")
+    assert "The office closes at six." in page
+    assert "Command:" not in page
+    assert "Syntax" not in page
+
+    host = _Host(_help=book)
+    process_commands(host, _Player(), "help closing")  # type: ignore[arg-type]
+    assert "The office closes at six." in host.sent[0]
+    assert "Command:" not in host.sent[0]
+
+
+def test_help_hides_a_see_name_the_player_cannot_open() -> None:
+    """See Also drops a topic this rank cannot open."""
+    book = HelpBook(
+        entries=(
+            HelpEntry("hours", (), "The office closes at six.", see=("reload", "look")),
+            HelpEntry("look", (), "Show this room."),
+            HelpEntry("reload", (), "Read the help file again."),
+        )
+    )
+    host = _Host(_help=book)
+    process_commands(host, _Player(), "help hours")  # type: ignore[arg-type]
+    assert "See Also: look" in host.sent[0]
+    assert "reload" not in host.sent[0]
+
+
+def test_help_look_shows_the_command_name_as_syntax() -> None:
+    """Look has no syntax string, so the page shows the name."""
+    host, _player = _run("help look")
+    page = host.sent[0]
+    assert "Syntax  : look" in page
+    assert host.room_lines == []
+
+
 def test_prompt_follows_a_finished_command() -> None:
     """The prompt returns after success, a syntax error, and an unknown command."""
-    visible = command_api._visible_help(_SHIPPED_HELP, RANK_NEWBIE, mfa_enabled=False)
     host = _Host(_help=_SHIPPED_HELP)
     player = _Player()
     process_input(host, player, "help")  # type: ignore[arg-type]
-    assert host.sent == [format_index(visible), "What? > "]
+    assert host.sent == ["Syntax: help <topic>\n", "What? > "]
 
     process_input(host, player, "say")  # type: ignore[arg-type]
     assert host.sent[-2:] == ["Syntax: say <message>\n", "What? > "]
@@ -768,6 +839,7 @@ def test_a_newbie_entered_shows_the_default_description_on_examine(tmp_path: Pat
     host = _login_host(tmp_path)
     ada = _Player(player=None)
     process_input(host, ada, "Ada")  # type: ignore[arg-type]
+    process_input(host, ada, "yes")  # type: ignore[arg-type]
     assert ada.player is not None
     assert ada.player.description == "I am new here"
     bea = _newbie("Bea")
@@ -1092,6 +1164,23 @@ def test_load_profile_copies_a_saved_description(tmp_path: Path) -> None:
     assert user.description == "Hello"
 
 
+def test_load_profile_copies_a_saved_entermsg(tmp_path: Path) -> None:
+    """A saved player enters with the enter message from the file."""
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            entermsg="crawls into the room",
+        ),
+    )
+    host = _login_host(tmp_path)
+    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_RESIDENT)
+    entry_api._load_profile(host, user)  # type: ignore[arg-type]
+    assert user.entermsg == "crawls into the room"
+
+
 def test_promote_drops_the_default_description_or_keeps_a_custom_one(tmp_path: Path) -> None:
     """Resident promotion clears I am new here but keeps a typed description."""
     host = _login_host(tmp_path)
@@ -1255,6 +1344,60 @@ def test_go_collapses_whitespace() -> None:
     assert "Ada goes north-west to Hall.\n" in host.room_lines
 
 
+def test_go_uses_the_destination_enter_sentence() -> None:
+    """People left behind hear the room being entered."""
+    host = _Host()
+    host._layout = Layout(
+        rooms={
+            "reception": Room("The desk.", 4, {"nw": "hall"}),
+            "hall": Room("A hall.", 4, {}, "opens the door and enters the hall"),
+        }
+    )
+    ada = _Player()
+    process_commands(host, ada, "go nw")  # type: ignore[arg-type]
+    assert "Ada opens the door and enters the hall.\n" in host.room_lines
+    assert "Ada goes north-west to Hall.\n" not in host.room_lines
+
+
+def test_go_announces_the_player_enter_message() -> None:
+    """The destination hears the player's sentence, not a direction."""
+    user = Player("Ada", "reception", datetime.now(timezone.utc), entermsg="crawls into the room")
+    ada = _Player(player=user)
+    host = _Host(people=[ada])
+    process_commands(host, ada, "go nw")  # type: ignore[arg-type]
+    assert "Ada crawls into the room.\n" in host.room_lines
+    assert "Ada arrives from the south-east.\n" not in host.room_lines
+
+
+def test_join_says_who_they_went_to_join() -> None:
+    """Join names the player, not the room sentence."""
+    bea = _Player(name="Bea", room="hall")
+    host = _Host(people=[bea])
+    host._layout = Layout(
+        rooms={
+            "reception": Room("The desk.", 4, {"nw": "hall"}),
+            "hall": Room("A hall.", 4, {}, "opens the door and enters the hall"),
+        }
+    )
+    ada = _Player()
+    process_commands(host, ada, "join Bea")  # type: ignore[arg-type]
+    assert host.room_lines[0] == "Ada goes to join Bea.\n"
+
+
+def test_main_uses_the_start_room_enter_sentence() -> None:
+    """Main speaks the start room's sentence to the room being left."""
+    ada = _Player(room="hall")
+    host = _Host(people=[ada])
+    host._layout = Layout(
+        rooms={
+            "reception": Room("The desk.", 4, {"nw": "hall"}, "walks back to the desk"),
+            "hall": Room("A hall.", 4, {}),
+        }
+    )
+    process_commands(host, ada, "main")  # type: ignore[arg-type]
+    assert host.room_lines[0] == "Ada walks back to the desk.\n"
+
+
 def test_map_sends_the_map() -> None:
     """Map with no remainder sends the centered map to the player only."""
     host, player = _run("map")
@@ -1283,14 +1426,19 @@ def test_map_centers_on_the_manual_width() -> None:
 
 
 def test_question_mark_is_help() -> None:
-    """Question mark lists help, and ? say asks for the say write-up."""
+    """Bare help and bare ? reply Syntax: help <topic>. ? say and ?say show the say page."""
     listed, _player = _run("help")
+    assert listed.sent == ["Syntax: help <topic>\n"]
     asked, _player = _run("?")
-    assert asked.sent == listed.sent
+    assert asked.sent == ["Syntax: help <topic>\n"]
     topic, _player = _run("? say")
-    assert topic.sent == [format_entry(_SHIPPED_HELP.find("say"))]  # type: ignore[arg-type]
+    topic_page = topic.sent[0]
+    assert "Command : say" in topic_page
+    assert "Syntax  : say <message>" in topic_page
     stuck, _player = _run("?say")
-    assert stuck.sent == [format_entry(_SHIPPED_HELP.find("say"))]  # type: ignore[arg-type]
+    stuck_page = stuck.sent[0]
+    assert "Command : say" in stuck_page
+    assert "Syntax  : say <message>" in stuck_page
 
 
 def test_map_leaves_the_current_room_plain_when_colour_is_off() -> None:
@@ -1359,16 +1507,19 @@ def test_help_hides_shout_from_a_newbie() -> None:
 
     host = _Host(_help=book)
     process_commands(host, newbie, "help")  # type: ignore[arg-type]
-    assert host.sent == ["Commands: say\nType help <command> for more.\n"]
+    assert host.sent == ["Syntax: help <topic>\n"]
 
     resident = _Player(player=Player("Ada", "reception", when, rank=RANK_RESIDENT))
     host = _Host(_help=book)
     process_commands(host, resident, "help shout")  # type: ignore[arg-type]
-    assert host.sent == ["shout\nAliases: !\nShout to everyone.\n"]
+    shout_page = host.sent[0]
+    assert "Command : shout" in shout_page
+    assert "Syntax  : shout <message>" in shout_page
+    assert "Aliases : !" in shout_page
 
     host = _Host(_help=book)
     process_commands(host, resident, "help")  # type: ignore[arg-type]
-    assert host.sent == ["Commands: say shout\nType help <command> for more.\n"]
+    assert host.sent == ["Syntax: help <topic>\n"]
 
 
 def test_shout_reaches_everyone_and_alias_needs_no_space() -> None:
@@ -1755,7 +1906,7 @@ def test_term_width_sets_and_clears_a_manual_width() -> None:
     ada = _Player(discovered_columns=100, discovered_rows=24, frame_columns=None)
     host = _Host(people=[ada])
     process_commands(host, ada, "term_width")  # type: ignore[arg-type]
-    assert host.sent == ["  Terminal Size  : 100x24  (100x24 discovered)\n"]
+    assert host.sent == ["  Terminal Size  : 100x24 (100x24 discovered)\n"]
     host.sent.clear()
     process_commands(host, ada, "term_width 70")  # type: ignore[arg-type]
     assert ada.frame_columns == 70
@@ -1830,20 +1981,24 @@ def test_who_lists_players_rooms_and_idle() -> None:
 
     host = _Host(people=[_Player(name="Cyd", room=None)])
     process_commands(host, _Player(), "who")  # type: ignore[arg-type]
-    text = host.sent[0]
-    lines = text.splitlines()
-    assert len(lines) == 3
-    assert lines[0] == "-" * 72
-    assert lines[-1] == "-" * 72
-    assert "Name" in lines[1]
-    assert "Rank" in lines[1]
-    assert "Room" in lines[1]
-    assert "Status" in lines[1]
-    assert "Idle" in lines[1]
-    assert "Cyd" not in text
+    assert host.sent == [" -=> There is currently no one connected\n"]
 
     extra, _player = _run("who please")
     assert extra.sent == ["Syntax: who\n"]
+
+
+def test_who_lists_a_player_who_is_alone() -> None:
+    """A player in a room is listed, including when they are the only one."""
+    when = datetime.now(timezone.utc)
+    ada = _Player(
+        name="Ada",
+        room="reception",
+        player=Player("Ada", "reception", when),
+    )
+    host = _Host(people=[ada])
+    process_commands(host, ada, "who")  # type: ignore[arg-type]
+    assert "Ada" in host.sent[0]
+    assert host.sent[0] != " -=> There is currently no one connected\n"
 
 
 def test_w_lists_the_same_players_as_who() -> None:
@@ -1908,7 +2063,7 @@ def test_join_moves_to_that_players_room() -> None:
     ada = _Player()
     process_commands(host, ada, "join Bea")  # type: ignore[arg-type]
     assert ada.room == "hall"
-    assert host.room_lines == ["Ada leaves for Hall.\n", "Ada arrives.\n"]
+    assert host.room_lines == ["Ada goes to join Bea.\n", "Ada arrives.\n"]
     assert host.sent[0] == host._layout.brief("hall", [])
 
     stay = _Host(people=[_Player(name="Bea", room="reception")])
@@ -2147,7 +2302,7 @@ def test_examine_me_is_the_typist() -> None:
             ("Logged in for", "10 minutes"),
             ("Total Login", "2 hours"),
             ("Idle for", "Not idle at all"),
-            ("Terminal Size", "72x24  (72x24 discovered)"),
+            ("Terminal Size", "72x24 (72x24 discovered)"),
         ),
         72,
     )
@@ -2176,7 +2331,7 @@ def test_examine_me_is_the_typist() -> None:
                 ("Logged in for", "0 seconds"),
                 ("Total Login", "0 seconds"),
                 ("Idle for", "Not idle at all"),
-                ("Terminal Size", "72x24  (72x24 discovered)"),
+                ("Terminal Size", "72x24 (72x24 discovered)"),
             ),
             72,
         )
@@ -2195,7 +2350,7 @@ def test_examine_finds_a_connected_newbie_by_exact_name(tmp_path: Path) -> None:
             ("Logged in for", "0 seconds"),
             ("Total Login", "0 seconds"),
             ("Idle for", "Not idle at all"),
-            ("Terminal Size", "72x24  (72x24 discovered)"),
+            ("Terminal Size", "72x24 (72x24 discovered)"),
         ),
         72,
     )
@@ -2297,7 +2452,11 @@ def _login_host(tmp_path: Path, admin: str = "admin", *, opened: bool = True) ->
         admin=admin,
         mfa_enabled=False,
     )
-    return _Host(_config=config, _roster_dir=tmp_path)
+    host = _Host(_config=config, _roster_dir=tmp_path)
+    host._help = HelpBook(
+        entries=(HelpEntry("disclaimer", (), "Be kind."),),
+    )
+    return host
 
 
 def _mfa_login_host(tmp_path: Path, admin: str = "admin", *, opened: bool = True) -> _Host:
@@ -2325,6 +2484,17 @@ _MFA_REMOVED_WARNING = (
     "Your MFA has been removed. Set it up again before you log out. "
     "The next login will make you set it up before you can enter."
 )
+
+
+def _assert_sealed_mfa_secret(saved: SavedPlayer, password: str, plain_secret: str) -> None:
+    """Assert the file seal opens with ``password`` to ``plain_secret``."""
+    from lupaxa.chat_server.mfa_seal import open_mfa_secret
+
+    assert saved.mfa_secret is not None
+    assert saved.mfa_secret.startswith("enc1$")
+    assert plain_secret not in saved.mfa_secret
+    assert saved.mfa_on is True
+    assert open_mfa_secret(password, saved.mfa_secret) == plain_secret
 
 
 def _totp_code(secret: str, *, now: int = 1_700_000_000) -> str:
@@ -2366,6 +2536,215 @@ def test_mfa_login_asks_for_a_code_after_the_password(
     process_input(host, player, _totp_code(totp_seed))  # type: ignore[arg-type]
     assert player.player is not None
     assert player.player.name == "Bea"
+
+
+def test_a_plaintext_secret_still_logs_in_and_is_sealed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An old base32 secret matches a code and is stored sealed."""
+    totp_seed = TOTP_TEST_SEED
+    save_player(
+        tmp_path,
+        SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4), mfa_secret=totp_seed),
+    )
+    host = _mfa_login_host(tmp_path)
+    player = _Player(player=None)
+    monkeypatch.setattr("lupaxa.chat_server.password.time.time", lambda: 1_700_000_000.0)
+    process_input(host, player, "Bea")  # type: ignore[arg-type]
+    process_input(host, player, "pw")  # type: ignore[arg-type]
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_secret is not None
+    assert saved.mfa_secret.startswith("enc1$")
+    assert totp_seed not in saved.mfa_secret
+    assert saved.mfa_on is True
+    assert player.auth == "code"
+    assert player.player is None
+    process_input(host, player, _totp_code(totp_seed))  # type: ignore[arg-type]
+    assert player.player is not None
+    assert player.pending_password == ""
+    assert player.pending_mfa_secret == ""
+    record_saved_logout(tmp_path, player.player)
+    stayed = load_saved(player_path(tmp_path, "Bea"))
+    assert stayed is not None
+    assert stayed.mfa_secret is not None
+    assert stayed.mfa_secret.startswith("enc1$")
+    assert totp_seed not in stayed.mfa_secret
+
+
+def test_mfa_off_still_seals_a_plaintext_secret(tmp_path: Path) -> None:
+    """A turned-off server seals the secret and does not ask for a code."""
+    totp_seed = TOTP_TEST_SEED
+    save_player(
+        tmp_path,
+        SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4), mfa_secret=totp_seed),
+    )
+    host = _mfa_login_host(tmp_path)
+    host._mfa_enabled = False
+    player = _Player(player=None)
+    process_input(host, player, "Bea")  # type: ignore[arg-type]
+    process_input(host, player, "pw")  # type: ignore[arg-type]
+    assert player.player is not None
+    assert "Code:" not in "".join(host.sent)
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_secret is not None
+    assert saved.mfa_secret.startswith("enc1$")
+    assert saved.mfa_on is True
+
+
+def test_login_says_mfa_was_removed_when_the_flag_remains(tmp_path: Path) -> None:
+    """A deleted secret is obvious when the file still shows MFA was on."""
+    save_player(
+        tmp_path,
+        SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4), mfa_on=True),
+    )
+    host = _mfa_login_host(tmp_path)
+    player = _Player(player=None)
+    process_input(host, player, "Bea")  # type: ignore[arg-type]
+    process_input(host, player, "pw")  # type: ignore[arg-type]
+    assert "Your MFA has been removed.\n" in host.sent
+    assert player.player is not None
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_on is False
+
+
+def test_staff_with_the_flag_are_told_and_must_set_mfa_up(tmp_path: Path) -> None:
+    """A wiped secret still blocks staff when the file shows MFA was on."""
+    save_player(
+        tmp_path,
+        SavedPlayer("Bea", RANK_SUPER, hash_password("pw", rounds=4), mfa_on=True),
+    )
+    host = _mfa_login_host(tmp_path)
+    player = _Player(player=None)
+    process_input(host, player, "Bea")  # type: ignore[arg-type]
+    process_input(host, player, "pw")  # type: ignore[arg-type]
+    assert "Your MFA has been removed.\n" in host.sent
+    assert player.auth == "mfa_enroll"
+    assert player.player is None
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_on is True
+
+
+def test_staff_unreadable_seal_kept_until_setup_finishes(tmp_path: Path) -> None:
+    """Staff keep a seal that will not open until enrolment saves."""
+    from lupaxa.chat_server.mfa_seal import seal_mfa_secret
+
+    sealed = seal_mfa_secret("other", TOTP_TEST_SEED)
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_SUPER,
+            hash_password("pw", rounds=4),
+            mfa_secret=sealed,
+            mfa_on=True,
+        ),
+    )
+    host = _mfa_login_host(tmp_path)
+    player = _Player(player=None)
+    process_input(host, player, "Bea")  # type: ignore[arg-type]
+    process_input(host, player, "pw")  # type: ignore[arg-type]
+    assert "Your MFA has been removed.\n" in host.sent
+    assert player.auth == "mfa_enroll"
+    assert player.player is None
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_secret == sealed
+    assert saved.mfa_on is True
+
+
+def test_staff_without_the_flag_set_up_with_no_removal_line(tmp_path: Path) -> None:
+    """The first forced setup does not say MFA was removed."""
+    save_player(tmp_path, SavedPlayer("Bea", RANK_SUPER, hash_password("pw", rounds=4)))
+    host = _mfa_login_host(tmp_path)
+    player = _Player(player=None)
+    process_input(host, player, "Bea")  # type: ignore[arg-type]
+    process_input(host, player, "pw")  # type: ignore[arg-type]
+    assert "Your MFA has been removed.\n" not in host.sent
+    assert player.auth == "mfa_enroll"
+
+
+def test_mfa_off_leaves_an_unreadable_secret_in_place(tmp_path: Path) -> None:
+    """A seal that will not open is kept when MFA is turned off."""
+    from lupaxa.chat_server.mfa_seal import seal_mfa_secret
+
+    sealed = seal_mfa_secret("other", TOTP_TEST_SEED)
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            mfa_secret=sealed,
+            mfa_on=True,
+        ),
+    )
+    host = _mfa_login_host(tmp_path)
+    host._mfa_enabled = False
+    player = _Player(player=None)
+    process_input(host, player, "Bea")  # type: ignore[arg-type]
+    process_input(host, player, "pw")  # type: ignore[arg-type]
+    assert player.player is not None
+    assert "Your MFA has been removed.\n" not in host.sent
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_secret == sealed
+
+
+def test_unreadable_secret_removed_when_mfa_flag_is_off(tmp_path: Path) -> None:
+    """A seal that will not open is cleared even when mfa_on is false."""
+    from lupaxa.chat_server.mfa_seal import seal_mfa_secret
+
+    sealed = seal_mfa_secret("other", TOTP_TEST_SEED)
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            mfa_secret=sealed,
+            mfa_on=False,
+        ),
+    )
+    host = _mfa_login_host(tmp_path)
+    player = _Player(player=None)
+    process_input(host, player, "Bea")  # type: ignore[arg-type]
+    process_input(host, player, "pw")  # type: ignore[arg-type]
+    assert "Your MFA has been removed.\n" in host.sent
+    assert player.player is not None
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_secret is None
+    assert saved.mfa_on is False
+
+
+def test_an_unreadable_secret_tells_a_resident_and_is_deleted(tmp_path: Path) -> None:
+    """A seal that will not open is removed after the resident is told."""
+    from lupaxa.chat_server.mfa_seal import seal_mfa_secret
+
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            mfa_secret=seal_mfa_secret("other", TOTP_TEST_SEED),
+            mfa_on=True,
+        ),
+    )
+    host = _mfa_login_host(tmp_path)
+    player = _Player(player=None)
+    process_input(host, player, "Bea")  # type: ignore[arg-type]
+    process_input(host, player, "pw")  # type: ignore[arg-type]
+    assert "Your MFA has been removed.\n" in host.sent
+    assert player.player is not None
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_secret is None
+    assert saved.mfa_on is False
 
 
 def test_mfa_login_drops_after_three_wrong_codes(tmp_path: Path) -> None:
@@ -2429,12 +2808,13 @@ def test_mfa_super_user_enrols_on_first_login(
     body = "".join(host.sent)
     assert player.pending_mfa_secret in body
     assert "Code:" in body
-    code = _totp_code(player.pending_mfa_secret)
+    secret = player.pending_mfa_secret
+    code = _totp_code(secret)
     process_input(host, player, code)  # type: ignore[arg-type]
     assert player.player is not None
     saved = load_saved(player_path(tmp_path, "Cyd"))
     assert saved is not None
-    assert saved.mfa_secret == player.pending_mfa_secret
+    _assert_sealed_mfa_secret(saved, "pw", secret)
 
 
 def test_mfa_super_admin_first_login_waits_for_enrolment(
@@ -2455,7 +2835,7 @@ def test_mfa_super_admin_first_login_waits_for_enrolment(
     assert player.player is not None
     saved = load_saved(player_path(tmp_path, "admin"))
     assert saved is not None
-    assert saved.mfa_secret == secret
+    _assert_sealed_mfa_secret(saved, "secret", secret)
 
 
 def test_mfa_resident_without_secret_enters_on_password_alone(tmp_path: Path) -> None:
@@ -2544,7 +2924,7 @@ def test_mfa_setup_asks_password_then_saves_secret_on_code(
     process_input(host, bea, _totp_code(secret))  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
-    assert saved.mfa_secret == secret
+    _assert_sealed_mfa_secret(saved, "pw", secret)
     assert bea.auth == "name"
 
 
@@ -2617,6 +2997,7 @@ def test_mfa_remove_self_clears_secret_for_resident(
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.mfa_secret is None
+    assert saved.mfa_on is False
 
 
 def test_mfa_remove_self_then_setup_same_window(
@@ -2646,7 +3027,7 @@ def test_mfa_remove_self_then_setup_same_window(
     process_input(host, bea, _totp_code(new_secret))  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
-    assert saved.mfa_secret == new_secret
+    _assert_sealed_mfa_secret(saved, "pw", new_secret)
     assert bea.player is not None
     assert bea.auth == "name"
 
@@ -2698,6 +3079,7 @@ def test_mfa_remove_other_asks_sure_and_clears_on_yes(tmp_path: Path) -> None:
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.mfa_secret is None
+    assert saved.mfa_on is False
     assert bea.player is not None
     line = "[ Admin ] Boss removes MFA for Bea.\n"
     assert host.admin_lines == [paint_admin(ada, line)]
@@ -2718,6 +3100,7 @@ def test_mfa_remove_other_clears_logged_off_player(tmp_path: Path) -> None:
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.mfa_secret is None
+    assert saved.mfa_on is False
 
 
 def test_mfa_remove_other_refuses_equal_rank(tmp_path: Path) -> None:
@@ -2752,6 +3135,7 @@ def test_mfa_remove_other_super_admin_clears_admin(tmp_path: Path) -> None:
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.mfa_secret is None
+    assert saved.mfa_on is False
 
 
 def test_mfa_remove_other_refuses_super_admin(tmp_path: Path) -> None:
@@ -2797,14 +3181,75 @@ def test_mfa_command_missing_when_disabled(tmp_path: Path) -> None:
     assert host.sent == ["No such command 'mfa'\n"]
 
 
-def test_a_newbie_name_enters_at_once(tmp_path: Path) -> None:
-    """A name with no file and not the admin name needs no password."""
+def test_a_newbie_name_enters_after_yes(tmp_path: Path) -> None:
+    """A free name shows the disclaimer and enters after yes."""
     host = _login_host(tmp_path)
     player = _Player(player=None)
     process_input(host, player, "Ada")  # type: ignore[arg-type]
+    assert player.player is None
+    assert player.sent[-1] == "Do you agree to these rules: "
+    page_line = next(line for line in player.sent if "Be kind." in line)
+    assert page_line.startswith("\n\n")
+    process_input(host, player, "YES")  # type: ignore[arg-type]
     assert player.player is not None
     assert player.player.rank == "newbie"
-    assert host.sent[-1] == "What? > "
+    assert player.sent[-1] == "What? > "
+
+
+def test_a_newbie_must_type_yes(tmp_path: Path) -> None:
+    """Any other line repeats the prompt and does not draw the page again."""
+    host = _login_host(tmp_path)
+    player = _Player(player=None)
+    process_input(host, player, "Ada")  # type: ignore[arg-type]
+    process_input(host, player, "no")  # type: ignore[arg-type]
+    assert player.player is None
+    assert player.auth == "agree"
+    assert player.sent[-1] == "Do you agree to these rules: "
+    assert sum("Be kind." in line for line in player.sent) == 1
+    process_input(host, player, "who")  # type: ignore[arg-type]
+    assert player.sent[-1] == "Do you agree to these rules: "
+    assert player.player is None
+
+
+def test_quit_during_the_disclaimer_disconnects(tmp_path: Path) -> None:
+    """Quit at the disclaimer leaves before the room."""
+    host = _login_host(tmp_path)
+    player = _Player(player=None)
+    process_input(host, player, "Ada")  # type: ignore[arg-type]
+    process_input(host, player, "quit")  # type: ignore[arg-type]
+    assert player in host.dropped_clients
+    assert player.player is None
+    assert host.room_lines == []
+
+
+def test_yes_refuses_a_talker_that_closed(tmp_path: Path) -> None:
+    """Closing newbies while the page is up returns to the name prompt."""
+    host = _login_host(tmp_path)
+    player = _Player(player=None)
+    process_input(host, player, "Ada")  # type: ignore[arg-type]
+    host._allow_newbies = False
+    process_input(host, player, "yes")  # type: ignore[arg-type]
+    assert player.player is None
+    assert player.auth == "name"
+    assert player.sent[-1] == ("The talker is closed to new people.\nPlease enter your name: ")
+
+
+def test_a_missing_disclaimer_disconnects_the_newbie(tmp_path: Path) -> None:
+    """No disclaimer topic tells the newbie, drops them, and tells admins."""
+    host = _login_host(tmp_path)
+    host._help = HelpBook(entries=())
+    admin_user = Player("Ann", "reception", datetime.now(timezone.utc), rank="admin")
+    admin_user.colour = False
+    admin = _Player(name="Ann", player=admin_user)
+    host.people = [admin]
+    player = _Player(player=None)
+    process_input(host, player, "Ada")  # type: ignore[arg-type]
+    assert player.sent == ["The disclaimer is missing.\n"]
+    assert player in host.dropped_clients
+    assert host.announced == [False]
+    assert host.room_lines == []
+    assert host.admin_lines == ["[ Admin ] The disclaimer is missing.\n"]
+    assert player.player is None
 
 
 def test_the_admin_name_sets_and_confirms_a_password(tmp_path: Path) -> None:
@@ -3206,6 +3651,7 @@ def test_remote_login_waits_until_the_admin_password_exists(tmp_path: Path) -> N
     host.sent.clear()
     remote_name = _Player(player=None, address="10.0.0.5")
     process_input(host, remote_name, "Bea")  # type: ignore[arg-type]
+    process_input(host, remote_name, "yes")  # type: ignore[arg-type]
     assert remote_name.player is not None
     assert remote_name.player.name == "Bea"
     host.sent.clear()
@@ -3283,6 +3729,7 @@ def test_a_newbie_who_quits_frees_the_name(tmp_path: Path) -> None:
     host.sent.clear()
     later = _Player(player=None)
     process_input(host, later, "bea")  # type: ignore[arg-type]
+    process_input(host, later, "yes")  # type: ignore[arg-type]
     assert later.player is not None
     assert later.player.name == "bea"
     assert later.player.rank == RANK_NEWBIE
@@ -3305,6 +3752,7 @@ def test_a_newbie_setting_a_resident_password_still_holds_the_name(tmp_path: Pat
     process_input(host, bea, "quit")  # type: ignore[arg-type]
     host.sent.clear()
     process_input(host, newcomer, "bea")  # type: ignore[arg-type]
+    process_input(host, newcomer, "yes")  # type: ignore[arg-type]
     assert newcomer.player is not None
     assert newcomer.player.name == "bea"
     assert load_saved(player_path(tmp_path, "bea")) is None
@@ -4258,6 +4706,7 @@ def test_entry_remembers_the_address_of_a_saved_player_only(tmp_path: Path) -> N
     host = _login_host(tmp_path)
     cyd = _Player(player=None, address="10.0.0.6")
     process_input(host, cyd, "Cyd")  # type: ignore[arg-type]
+    process_input(host, cyd, "yes")  # type: ignore[arg-type]
     assert cyd.player is not None
     assert load_saved(player_path(tmp_path, "Cyd")) is None
 
@@ -4695,6 +5144,72 @@ def test_saved_player_can_change_password(tmp_path: Path) -> None:
     assert saved.connected_seconds == 90
 
 
+def test_password_change_reseals_with_the_new_password(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new password still opens the same MFA secret."""
+    from lupaxa.chat_server.mfa_seal import open_mfa_secret, seal_mfa_secret
+
+    totp_seed = TOTP_TEST_SEED
+    sealed = seal_mfa_secret("pw", totp_seed)
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            mfa_secret=sealed,
+            mfa_on=True,
+        ),
+    )
+    host = _login_host(tmp_path)
+    host._mfa_enabled = False
+    bea = _staff("Bea", RANK_RESIDENT)
+    process_commands(host, bea, "password")  # type: ignore[arg-type]
+    process_input(host, bea, "pw")  # type: ignore[arg-type]
+    process_input(host, bea, "next")  # type: ignore[arg-type]
+    process_input(host, bea, "next")  # type: ignore[arg-type]
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_secret is not None
+    assert open_mfa_secret("next", saved.mfa_secret) == totp_seed
+    assert open_mfa_secret("pw", saved.mfa_secret) is None
+
+
+def test_password_change_reseals_after_mismatch_confirm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed confirm still reseals with the new password on retry."""
+    from lupaxa.chat_server.mfa_seal import open_mfa_secret, seal_mfa_secret
+
+    totp_seed = TOTP_TEST_SEED
+    sealed = seal_mfa_secret("pw", totp_seed)
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            mfa_secret=sealed,
+            mfa_on=True,
+        ),
+    )
+    host = _login_host(tmp_path)
+    host._mfa_enabled = False
+    bea = _staff("Bea", RANK_RESIDENT)
+    process_commands(host, bea, "password")  # type: ignore[arg-type]
+    process_input(host, bea, "pw")  # type: ignore[arg-type]
+    process_input(host, bea, "next")  # type: ignore[arg-type]
+    process_input(host, bea, "nope")  # type: ignore[arg-type]
+    process_input(host, bea, "next")  # type: ignore[arg-type]
+    process_input(host, bea, "next")  # type: ignore[arg-type]
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.mfa_secret is not None
+    assert open_mfa_secret("next", saved.mfa_secret) == totp_seed
+    assert open_mfa_secret("pw", saved.mfa_secret) is None
+
+
 def test_password_wrong_current_keeps_the_old_hash(tmp_path: Path) -> None:
     """A wrong current password does not drop the player or change the file."""
     save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
@@ -4766,7 +5281,8 @@ def test_admin_commands_are_coloured_and_say_is_plain() -> None:
     assert cyan("conns") in text
     assert red("shutdown") in text
     assert cyan("say") not in text
-    assert " say " in text
+    assert red("network") in text
+    assert "say" in text.split()
 
 
 def test_commands_without_colour_have_no_codes() -> None:
@@ -4840,8 +5356,9 @@ def test_admin_words_include_the_new_commands() -> None:
         "! \" ' , . : ; < > ? ` ~ ae alarm allow at au auto_reply broadcast color "
         "colour commands connections "
         "conns demote "
-        "description disconnect emote examine go help join look lsn lsu main map nuke "
-        "password promote prompt quit recap remote resident retire save say se shout "
+        "description disconnect emote entermsg examine go help join look lsn lsu main map network "
+        "nuke "
+        "password promote prompt quit recap reload remote resident retire save say se shout "
         "shutdown st staff status su "
         "tell term_width think time version w warn who x"
     )
@@ -5218,6 +5735,269 @@ def test_shutdown_rejects_a_unicode_digit_count(tmp_path: Path) -> None:
     assert host._shutdown_seconds is None
 
 
+def test_reload_help_replaces_the_book(tmp_path: Path) -> None:
+    """reload help installs the file and tells the admin."""  # noqa: D403
+    path = tmp_path / "help.yml"
+    path.write_text("- name: say\n  aliases: []\n  text: Hello.\n", encoding="utf-8")
+    host = _Host()
+    host._config = replace(host._config, help=path)
+    host._help_failed = HelpStamp(1, 2)
+    ada = _staff("Ada", RANK_ADMIN)
+    assert ada.player is not None
+    ada.player.colour = False
+    host.people = [ada]
+    process_commands(host, ada, "reload help")  # type: ignore[arg-type]
+    loaded = host._help.find("say")
+    assert loaded is not None
+    assert loaded.text == "Hello."
+    assert host.sent == ["Help reloaded.\n"]
+    assert host.admin_lines == []
+    assert host._help_stamp == help_stamp(path)
+    assert host._help_failed is None
+
+
+def test_reload_help_keeps_the_book_when_the_file_is_not_utf8(tmp_path: Path) -> None:
+    """A non-UTF-8 file leaves the old book and tells the admin once."""
+    path = tmp_path / "help.yml"
+    path.write_text(_GOOD_HELP, encoding="utf-8")
+    host = _Host()
+    host._config = replace(host._config, help=path)
+    host._help = load_help(path)
+    previous = host._help
+    ada = _staff("Ada", RANK_ADMIN)
+    assert ada.player is not None
+    ada.player.colour = False
+    host.people = [ada]
+    path.write_bytes(_INVALID_UTF8_HELP)
+    process_commands(host, ada, "reload help")  # type: ignore[arg-type]
+    assert host._help is previous
+    assert len(host.sent) == 1
+    assert host.sent[0].startswith("Cannot reload help: Help file ")
+    assert "is not valid UTF-8:" in host.sent[0]
+    assert host.admin_lines == []
+    assert host._help_failed == help_stamp(path)
+
+
+def test_reload_help_keeps_the_book_when_the_file_is_bad(tmp_path: Path) -> None:
+    """A bad file leaves the old book and tells the admin the load error."""
+    path = tmp_path / "help.yml"
+    path.write_text("- name: say\n  aliases: []\n", encoding="utf-8")
+    host = _Host()
+    host._config = replace(host._config, help=path)
+    previous = host._help
+    ada = _staff("Ada", RANK_ADMIN)
+    assert ada.player is not None
+    ada.player.colour = False
+    host.people = [ada]
+    process_commands(host, ada, "reload help")  # type: ignore[arg-type]
+    assert host._help is previous
+    assert host.sent == ["Cannot reload help: Help entry say is missing text.\n"]
+    assert host.admin_lines == []
+    assert host._help_failed == help_stamp(path)
+
+
+def test_reload_help_reads_the_file_when_the_stamp_matches(tmp_path: Path) -> None:
+    """reload help reads the file even when the stamp already matches."""  # noqa: D403
+    path = tmp_path / "help.yml"
+    path.write_text("- name: say\n  aliases: []\n  text: Hello.\n", encoding="utf-8")
+    host = _Host()
+    host._config = replace(host._config, help=path)
+    host._help_stamp = help_stamp(path)
+    ada = _staff("Ada", RANK_ADMIN)
+    host.people = [ada]
+    process_commands(host, ada, "reload help")  # type: ignore[arg-type]
+    loaded = host._help.find("say")
+    assert loaded is not None
+    assert loaded.text == "Hello."
+
+
+def test_reload_of_an_unknown_type_does_not_read_the_file(tmp_path: Path) -> None:
+    """reload rooms is refused before the help file is opened."""  # noqa: D403
+    path = tmp_path / "help.yml"
+    path.write_text("- name: say\n  aliases: []\n  text: Hello.\n", encoding="utf-8")
+    host = _Host()
+    host._config = replace(host._config, help=path)
+    previous = host._help
+    ada = _staff("Ada", RANK_ADMIN)
+    host.people = [ada]
+    process_commands(host, ada, "reload rooms")  # type: ignore[arg-type]
+    assert host._help is previous
+    assert host.sent == ["reload for rooms not found\n"]
+
+
+def test_bare_reload_replies_with_the_syntax() -> None:
+    """reload with no type uses the normal syntax reply."""  # noqa: D403
+    ada = _staff("Ada", RANK_ADMIN)
+    host = _Host(people=[ada])
+    process_commands(host, ada, "reload")  # type: ignore[arg-type]
+    assert host.sent == ["Syntax: reload <type>\n"]
+
+
+def test_a_super_user_cannot_reload() -> None:
+    """Reload is an admin command, so a super user does not see it."""
+    ada = _staff("Ada", RANK_SUPER)
+    host = _Host(people=[ada])
+    process_commands(host, ada, "reload help")  # type: ignore[arg-type]
+    assert host.sent == ["No such command 'reload'\n"]
+
+
+_GOOD_HELP = "- name: say\n  aliases: []\n  text: Hello.\n"
+_BAD_HELP = "- name: say\n  aliases: []\n"
+_INVALID_UTF8_HELP = b"- name: say\n  aliases: []\n  text: caf\xe9\n"
+
+
+def _help_host(tmp_path: Path, text: str) -> tuple[_Host, Path]:
+    """Return an admin host whose help file is ``text`` and whose stamp matches it."""
+    path = tmp_path / "help.yml"
+    path.write_text(text, encoding="utf-8")
+    host = _Host()
+    host._config = replace(host._config, help=path)
+    host._help_stamp = help_stamp(path)
+    ada = _staff("Ada", RANK_ADMIN)
+    assert ada.player is not None
+    ada.player.colour = False
+    host.people = [ada]
+    return host, path
+
+
+def test_help_is_not_checked_before_five_minutes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """299 seconds leaves the book alone."""
+    host, path = _help_host(tmp_path, _GOOD_HELP)
+    previous = host._help
+    path.write_text(_GOOD_HELP.replace("Hello.", "Updated."), encoding="utf-8")
+    _advance(host, monkeypatch, 299)
+    assert host._help is previous
+    assert host.admin_lines == []
+
+
+def test_an_unchanged_help_file_is_left_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """300 seconds with the same stamp does not replace the book."""
+    host, _path = _help_host(tmp_path, _GOOD_HELP)
+    previous = host._help
+    _advance(host, monkeypatch, 300)
+    assert host._help is previous
+    assert host.admin_lines == []
+    assert host._help_check_seconds == 0
+
+
+def test_a_changed_help_file_reloads_without_a_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new good file replaces the book and the admin channel stays quiet."""
+    host, path = _help_host(tmp_path, _GOOD_HELP)
+    path.write_text(_GOOD_HELP.replace("Hello.", "Updated."), encoding="utf-8")
+    _advance(host, monkeypatch, 300)
+    loaded = host._help.find("say")
+    assert loaded is not None
+    assert loaded.text == "Updated."
+    assert host.admin_lines == []
+
+
+def test_a_non_utf8_help_file_is_announced_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A non-UTF-8 file keeps the book and announces that stamp once."""
+    host, path = _help_host(tmp_path, _GOOD_HELP)
+    host._help = load_help(path)
+    previous = host._help
+    path.write_bytes(_INVALID_UTF8_HELP)
+    _advance(host, monkeypatch, 300)
+    assert host._help is previous
+    assert len(host.admin_lines) == 1
+    assert host.admin_lines[0].startswith("[ Admin ] Cannot reload help: Help file ")
+    assert "is not valid UTF-8:" in host.admin_lines[0]
+    _advance(host, monkeypatch, 300)
+    assert len(host.admin_lines) == 1
+
+
+def test_a_bad_change_is_announced_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same failed stamp does not announce again. 700 seconds checks once."""
+    host, path = _help_host(tmp_path, _GOOD_HELP)
+    previous = host._help
+    path.write_text(_BAD_HELP, encoding="utf-8")
+    _advance(host, monkeypatch, 700)
+    assert host._help is previous
+    assert host._help_check_seconds == 100
+    assert host.admin_lines == ["[ Admin ] Cannot reload help: Help entry say is missing text.\n"]
+    _advance(host, monkeypatch, 300)
+    assert host._help is previous
+    assert len(host.admin_lines) == 1
+
+
+def test_a_missing_help_file_is_announced_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleting the file keeps the book and announces that version once."""
+    host, path = _help_host(tmp_path, _GOOD_HELP)
+    previous = host._help
+    path.unlink()
+    _advance(host, monkeypatch, 300)
+    assert host._help is previous
+    assert len(host.admin_lines) == 1
+    assert host.admin_lines[0].startswith("[ Admin ] Cannot reload help: Cannot read help file ")
+    _advance(host, monkeypatch, 300)
+    assert len(host.admin_lines) == 1
+
+
+def test_a_fix_after_a_failed_reload_clears_the_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A later good file replaces the book and does not send another admin line."""
+    host, path = _help_host(tmp_path, _GOOD_HELP)
+    path.write_text(_BAD_HELP, encoding="utf-8")
+    _advance(host, monkeypatch, 300)
+    path.write_text(_GOOD_HELP.replace("Hello.", "Fixed."), encoding="utf-8")
+    _advance(host, monkeypatch, 300)
+    loaded = host._help.find("say")
+    assert loaded is not None
+    assert loaded.text == "Fixed."
+    assert len(host.admin_lines) == 1
+
+
+def test_a_manual_failure_is_not_announced_again_by_the_timer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reload help records the failed stamp, so the timer stays quiet."""
+    host, path = _help_host(tmp_path, _GOOD_HELP)
+    ada = host.people[0]
+    path.write_text(_BAD_HELP, encoding="utf-8")
+    process_commands(host, ada, "reload help")  # type: ignore[arg-type]
+    assert host.admin_lines == []
+    _advance(host, monkeypatch, 300)
+    assert host.admin_lines == []
+
+
+def test_a_later_bad_save_is_announced_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A new failed stamp is announced once, after an earlier failure."""
+    host, path = _help_host(tmp_path, _GOOD_HELP)
+    path.write_text(_BAD_HELP, encoding="utf-8")
+    _advance(host, monkeypatch, 300)
+    path.write_text("- name: look\n  aliases: []\n", encoding="utf-8")
+    _advance(host, monkeypatch, 300)
+    assert host.admin_lines == [
+        "[ Admin ] Cannot reload help: Help entry say is missing text.\n",
+        "[ Admin ] Cannot reload help: Help entry look is missing text.\n",
+    ]
+
+
+def test_help_is_not_reloaded_while_the_server_is_stopping(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stopping server does not read a changed help file."""
+    host, path = _help_host(tmp_path, _GOOD_HELP)
+    previous = host._help
+    path.write_text(_GOOD_HELP.replace("Hello.", "Updated."), encoding="utf-8")
+    host.stopped = True
+    _advance(host, monkeypatch, 300)
+    assert host._help is previous
+
+
 def test_a_login_that_never_enters_is_timed_out(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -5300,6 +6080,7 @@ def test_a_newbie_enters_with_no_total(tmp_path: Path) -> None:
     host = _login_host(tmp_path)
     ada = _Player(player=None)
     process_input(host, ada, "Ada")  # type: ignore[arg-type]
+    process_input(host, ada, "yes")  # type: ignore[arg-type]
     assert ada.player is not None
     assert ada.player.connected_seconds == 0
     assert ada.player.flushed_seconds == 0
@@ -5320,6 +6101,89 @@ def test_a_new_resident_is_saved_with_the_total_so_far(tmp_path: Path) -> None:
     assert bea.player.flushed_seconds == 120
 
 
+def test_a_newbie_cannot_set_entermsg() -> None:
+    """The command does not exist below resident."""
+    host, _player = _run("entermsg crawls into the room")
+    assert host.sent == ["No such command 'entermsg'\n"]
+
+
+def test_a_resident_sets_and_clears_entermsg(tmp_path: Path) -> None:
+    """The sentence is saved, and a bare command removes it."""
+    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
+    host = _login_host(tmp_path)
+    bea = _staff("Bea", RANK_RESIDENT)
+    process_commands(host, bea, "entermsg crawls into the room")  # type: ignore[arg-type]
+    assert host.sent[-1] == "Enter message set.\n"
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.entermsg == "crawls into the room"
+    host.sent.clear()
+    process_commands(host, bea, "entermsg")  # type: ignore[arg-type]
+    assert "Enter message cleared.\n" in host.sent[-1]
+    cleared = load_saved(player_path(tmp_path, "Bea"))
+    assert cleared is not None
+    assert cleared.entermsg is None
+
+
+def test_entermsg_rejects_more_than_80_characters(tmp_path: Path) -> None:
+    """A long sentence is refused and the file stays unchanged."""
+    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
+    host = _login_host(tmp_path)
+    bea = _staff("Bea", RANK_RESIDENT)
+    process_commands(host, bea, "entermsg " + ("x" * 81))  # type: ignore[arg-type]
+    assert "An enter message is at most 80 characters.\n" in "".join(host.sent)
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.entermsg is None
+
+
+def _entermsg_of(tmp_path: Path) -> str | None:
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    return saved.entermsg
+
+
+def test_the_default_entermsg_stores_no_key(tmp_path: Path) -> None:
+    """Choosing the usual line removes a saved enter message."""
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            entermsg="crawls into the room",
+        ),
+    )
+    host = _login_host(tmp_path)
+    bea = _staff("Bea", RANK_RESIDENT)
+    process_commands(host, bea, "entermsg arrives.")  # type: ignore[arg-type]
+    assert _entermsg_of(tmp_path) is None
+    assert "entermsg" not in (tmp_path / "bea.yml").read_text(encoding="utf-8")
+    assert bea.player is not None
+    assert bea.player.entermsg == "arrives."
+    assert host.sent == ["Enter message set.\n"]
+
+
+def test_save_after_default_entermsg_stores_no_key(tmp_path: Path) -> None:
+    """Save keeps the default enter message out of the player file."""
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            entermsg="crawls into the room",
+        ),
+    )
+    host = _login_host(tmp_path)
+    bea = _staff("Bea", RANK_RESIDENT)
+    process_commands(host, bea, "entermsg arrives.")  # type: ignore[arg-type]
+    host.sent.clear()
+    process_commands(host, bea, "save")  # type: ignore[arg-type]
+    assert _entermsg_of(tmp_path) is None
+    assert "entermsg" not in (tmp_path / "bea.yml").read_text(encoding="utf-8")
+
+
 def test_a_newbie_cannot_set_a_prompt() -> None:
     """A newbie is told prompt does not exist, and help hides it."""
     when = datetime.now(timezone.utc)
@@ -5335,7 +6199,7 @@ def test_a_newbie_cannot_set_a_prompt() -> None:
     assert helped.sent == ["help for prompt not found\n"]
     listed = _Host(_help=book)
     process_commands(listed, newbie, "help")  # type: ignore[arg-type]
-    assert listed.sent == ["Commands: say\nType help <command> for more.\n"]
+    assert listed.sent == ["Syntax: help <topic>\n"]
 
     assert "prompt" not in command_words(RANK_NEWBIE).split()
     assert "prompt" in command_words(RANK_RESIDENT).split()
@@ -5526,3 +6390,130 @@ def test_a_wide_plain_cell_grows_the_rule() -> None:
     assert wide.splitlines()[0] == "-" * 44
     coloured = list_frame(("Name",), [(red("Ada"),)], 72)
     assert coloured.splitlines()[0] == "-" * 72
+
+
+def test_ten_seconds_rolls_port_and_connection_counters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One 10-second step rolls telnet, combined, and the connection."""
+    host = _login_host(tmp_path)
+    host._timer_mark = 0.0
+    host._timer_remainder = 0.0
+    person = _Player(player=Player("Ada", "hall", datetime.now(timezone.utc)))
+    person.net.in_current = 25
+    host._telnet_net.in_current = 25
+    host._combined_net.in_current = 25
+    host.people = [person]
+    monkeypatch.setattr("lupaxa.chat_server.timer.time.monotonic", lambda: 10.0)
+    process_timer(host)  # type: ignore[arg-type]
+    assert host._net_count == 10
+    assert host._telnet_net.in_total == 25
+    assert host._telnet_net.in_bps == 2
+    assert host._telnet_net.in_average == 1
+    assert host._telnet_net.in_current == 0
+    assert person.net.in_total == 25
+    assert person.net.in_current == 0
+
+
+def test_a_short_window_is_still_divided_by_ten(tmp_path: Path) -> None:
+    """Three bytes in a window that closes early have a rate of 0."""
+    host = _login_host(tmp_path)
+    host._net_count = 1
+    person = _Player()
+    person.net.in_current = 3
+    host.people = [person]
+    apply_net_tick(host, 1)  # type: ignore[arg-type]
+    assert person.net.in_bps == 0
+    assert person.net.in_total == 3
+
+
+def test_a_fifteen_second_tick_rolls_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A late tick divides by 10 once and sets the countdown back to 10."""
+    host = _login_host(tmp_path)
+    host._timer_mark = 0.0
+    host._timer_remainder = 0.0
+    host._telnet_net.in_current = 100
+    monkeypatch.setattr("lupaxa.chat_server.timer.time.monotonic", lambda: 15.0)
+    process_timer(host)  # type: ignore[arg-type]
+    assert host._net_count == 10
+    assert host._telnet_net.in_bps == 10
+    assert host._telnet_net.in_total == 100
+
+
+def test_telnet_and_ssh_cannot_be_names() -> None:
+    """Those words are reserved in any case, like me."""
+    for typed in ("telnet", "SSH", " Telnet "):
+        decision = consider_name(typed, set())
+        assert decision.name is None
+        assert decision.reply == (
+            f"{typed.strip()} cannot be used. Pick another name.\n\nPlease enter your name: "
+        )
+
+
+def test_a_resident_cannot_use_network(tmp_path: Path) -> None:
+    """Below admin, network is not a command."""
+    host = _login_host(tmp_path)
+    user = Player("Ada", "reception", datetime.now(timezone.utc), rank=RANK_RESIDENT)
+    player = _Player(player=user)
+    process_commands(host, player, "network")  # type: ignore[arg-type]
+    assert player.sent[-1] == "No such command 'network'\n"
+
+
+def test_network_with_no_argument_shows_the_combined_box(tmp_path: Path) -> None:
+    """Bare network is the combined counter."""
+    host = _login_host(tmp_path)
+    host._combined_net.in_total = 1500
+    host._telnet_net.in_total = 9
+    user = Player("Ann", "reception", datetime.now(timezone.utc), rank=RANK_ADMIN)
+    player = _Player(player=user)
+    host.people = [player]
+    process_commands(host, player, "network")  # type: ignore[arg-type]
+    assert "1.5 KB" in player.sent[-1]
+    assert "9 B" not in player.sent[-1]
+
+
+def test_network_telnet_and_ssh_select_those_ports(tmp_path: Path) -> None:
+    """The port words win in any case."""
+    host = _login_host(tmp_path)
+    host._telnet_net.in_total = 1500
+    host._ssh_net.out_total = 300_000_000
+    user = Player("Ann", "reception", datetime.now(timezone.utc), rank=RANK_ADMIN)
+    player = _Player(player=user)
+    host.people = [player]
+    process_commands(host, player, "network TELNET")  # type: ignore[arg-type]
+    assert "1.5 KB" in player.sent[-1]
+    process_commands(host, player, "network ssh")  # type: ignore[arg-type]
+    assert "300.0 MB" in player.sent[-1]
+
+
+def test_network_shows_one_connection_from_accept(tmp_path: Path) -> None:
+    """The player's box is the connection counter, including login bytes."""
+    host = _login_host(tmp_path)
+    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_RESIDENT)
+    bea = _Player(name="Bea", player=user, room="hall")
+    bea.net.in_total = 999
+    admin_user = Player("Ann", "reception", datetime.now(timezone.utc), rank=RANK_ADMIN)
+    admin = _Player(player=admin_user)
+    host.people = [admin, bea]
+    process_commands(host, admin, "network bea")  # type: ignore[arg-type]
+    assert "999 B" in admin.sent[-1]
+
+
+def test_network_reports_a_missing_player_and_extra_words(tmp_path: Path) -> None:
+    """An unknown name and a second word are refused."""
+    host = _login_host(tmp_path)
+    user = Player("Ann", "reception", datetime.now(timezone.utc), rank=RANK_ADMIN)
+    player = _Player(player=user)
+    host.people = [player]
+    process_commands(host, player, "network Ada")  # type: ignore[arg-type]
+    assert player.sent[-1] == "Player Ada not found.\n"
+    process_commands(host, player, "network telnet please")  # type: ignore[arg-type]
+    assert player.sent[-1] == "Syntax: network [telnet|ssh|<player>]\n"
+
+
+def test_a_saved_player_file_has_no_network_fields(tmp_path: Path) -> None:
+    """Traffic counters are not written to the player file."""
+    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
+    text = player_path(tmp_path, "Bea").read_text(encoding="utf-8")
+    assert "in_total" not in text
+    assert "in_bps" not in text

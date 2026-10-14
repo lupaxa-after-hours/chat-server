@@ -8,11 +8,11 @@ import pytest
 
 from lupaxa.chat_server.exceptions import ConfigError
 from lupaxa.chat_server.rooms import (
-    arrive_line,
     cannot_go_line,
     full_line,
     leave_line,
     load_layout,
+    spoken_line,
 )
 
 _OFFICE = """\
@@ -83,12 +83,47 @@ court:
     assert "south-east" not in brief
 
 
+def test_spoken_line_adds_a_stop_unless_one_is_there() -> None:
+    """The name comes first. Punctuation is added once."""
+    assert spoken_line("Ada", "opens the door") == "Ada opens the door.\n"
+    assert spoken_line("Ada", "stops!") == "Ada stops!\n"
+    assert spoken_line(None, "opens the door") == ""
+
+
+def test_enter_is_optional_and_rejects_a_number(tmp_path: Path) -> None:
+    """A blank enter is absent. A number is not a sentence."""
+    path = _write(
+        tmp_path,
+        _OFFICE.replace(
+            "description: A hall.",
+            "description: A hall.\n  enter: '  '\n",
+            1,
+        ),
+    )
+    layout = load_layout(path)
+    assert layout.rooms["hall"].enter is None
+    path = _write(
+        tmp_path,
+        _OFFICE.replace("description: A hall.", "description: A hall.\n  enter: 1\n", 1),
+    )
+    with pytest.raises(ConfigError, match="Room hall enter must be a string"):
+        load_layout(path)
+    path = _write(
+        tmp_path,
+        _OFFICE.replace(
+            "description: A hall.\n",
+            "description: A hall.\n  enter: |\n    one\n    two\n",
+            1,
+        ),
+    )
+    with pytest.raises(ConfigError, match="Room hall enter must be one line"):
+        load_layout(path)
+
+
 def test_move_lines() -> None:
-    """Leave, arrive, full, and blocked lines use the long direction."""
+    """Leave, arrive, full, and blocked lines match the helpers."""
     assert leave_line("Ada", "w", "Kitchen") == "Ada goes west to Kitchen.\n"
-    assert arrive_line("Ada", "w") == "Ada arrives from the east.\n"
-    assert arrive_line("Ada", "up") == "Ada arrives from below.\n"
-    assert arrive_line("Ada", "down") == "Ada arrives from above.\n"
+    assert spoken_line("Ada", "arrives.") == "Ada arrives.\n"
     assert full_line("Toilet") == "Toilet is full.\n"
     assert cannot_go_line("w") == "You cannot go west.\n"
 
@@ -151,6 +186,8 @@ def test_shipped_layout() -> None:
     assert layout.rooms["server_room"].max_occupancy == 2
     assert layout.rooms["plant_room"].max_occupancy == 2
     assert layout.rooms["kitchen"].max_occupancy == 4
+    assert all(room.enter for room in layout.rooms.values())
+    assert layout.rooms["server_room"].enter == ("opens the door and enters the server room")
     assert layout.rooms["staff_room"].exits == {
         "s": "kitchen",
         "e": "open_office",

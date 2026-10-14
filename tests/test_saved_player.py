@@ -30,6 +30,14 @@ from lupaxa.chat_server.saved_player import (
 from lupaxa.chat_server.utilities import display_address
 
 
+def _write_player(tmp_path: Path, extra: str = "") -> Path:
+    hashed = hash_password("secret", rounds=4)
+    path = player_path(tmp_path, "Bea")
+    base = f"name: Bea\nlowercase_name: bea\nrank: resident\npassword: {hashed}\n"
+    path.write_text(base + extra, encoding="utf-8")
+    return path
+
+
 def test_savable_name_is_three_to_twenty_letters_or_digits() -> None:
     """A saved name matches the typed-name rule."""
     assert savable_name("Admin") is True
@@ -116,14 +124,70 @@ def test_mfa_secret_rejects_empty_or_non_string(tmp_path: Path) -> None:
         f"name: Bea\nlowercase_name: bea\nrank: resident\npassword: {hashed}\nmfa_secret: ''\n",
         encoding="utf-8",
     )
-    with pytest.raises(ConfigError, match="mfa_secret must be a base32 secret"):
+    with pytest.raises(ConfigError, match="must be a sealed secret or a base32 secret"):
         load_saved(path)
     path.write_text(
         f"name: Bea\nlowercase_name: bea\nrank: resident\npassword: {hashed}\nmfa_secret: 1\n",
         encoding="utf-8",
     )
-    with pytest.raises(ConfigError, match="mfa_secret must be a base32 secret"):
+    with pytest.raises(ConfigError, match="must be a sealed secret or a base32 secret"):
         load_saved(path)
+
+
+def test_mfa_on_defaults_to_false_and_rejects_a_number(tmp_path: Path) -> None:
+    """The MFA flag is off unless the file says true."""
+    path = _write_player(tmp_path, "mfa_on: 1\n")
+    with pytest.raises(ConfigError, match="mfa_on must be true or false"):
+        load_saved(path)
+    path = _write_player(tmp_path, "mfa_secret: not-a-secret\n")
+    with pytest.raises(ConfigError, match="must be a sealed secret or a base32 secret"):
+        load_saved(path)
+    loaded = load_saved(_write_player(tmp_path))
+    assert loaded is not None
+    assert loaded.mfa_on is False
+    sealed = "enc1$fake-token"
+    path = _write_player(tmp_path, f"mfa_secret: {sealed}\n")
+    with_secret = load_saved(path)
+    assert with_secret is not None
+    assert with_secret.mfa_secret == sealed
+
+
+def test_mfa_on_round_trips(tmp_path: Path) -> None:
+    """A true flag is still true after a save."""
+    save_player(
+        tmp_path,
+        SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4), mfa_on=True),
+    )
+    loaded = load_saved(player_path(tmp_path, "Bea"))
+    assert loaded is not None
+    assert loaded.mfa_on is True
+
+
+def test_entermsg_is_optional_and_rejects_a_blank(tmp_path: Path) -> None:
+    """A missing sentence stays the default. A blank line is not stored."""
+    path = _write_player(tmp_path)
+    loaded = load_saved(path)
+    assert loaded is not None
+    assert loaded.entermsg is None
+    path = _write_player(tmp_path, "entermsg: ''\n")
+    with pytest.raises(ConfigError, match="entermsg must be one line of at most 80"):
+        load_saved(path)
+
+
+def test_entermsg_round_trips_when_it_is_not_the_default(tmp_path: Path) -> None:
+    """A custom sentence is still there after a save."""
+    save_player(
+        tmp_path,
+        SavedPlayer(
+            "Bea",
+            RANK_RESIDENT,
+            hash_password("pw", rounds=4),
+            entermsg="crawls into the room",
+        ),
+    )
+    loaded = load_saved(player_path(tmp_path, "Bea"))
+    assert loaded is not None
+    assert loaded.entermsg == "crawls into the room"
 
 
 def test_same_key_updates_the_display_spelling(tmp_path: Path) -> None:

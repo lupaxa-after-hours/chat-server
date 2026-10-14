@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from .channel import broadcast_admin
 from .client import Client
 from .commands_list import Host, by_name
-from .entry import _ask, _enter, name_taken_reply, player_prompt
+from .entry import _ask, _enter, _restart_login, name_taken_reply, player_prompt
 from .exceptions import ConfigError
 from .globals import LOCALHOST, NAME_PROMPT
+from .help import format_page
 from .mfa import (
     _process_mfa_pw,
     _process_mfa_remove_code,
@@ -29,7 +31,9 @@ from .password import (
     set_password_prompt,
 )
 from .saved_player import RANK_NEWBIE
-from .utilities import _find_saved
+from .utilities import _find_saved, center_block, frame_width
+
+AGREE_PROMPT = "Do you agree to these rules: "
 
 
 def admin_gate_reply() -> str:
@@ -42,9 +46,11 @@ def name_prompt() -> str:
     return NAME_PROMPT
 
 
-def welcome_text(version: str) -> str:
-    """Return the banner plus the name prompt."""
-    return f"Welcome to Chat Server\nVersion {version}\n\n{NAME_PROMPT}"
+def welcome_text(banner: str, width: int) -> str:
+    """Return the centered banner, two blank lines, and the name prompt."""
+    block = banner[:-1] if banner.endswith("\n") else banner
+    centered = center_block(block + "\n", width)
+    return f"\n\n{centered}\n\n{NAME_PROMPT}"
 
 
 def _unsaved_holder_may_quit(client: Client) -> bool:
@@ -52,7 +58,7 @@ def _unsaved_holder_may_quit(client: Client) -> bool:
     user = client.player
     if user is not None and user.rank == RANK_NEWBIE:
         return True
-    return user is None and client.auth in ("set", "confirm")
+    return user is None and client.auth in ("set", "confirm", "agree")
 
 
 def _run_named(host: Host, client: Client, word: str) -> None:
@@ -133,6 +139,8 @@ def process_login(host: Host, client: Client, line: str) -> None:
         _process_mfa_remove_code(host, client, line)
     elif client.auth == "mfa_sure":
         _process_mfa_sure(host, client, line)
+    elif client.auth == "agree":
+        _process_agree(host, client, line)
     else:
         _process_name(host, client, line)
 
@@ -182,4 +190,32 @@ def _process_name(host: Host, client: Client, line: str) -> None:
     if not host._allow_newbies or not host._allow_residents:
         host.send(client, f"The talker is closed to new people.\n{NAME_PROMPT}")
         return
-    _enter(host, client, name, "newbie")
+    _show_disclaimer(host, client, name)
+
+
+def _show_disclaimer(host: Host, client: Client, name: str) -> None:
+    """Show the disclaimer, or drop the newbie when that topic is missing."""
+    entry = host._help.find("disclaimer")
+    if entry is None:
+        host.send(client, "The disclaimer is missing.\n")
+        broadcast_admin(host, "[ Admin ] The disclaimer is missing.\n")
+        host.drop(client, announce=False)
+        return
+    _ask(client, "agree", name, None)
+    width = frame_width(client.discovered_columns, client.frame_columns)
+    visible = frozenset(item.name for item in host._help.entries)
+    page = format_page(entry, None, width, visible=visible)
+    host.send(client, f"\n\n{page}\n")
+    host.send(client, AGREE_PROMPT)
+
+
+def _process_agree(host: Host, client: Client, line: str) -> None:
+    """Enter on yes. Any other line asks again."""
+    if line.strip().lower() != "yes":
+        host.send(client, AGREE_PROMPT)
+        return
+    if not host._allow_newbies or not host._allow_residents:
+        _restart_login(client)
+        host.send(client, f"The talker is closed to new people.\n{NAME_PROMPT}")
+        return
+    _enter(host, client, client.pending_name, "newbie")
