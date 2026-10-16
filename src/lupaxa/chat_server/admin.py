@@ -11,12 +11,12 @@ from .commands import Command, shown_syntax
 from .country import address_text, ipinfo_fields, is_local_address, is_private_address, normalised_address, read_ipinfo
 from .exceptions import ConfigError
 from .globals import CANNOT_NOW, COMMANDS
-from .player import find_player, is_logged_in, match_online_player
+from .player import is_logged_in, match_online_player
 from .ranks import Rank, rank_allows, rank_label
 from .roles import ROLE_LABELS, ROLE_WORDS, appoint_to_role, dismiss_from_role, role_from_name
 from .saved_player import SavedPlayer, has_set_mfa, save_player
 from .server import Server
-from .utilities import examine_frame, find_saved, frame_width, get_clients, get_parts, get_player_name, get_saved_player, has_rank, lookup_hostname, refuses_self, saved_players
+from .utilities import examine_frame, find_player, find_saved, frame_width, get_clients, get_parts, get_player_name, get_saved_player, has_rank, lookup_hostname, refuses_self, saved_players
 
 
 def command_au(server: Server, client: Client, command: Command, text: str | None) -> None:

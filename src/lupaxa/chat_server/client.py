@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import socket
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from .netstats import NetStats
@@ -78,6 +78,23 @@ class Client:
         if self.player is None or room_id is None:
             return
         self.player.room = room_id
+
+
+class LockServer(Protocol):
+    """A server that can still send while a screen is locked."""
+
+    def send(self, client: Client, text: str) -> bool:
+        """Queue text for one client."""
+        raise NotImplementedError
+
+
+def send_lock_line(server: LockServer, client: Client, text: str) -> None:
+    """Send ``text`` even while this connection's screen is locked."""
+    client.show_lock = True
+    try:
+        server.send(client, text)
+    finally:
+        client.show_lock = False
 
 
 def output_hidden(client: object) -> bool:

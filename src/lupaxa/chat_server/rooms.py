@@ -6,17 +6,23 @@ import re
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Protocol
 
 import yaml
 
 from .client import Client
 from .colour import green, plain_len
+from .config import Config
 from .exceptions import ConfigError
 from .player import is_logged_in
 
-if TYPE_CHECKING:
-    from .server import Server
+
+class HouseServer(Protocol):
+    """The config and layout a house file is read from."""
+
+    config: Config
+    layout: Layout
+
 
 ROOM_ID = re.compile(r"^[a-z0-9_]+$")
 HOME_ID = re.compile(r"^home_[a-z][a-z0-9]{2,19}$")
@@ -422,7 +428,7 @@ def house_path_blocked(rooms_file: Path, help_file: Path, name: str) -> bool:
         return True
 
 
-def unlink_house(server: Server, name: str) -> None:
+def unlink_house(server: HouseServer, name: str) -> None:
     """Delete ``name``'s house file when it is really theirs."""
     if house_path_blocked(server.config.rooms, server.config.help, name):
         return
@@ -470,7 +476,7 @@ def write_default_house(system_file: Path, name: str) -> None:
     path.write_text(f"{room_id}:\n  description: You are home.\n  max_occupancy: 1\n  exits: {{}}\n", encoding="utf-8")
 
 
-def restore_saved_room(server: Server, name: str, room_id: str | None) -> str:
+def restore_saved_room(server: HouseServer, name: str, room_id: str | None) -> str:
     """Return the room id to put ``name`` back in."""
     if room_id is None:
         return VOID_ID

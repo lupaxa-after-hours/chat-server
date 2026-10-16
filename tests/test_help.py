@@ -11,9 +11,8 @@ from lupaxa.chat_server.commands import by_name, command_words, ensure_commands,
 from lupaxa.chat_server.exceptions import ConfigError
 from lupaxa.chat_server.help import HelpBook, HelpEntry, format_page, load_help
 from lupaxa.chat_server.newbie import visible_help
-from lupaxa.chat_server.ranks import Rank
+from lupaxa.chat_server.ranks import Rank, shown_rank
 from lupaxa.chat_server.roles import Roles
-from lupaxa.chat_server.utilities import shown_rank
 
 
 def write(tmp_path: Path, text: str) -> Path:
@@ -212,7 +211,8 @@ def test_help_file_must_be_a_list(tmp_path: Path) -> None:
     empty = write(tmp_path, "")
     with pytest.raises(ConfigError, match="must be a YAML list"):
         load_help(empty)
-    assert load_help(write(tmp_path, "[]\n")) == HelpBook(entries=())
+    empty_book = load_help(write(tmp_path, "[]\n"))
+    assert empty_book == HelpBook(entries=())
 
 
 def test_entry_must_be_a_mapping(tmp_path: Path) -> None:

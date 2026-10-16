@@ -24,7 +24,7 @@ import lupaxa.chat_server.login as login_api
 import lupaxa.chat_server.mfa as mfa_api
 import lupaxa.chat_server.newbie as newbie_api
 import lupaxa.chat_server.password as password_api
-import lupaxa.chat_server.player as player_api
+import lupaxa.chat_server.utilities as utilities_api
 import lupaxa.chat_server.resident as resident_api
 import lupaxa.chat_server.rooms as rooms_api
 import lupaxa.chat_server.coder as coder_api
@@ -32,7 +32,7 @@ import lupaxa.chat_server.su as su_api
 import lupaxa.chat_server.timer as timer_api
 from lupaxa.chat_server.admin import command_allow, command_demote, command_promote
 from lupaxa.chat_server.client import output_hidden
-from lupaxa.chat_server.colour import cls, cyan, green, paint_admin, paint_coder, paint_staff, plain_len, red, yellow
+from lupaxa.chat_server.colour import center_block, cls, cyan, green, paint_admin, paint_coder, paint_staff, plain_len, red, yellow
 from lupaxa.chat_server.commands import Command, by_name, command_words, subcommand_words
 from lupaxa.chat_server.config import Config
 from lupaxa.chat_server.entry import enter, enter_fresh
@@ -53,9 +53,9 @@ from lupaxa.chat_server.su import command_disconnect, command_nuke, command_resi
 from lupaxa.chat_server.time import clock_phrase, cpu_phrase, duration_phrase, idle_clock
 from lupaxa.chat_server.chatserver import ChatServer
 from lupaxa.chat_server.timer import apply_net_tick, consume_seconds, message_file_stamps, note_connected_time, process_timer, reload_messages
-from lupaxa.chat_server.utilities import center_block, examine_frame, frame_width, list_frame, shown_rank, time_frame, wrap_words
+from lupaxa.chat_server.utilities import examine_frame, frame_width, list_frame, time_frame, wrap_words
 from lupaxa.chat_server.version import get_version
-from lupaxa.chat_server.ranks import Rank, rank_allows
+from lupaxa.chat_server.ranks import Rank, rank_allows, shown_rank
 
 SHIPPED_HELP = load_help(Path(__file__).resolve().parents[1] / "config" / "help.yml")
 
@@ -423,7 +423,7 @@ def route_scans_to_the_host_fake(monkeypatch: pytest.MonkeyPatch) -> None:
             if found is None and not quiet:
                 server.send(client, f"No such player '{name}'.\n")  # type: ignore[arg-type]
             return found
-        return player_api.find_player(server, client, name, quiet=quiet)  # type: ignore[arg-type]
+        return utilities_api.find_player(server, client, name, quiet=quiet)  # type: ignore[arg-type]
 
     replacements = {
         "broadcast_room": broadcast_room,
@@ -2955,7 +2955,7 @@ def test_idle_cell_uses_green_yellow_and_red() -> None:
 def test_super_admin_rank_is_light_blue() -> None:
     """A promoted admin stays red. The config Super Admin is light blue."""
     from lupaxa.chat_server.colour import light_blue
-    from lupaxa.chat_server.utilities import shown_rank_cell
+    from lupaxa.chat_server.ranks import shown_rank_cell
 
     assert shown_rank(Rank.ADMIN, True) == red("Admin")
     assert shown_rank(Rank.SUPER_ADMIN, True) == light_blue("Super Admin")
@@ -8852,7 +8852,8 @@ def test_ipinfo_frames_a_player_or_an_address(tmp_path: Path, monkeypatch: pytes
     assert "North America (NA)" in text
     assert "AS15169" in text
     assert "Google LLC" in text
-    assert "google.com" in text
+    domain_row = text.split("AS domain", 1)[1].split("\n", 1)[0]
+    assert domain_row.strip(" :|") == "google.com"
     assert "8.8.8.0/24" in text
     server.sent.clear()
     process_commands(server, admin, "ipinfo me")  # type: ignore[arg-type]

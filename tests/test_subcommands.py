@@ -24,7 +24,6 @@ from lupaxa.chat_server.server import Server
 
 def unused(server: Server, client: Client, command: Command, text: str | None) -> None:
     """Satisfy the command signature. These tests do not call it."""
-    del server, client, command, text
 
 
 def parent_of(*children: Command, rank: Rank = Rank.RESIDENT) -> Command:

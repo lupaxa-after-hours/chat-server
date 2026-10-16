@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .commands import Command
+from typing import Any
 
 DIRECTIONS = {
     "n": "n",
@@ -41,9 +38,9 @@ LOCALHOST = frozenset({"127.0.0.1", "::1"})
 # rooms, on, off, login, and force, stay available as names.
 RESERVED_NAMES = frozenset({"me", "who", "quit", "ssh", "telnet", "system"})
 
-COMMANDS: list[Command] = []
-commands_by_name: dict[str, Command] = {}
-command_aliases: tuple[Command, ...] = ()
+COMMANDS: list[Any] = []
+commands_by_name: dict[str, Any] = {}
+command_aliases: tuple[Any, ...] = ()
 LOADED = [False]
 # Casefolded parent name to (first spelling, children in call order).
-registered_subcommands: dict[str, tuple[str, list[Command]]] = {}
+registered_subcommands: dict[str, tuple[str, list[Any]]] = {}

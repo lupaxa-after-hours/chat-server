@@ -6,18 +6,18 @@ from dataclasses import replace
 from datetime import datetime, timezone
 
 from .broadcast import broadcast_room, broadcast_staff
-from .client import Client
+from .client import Client, send_lock_line
 from .commands import held_roles
 from .defaults import DEFAULT_LOGINMSG, DEFAULT_PROMPT
 from .exceptions import ConfigError
 from .globals import NAME_PROMPT
-from .player import Player, find_player
+from .player import Player
 from .ranks import Rank, rank_allows
 from .roles import Roles, join_names
 from .rooms import full_line, house_path, house_path_blocked, house_room_id, is_full, load_house, others, spoken_line, system_room_ids
 from .saved_player import SavedPlayer, save_player, super_admins
 from .server import Server
-from .utilities import find_saved, get_clients, reconnected_line
+from .utilities import find_player, find_saved, get_clients, reconnected_line
 
 
 def name_taken_reply(name: str) -> str:
@@ -129,8 +129,6 @@ def warn_site_admin(server: Server, client: Client) -> None:
     """Tell this site admin about extra super admins and obsolete config keys."""
     if (held_roles(client) & int(Roles.SITE_ADMIN)) == 0:
         return
-    from .password import send_lock_line
-
     for line in issue_lines(server):
         send_lock_line(server, client, line)
 

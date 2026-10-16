@@ -11,7 +11,7 @@ import psutil
 from . import reboot as reboot_api
 from .broadcast import broadcast_all, broadcast_coder
 from .client import Client
-from .colour import can_see_colour, paint_coder, red
+from .colour import can_see_colour, center_block, paint_coder, red
 from .commands import Command, register_subcommands, shown_syntax
 from .globals import COMMANDS
 from .help import load_help_into
@@ -23,7 +23,7 @@ from .roles import Roles
 from .server import Server
 from .time import clock_phrase, cpu_phrase, duration_phrase
 from .timer import reload_hot_config, reload_messages, reload_rooms, shutdown_phrase
-from .utilities import center_block, frame_width, get_clients, get_parts, get_player_name
+from .utilities import frame_width, get_clients, get_parts, get_player_name
 
 
 def command_cu(server: Server, client: Client, command: Command, text: str | None) -> None:
@@ -72,7 +72,6 @@ def command_reboot(server: Server, client: Client, command: Command, text: str |
 
 def command_reload(server: Server, client: Client, command: Command, text: str | None) -> None:
     """Parent for reload. The dispatcher runs a child instead."""
-    del server, client, command, text
 
 
 def reload_extra(server: Server, client: Client, command: Command, text: str | None) -> bool:
@@ -263,6 +262,7 @@ def system_box(server: Server) -> str:
             except (psutil.Error, OSError):
                 voluntary = involuntary = missing
     except (psutil.Error, OSError):
+        # A failed reading keeps the unavailable values set above.
         pass
     head = [("PID", pid), ("Uptime", duration_phrase(seconds)), ("Booted at", clock_phrase(server.started_at))]
     if server.rebooted_at is not None:

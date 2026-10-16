@@ -11,7 +11,8 @@ from .client import Client
 from .colour import plain_len
 from .exceptions import ConfigError
 from .globals import CANNOT_NOW
-from .ranks import Rank, duty_cell as duty_cell, lsu_rank_cell as lsu_rank_cell, rank_cell as rank_cell, rank_words as rank_words, shown_rank as shown_rank, shown_rank_cell as shown_rank_cell
+from .player import is_logged_in
+from .ranks import Rank
 from .saved_player import SavedPlayer, load_saved, player_path, savable_name  # fmt: skip  # noqa: E501
 from .server import Server
 from .time import duration_phrase
@@ -133,20 +134,6 @@ def examine_idle(seconds: int) -> str:
 def visible_width(terminal: int, content: int) -> int:
     """Return the wider of the terminal and the plain content."""
     return max(content, terminal)
-
-
-def center_block(text: str, width: int) -> str:
-    """Pad every line so the widest line sits in the middle of ``width``."""
-    if width <= 0 or text == "":
-        return text
-    newline = text.endswith("\n")
-    lines = text[:-1].split("\n") if newline else text.split("\n")
-    widest = max((plain_len(line) for line in lines), default=0)
-    pad = max(0, (width - widest) // 2)
-    if pad == 0:
-        return text
-    centered = "\n".join(" " * pad + line for line in lines)
-    return centered + "\n" if newline else centered
 
 
 def wrap_words(words: Sequence[str], width: int) -> str:
@@ -271,6 +258,23 @@ def get_clients(server: Server, *, alphabetical: bool = False) -> Collection[Cli
     return sorted(clients, key=lambda client: (client.name is None, (client.name or "").lower()))
 
 
+def find_player(server: Server, client: Client, name: str, *, quiet: bool = False) -> Client | None:
+    """Return the playing client whose lowercase key is ``name``.
+
+    A miss tells ``client`` there is no such player, unless ``quiet`` is true.
+    """
+    key = name.lower()
+    for connected in get_clients(server):
+        player = connected.player
+        if not is_logged_in(connected) or player is None:
+            continue
+        if player.lowercase_name == key:
+            return connected
+    if not quiet:
+        server.send(client, f"No such player '{name}'.\n")
+    return None
+
+
 def has_rank(client: Client) -> Rank:
     """Return this player's rank, or newbie when they have not entered."""
     user = client.player
@@ -292,11 +296,13 @@ def goes_to_line(name: str | None, destination: str) -> str:
 
 
 @overload
-def get_parts(text: str | None, *, split: Literal[False] = False) -> str: ...
+def get_parts(text: str | None, *, split: Literal[False] = False) -> str:
+    pass
 
 
 @overload
-def get_parts(text: str | None, *, split: Literal[True]) -> list[str]: ...
+def get_parts(text: str | None, *, split: Literal[True]) -> list[str]:
+    pass
 
 
 def get_parts(text: str | None, *, split: bool = False) -> str | list[str]:

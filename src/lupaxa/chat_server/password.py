@@ -6,18 +6,17 @@ import time
 from dataclasses import replace
 
 from .broadcast import broadcast_staff
-from .client import Client
+from .client import Client, send_lock_line
 from .commands import Command, shown_syntax
 from .entry import ask, enter_fresh, player_prompt, restart_login
 from .exceptions import ConfigError
 from .globals import CANNOT_NOW, COMMANDS, MAX_PASSWORD_FAILURES, NAME_PROMPT
 from .mfa_seal import refresh_mfa_secret, seal_mfa_secret
-from .player import find_player
 from .rooms import unlink_house
 from .saved_player import SavedPlayer, delete_player, has_set_mfa, hash_password, password_ok, password_problem, save_player  # fmt: skip  # noqa: E501
 from .server import Server
 from .totp import new_secret, otpauth_uri, qr_lines, record_mfa_step, verify_totp
-from .utilities import find_saved, frame_width
+from .utilities import find_player, find_saved, frame_width
 from .ranks import Rank, rank_allows
 
 
@@ -57,15 +56,6 @@ def password_prompt() -> str:
 def unlock_prompt() -> str:
     """Return the prompt that asks for the password that unlocks the screen."""
     return "Enter password to unlock: "
-
-
-def send_lock_line(server: Server, client: Client, text: str) -> None:
-    """Send ``text`` even while this connection's screen is locked."""
-    client.show_lock = True
-    try:
-        server.send(client, text)
-    finally:
-        client.show_lock = False
 
 
 def code_prompt() -> str:

@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 
 from . import globals as catalogue
 from .client import Client
-from .colour import cyan, magenta, red
+from .colour import colour_of, cyan, magenta, red
 from .ranks import Rank, rank_allows
 from .server import Server
 
@@ -113,10 +113,8 @@ def subcommand_words(parent: Command, rank: Rank, colour: bool = False, *, roles
 
 def command_subcommands(server: Server, client: Client, command: Command, text: str | None) -> None:
     """List this parent's children for the player's rank."""
-    from .newbie import colour_of
     from .utilities import frame_width, has_rank, wrap_words
 
-    del text
     parent = by_name()[command.parent]
     words = subcommand_words(parent, has_rank(client), colour=colour_of(client), roles=held_roles(client)).split()
     wrapped = wrap_words(words, frame_width(client.discovered_columns, client.frame_columns))

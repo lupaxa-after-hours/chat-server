@@ -12,11 +12,11 @@ from .help import format_page
 from .mfa import process_mfa_pw, process_mfa_remove_code, process_mfa_remove_pw, process_mfa_show, process_mfa_sure
 from .parse import consider_name, process_commands
 from .password import code_prompt, confirm_password_prompt, current_password_prompt, password_prompt, process_code, process_confirm_password, process_current, process_on_duty_password, process_password, process_renew, process_renew_confirm, process_retire_confirm, process_retire_password, process_screenlock_password, process_set_password, send_lock_line, set_password_prompt, unlock_prompt  # fmt: skip  # noqa: E501
-from .player import find_player
 from .ranks import Rank, rank_allows
 from .rooms import house_path_blocked
 from .server import Server
-from .utilities import center_block, find_saved, frame_width, get_clients
+from .colour import center_block
+from .utilities import find_player, find_saved, frame_width, get_clients
 
 AGREE_PROMPT = "Do you agree to these rules: "
 

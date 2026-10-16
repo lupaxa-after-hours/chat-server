@@ -13,13 +13,13 @@ from .entry import player_prompt
 from .exceptions import ConfigError
 from .globals import CANNOT_NOW, COMMANDS
 from .password import send_lock_line, unlock_prompt
-from .player import Player, find_player
+from .player import Player
 from .ranks import Rank, rank_allows
 from .roles import role_names
 from .rooms import house_path, house_path_blocked, house_room_id, load_house, others, release_empty_houses, spoken_line, system_room_ids, write_default_house
 from .saved_player import SavedPlayer, save_player
 from .server import Server
-from .utilities import find_saved, get_clients, get_parts, is_admin
+from .utilities import find_player, find_saved, get_clients, get_parts, is_admin
 
 
 def command_shout(server: Server, client: Client, command: Command, text: str | None) -> None:
@@ -455,9 +455,6 @@ def command_roles(server: Server, client: Client, command: Command, text: str | 
         return
     connected = find_player(server, client, words[0], quiet=True)
     live = connected.player if connected is not None else None
-    if saved is None and live is None:
-        server.send(client, f"No such player '{words[0]}'.\n")
-        return
     if saved is not None:
         shown = saved.name
         mask = saved.roles
@@ -465,6 +462,7 @@ def command_roles(server: Server, client: Client, command: Command, text: str | 
         shown = live.name
         mask = live.roles
     else:
+        server.send(client, f"No such player '{words[0]}'.\n")
         return
     names = role_names(mask)
     if not names:
@@ -476,7 +474,6 @@ def command_roles(server: Server, client: Client, command: Command, text: str | 
 
 def command_set(server: Server, client: Client, command: Command, text: str | None) -> None:
     """Parent for set. The dispatcher runs a child instead."""
-    del server, client, command, text
 
 
 COMMANDS.extend(

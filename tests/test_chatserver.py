@@ -13,7 +13,6 @@ from pathlib import Path
 import pytest
 
 from lupaxa.chat_server import chatserver as chatserver_module
-from lupaxa.chat_server.player import find_player
 from lupaxa.chat_server.client import Client
 from lupaxa.chat_server.config import Config
 from lupaxa.chat_server.defaults import DEFAULT_HOST
@@ -25,7 +24,7 @@ from lupaxa.chat_server.player import Player
 from lupaxa.chat_server.rooms import Layout, load_layout
 from lupaxa.chat_server.saved_player import SavedPlayer, hash_password, load_saved, player_path, save_player  # fmt: skip  # noqa: E501
 from lupaxa.chat_server.chatserver import ChatServer, bind_listener, strip_telnet
-from lupaxa.chat_server.utilities import get_clients, lookup_hostname
+from lupaxa.chat_server.utilities import find_player, get_clients, lookup_hostname
 from lupaxa.chat_server.ranks import Rank
 
 
@@ -2090,11 +2089,12 @@ def test_an_ipv6_listener_is_ipv6_only() -> None:
         sock = bind_listener("::1", 0)
     except OSError:
         pytest.skip("IPv6 is not available")
-    try:
-        assert sock.family == socket.AF_INET6
-        assert sock.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 1
-    finally:
-        sock.close()
+    else:
+        try:
+            assert sock.family == socket.AF_INET6
+            assert sock.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY) == 1
+        finally:
+            sock.close()
 
 
 def test_lookup_hostname_accepts_an_ipv6_address() -> None:
@@ -2108,7 +2108,8 @@ def test_dual_stack_accepts_ipv4_and_ipv6(tmp_path: Path) -> None:
         probe = bind_listener("::1", 0)
     except OSError:
         pytest.skip("IPv6 is not available")
-    probe.close()
+    else:
+        probe.close()
     config = replace(make_config(players=player_dir(tmp_path)), host=DEFAULT_HOST, stack="dual")
     server = ChatServer(config, layout(tmp_path), TEST_HELP)
     thread = threading.Thread(target=server.serve_forever, daemon=True)

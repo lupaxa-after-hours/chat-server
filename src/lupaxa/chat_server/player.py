@@ -5,14 +5,32 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import Protocol, TypeVar
 
 from .defaults import DEFAULT_ENTERMSG, DEFAULT_LOGINMSG, DEFAULT_LOGOUTMSG, DEFAULT_PROMPT
 from .ranks import Rank
 
-if TYPE_CHECKING:
-    from .client import Client
-    from .server import Server
+
+class ConnectedClient(Protocol):
+    """A connection that has a name, a room, and maybe a player."""
+
+    @property
+    def name(self) -> str | None:
+        """Return the logged-in name."""
+        raise NotImplementedError
+
+    @property
+    def room(self) -> str | None:
+        """Return the player's room."""
+        raise NotImplementedError
+
+    @property
+    def player(self) -> Player | None:
+        """Return the logged-in player."""
+        raise NotImplementedError
+
+
+ConnectedT = TypeVar("ConnectedT", bound=ConnectedClient)
 
 
 @dataclass
@@ -51,28 +69,9 @@ class Player:
             self.lowercase_name = self.name.lower()
 
 
-def is_logged_in(client: Client) -> bool:
+def is_logged_in(client: ConnectedClient) -> bool:
     """Return whether this connection has a name and a room."""
     return client.name is not None and client.room is not None
-
-
-def find_player(server: Server, client: Client, name: str, *, quiet: bool = False) -> Client | None:
-    """Return the playing client whose lowercase key is ``name``.
-
-    A miss tells ``client`` there is no such player, unless ``quiet`` is true.
-    """
-    from .utilities import get_clients
-
-    key = name.lower()
-    for connected in get_clients(server):
-        player = connected.player
-        if not is_logged_in(connected) or player is None:
-            continue
-        if player.lowercase_name == key:
-            return connected
-    if not quiet:
-        server.send(client, f"No such player '{name}'.\n")
-    return None
 
 
 def multiple_matches_message(names: Iterable[str]) -> str:
@@ -109,12 +108,12 @@ def match_name(query: str, names: Iterable[str]) -> tuple[str | None, str | None
     return None, None
 
 
-def match_online_player(clients: Iterable[Client], name: str) -> tuple[Client | None, str | None]:
+def match_online_player(clients: Iterable[ConnectedT], name: str) -> tuple[ConnectedT | None, str | None]:
     """Return one playing client, or the multiple-matches line.
 
     Exact names win. A single prefix match is used. Several prefixes are refused.
     """
-    playing: list[Client] = []
+    playing: list[ConnectedT] = []
     for client in clients:
         if not is_logged_in(client):
             continue

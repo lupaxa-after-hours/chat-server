@@ -13,12 +13,11 @@ from .exceptions import ConfigError
 from .globals import CANNOT_NOW, MAX_PASSWORD_FAILURES
 from .mfa_seal import refresh_mfa_secret, seal_mfa_secret
 from .password import code_prompt, current_password_prompt, mfa_enrolment_text
-from .player import find_player
 from .ranks import Rank, rank_allows
 from .saved_player import SavedPlayer, has_set_mfa, password_ok, save_player
 from .server import Server
 from .totp import new_secret, record_mfa_step, verify_totp
-from .utilities import find_saved, get_parts, get_player_name, get_saved_player
+from .utilities import find_player, find_saved, get_parts, get_player_name, get_saved_player
 
 REMOVED = "Your MFA has been removed.\n"
 REMOVED_WARNING = ("Your MFA has been removed. Set it up again before you log out. The next login will make you set it up before you can enter.\n")  # fmt: skip  # noqa: E501

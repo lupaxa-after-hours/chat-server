@@ -2,14 +2,28 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import socket
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING
+from typing import Protocol
 
-if TYPE_CHECKING:
-    from .client import Client
-    from .server import Server
+from .client import Client
+
+
+class ChainServer(Protocol):
+    """The chain list and the clients a tell can reach."""
+
+    chains: list[Chain]
+
+    @property
+    def clients(self) -> Mapping[socket.socket, Client]:
+        """Return the connected clients."""
+        raise NotImplementedError
+
+    def send(self, client: Client, text: str) -> bool:
+        """Queue text for one client."""
+        raise NotImplementedError
 
 
 MAX_CHAIN_PEOPLE = 10
@@ -154,10 +168,9 @@ def chain_number(piece: str) -> int | None:
     return None
 
 
-def deliver(server: Server, client: Client, pieces: Sequence[str], now: datetime) -> Delivery:
+def deliver(server: ChainServer, client: Client, pieces: Sequence[str], now: datetime) -> Delivery:
     """Resolve targets, update chains, and return who should hear the message."""
     from .player import match_online_player
-    from .utilities import get_clients
 
     def display_name(connection: Client) -> str:
         player = connection.player
@@ -186,7 +199,7 @@ def deliver(server: Server, client: Client, pieces: Sequence[str], now: datetime
         if piece.casefold() == display_name(client).casefold():
             lines.append("Talking to yourself is the first sign of madness.\n")
             continue
-        target, error = match_online_player(get_clients(server), piece)
+        target, error = match_online_player(server.clients.values(), piece)
         if error is not None:
             lines.append(error if error.endswith("\n") else error + "\n")
             continue
@@ -286,7 +299,7 @@ def depart(chains: list[Chain], name: str) -> list[tuple[list[str], str]]:
     return notices
 
 
-def note_chain_departure(server: Server, name: str) -> None:
+def note_chain_departure(server: ChainServer, name: str) -> None:
     """Tell whoever is left when a disconnect changes their chain."""
     notices = depart(server.chains, name)
     for remaining, line in notices:
@@ -369,7 +382,7 @@ def delete_chain(chains: list[Chain], number: int, actor: str, reason: str) -> t
     return None, (names, f"({number}) {actor} deleted the chain.{suffix}\n")
 
 
-def close_idle_chains(server: Server, now: datetime) -> None:
+def close_idle_chains(server: ChainServer, now: datetime) -> None:
     """Delete a chain that has had no message for two hours, and tell its members."""
     chains = getattr(server, "chains", None)
     if not chains:
@@ -384,26 +397,22 @@ def close_idle_chains(server: Server, now: datetime) -> None:
         tell_names(server, names, f"({number}) Chain closed. It was unused for 2 hours.\n")
 
 
-def tell_names(server: Server, names: Sequence[str], line: str, *, skip: str | None = None) -> None:
+def tell_names(server: ChainServer, names: Sequence[str], line: str, *, skip: str | None = None) -> None:
     """Send one line to each connected person in ``names``."""
-    from .utilities import get_clients
-
     wanted = {name.casefold() for name in names}
     skipped = skip.casefold() if skip else None
-    for person in list(get_clients(server)):
+    for person in list(server.clients.values()):
         if person.name is None or person.name.casefold() == skipped:
             continue
         if person.name.casefold() in wanted:
             server.send(person, line)
 
 
-def clients_for_names(server: Server, names: Sequence[str]) -> list[Client]:
+def clients_for_names(server: ChainServer, names: Sequence[str]) -> list[Client]:
     """Return logged-in clients whose names are in this list."""
-    from .utilities import get_clients
-
     wanted = {name.casefold() for name in names}
     found: list[Client] = []
-    for person in get_clients(server):
+    for person in server.clients.values():
         if person.name is None or person.player is None or person.room is None:
             continue
         if person.name.casefold() in wanted and person not in found:

@@ -9,7 +9,7 @@ from typing import Protocol
 
 import yaml
 
-from .colour import plain_len
+from .colour import center_block, plain_len
 from .config import Config
 from .exceptions import ConfigError
 
@@ -99,8 +99,6 @@ def longest_token(entry: HelpEntry, syntax: str | None, visible: frozenset[str],
 
 def format_page(entry: HelpEntry, syntax: str | None, width: int, *, visible: frozenset[str], permissions: str | None = None) -> str:
     """Return one centered help box, ending with a newline."""
-    from .utilities import center_block
-
     longest = longest_token(entry, syntax, visible, permissions)
     outer = outer_width(width, longest)
     inner = outer - 2

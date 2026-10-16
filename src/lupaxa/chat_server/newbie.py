@@ -9,21 +9,21 @@ from datetime import datetime, timezone
 from .broadcast import broadcast_room
 from .chain import Delivery, chain_number, delete_chain, deliver, leave_chain, listed_names, remove_from_chain, split_target_message, tell_names
 from .client import Client
-from .colour import can_see_colour, cls, green, paint_idle, plain_len, testcard
+from .colour import can_see_colour, center_block, cls, colour_of, green, paint_idle, plain_len, testcard
 from .commands import Command, by_name, command_allowed, held_roles, listed_commands, shown_name, shown_syntax
 from .defaults import DEFAULT_ENTERMSG, DEFAULT_LOGINMSG, DEFAULT_LOGOUTMSG
 from .exceptions import ConfigError
 from .globals import CANNOT_NOW, COMMANDS
 from .help import HelpBook, HelpEntry, format_page
-from .player import Player, find_player, is_logged_in, match_name, match_online_player
+from .player import Player, is_logged_in, match_name, match_online_player
 from .roles import ROLE_LABELS, ROLE_WORDS, role_from_name, role_names, roles_phrase
 from .rooms import VOID_ID, cannot_go_line, full_line, is_full, leave_line, others, release_empty_houses, spoken_line
 from .saved_player import SavedPlayer, save_player
 from .server import Server
 from .time import clock_phrase, connected_phrase, duration_phrase
-from .utilities import center_block, connected_place, examine_frame, examine_idle, find_saved, frame_width, get_clients, get_parts, get_saved_player, goes_to_line, has_rank, list_frame, login_place, lsu_rank_cell, saved_players, shown_rank, terminal_size_line, terminal_size_value, time_frame, visible_width, width_ceiling, wrap_words  # fmt: skip  # noqa: E501
+from .utilities import connected_place, examine_frame, examine_idle, find_player, find_saved, frame_width, get_clients, get_parts, get_saved_player, goes_to_line, has_rank, list_frame, login_place, saved_players, terminal_size_line, terminal_size_value, time_frame, visible_width, width_ceiling, wrap_words  # fmt: skip  # noqa: E501
 from .version import get_version
-from .ranks import Rank, rank_allows, shown_person_cell, shown_person_rank
+from .ranks import Rank, lsu_rank_cell, rank_allows, shown_person_cell, shown_person_rank, shown_rank
 
 
 def command_say(server: Server, client: Client, command: Command, text: str | None) -> None:
@@ -825,13 +825,6 @@ def match_examine_name(server: Server, name: str) -> tuple[str | None, str | Non
             continue
         names[player.name.casefold()] = player.name
     return match_name(name, names.values())
-
-
-def colour_of(client: Client) -> bool:
-    """Return this player's colour choice. A missing player is on."""
-    if client.player is None:
-        return True
-    return client.player.colour
 
 
 def colour_line(enabled: bool) -> str:

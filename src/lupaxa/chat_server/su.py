@@ -12,11 +12,11 @@ from .entry import ask
 from .exceptions import ConfigError
 from .globals import CANNOT_NOW, COMMANDS
 from .password import password_prompt, set_password_prompt
-from .player import find_player, is_logged_in, match_online_player
+from .player import is_logged_in, match_online_player
 from .rooms import full_line, is_full, others, release_empty_houses, spoken_line, system_room_ids, unlink_house
 from .saved_player import SavedPlayer, delete_player, savable_name
 from .server import Server
-from .utilities import find_saved, frame_width, get_clients, get_parts, get_player_name, get_saved_player, has_rank, is_admin, list_frame, name_prefixes_argument, refuses_self, saved_players  # fmt: skip  # noqa: E501
+from .utilities import find_player, find_saved, frame_width, get_clients, get_parts, get_player_name, get_saved_player, has_rank, is_admin, list_frame, name_prefixes_argument, refuses_self, saved_players  # fmt: skip  # noqa: E501
 from .ranks import Rank, rank_allows
 
 

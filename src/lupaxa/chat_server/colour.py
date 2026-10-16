@@ -3,20 +3,44 @@
 from __future__ import annotations
 
 import re
+from typing import Protocol
 
 from colorama import Back, Fore, Style
 from colorama.ansi import BEL, clear_screen, code_to_chars
 
-from .client import Client
 from .time import IDLE_ACTIVE_SECONDS, IDLE_BLANK_SECONDS, IDLE_RED_SECONDS, idle_clock
+
+
+class ColourPlayer(Protocol):
+    """The colour switch a connection's player carries."""
+
+    colour: bool
+
+
+class ColourClient(Protocol):
+    """A connection whose player may have colour turned on."""
+
+    @property
+    def player(self) -> ColourPlayer | None:
+        """Return the logged-in player."""
+        raise NotImplementedError
+
 
 SGR = re.compile(r"\x1b\[[0-9;]*m")
 FLASH = code_to_chars(5)
 
 
-def can_see_colour(client: Client) -> bool:
+def can_see_colour(client: ColourClient) -> bool:
     """Return whether this connection's player has colour turned on."""
     return client.player is not None and client.player.colour
+
+
+def colour_of(client: ColourClient) -> bool:
+    """Return this player's colour choice. A missing player is on."""
+    player = client.player
+    if player is None:
+        return True
+    return player.colour
 
 
 def paint(text: str, *codes: str) -> str:
@@ -27,6 +51,20 @@ def paint(text: str, *codes: str) -> str:
 def plain_len(text: str) -> int:
     """Return the length of ``text`` after colour codes are removed."""
     return len(SGR.sub("", text))
+
+
+def center_block(text: str, width: int) -> str:
+    """Pad every line so the widest line sits in the middle of ``width``."""
+    if width <= 0 or text == "":
+        return text
+    newline = text.endswith("\n")
+    lines = text[:-1].split("\n") if newline else text.split("\n")
+    widest = max((plain_len(line) for line in lines), default=0)
+    pad = max(0, (width - widest) // 2)
+    if pad == 0:
+        return text
+    centered = "\n".join(" " * pad + line for line in lines)
+    return centered + "\n" if newline else centered
 
 
 def paint_idle(seconds: int, colour: bool) -> str:
@@ -43,21 +81,21 @@ def paint_idle(seconds: int, colour: bool) -> str:
     return light_black(text)
 
 
-def paint_staff(client: Client, text: str) -> str:
+def paint_staff(client: ColourClient, text: str) -> str:
     """Return a staff-channel line, cyan when the recipient has colour on."""
     if can_see_colour(client):
         return cyan(text.rstrip("\n")) + "\n"
     return text
 
 
-def paint_admin(client: Client, text: str) -> str:
+def paint_admin(client: ColourClient, text: str) -> str:
     """Return an admin-channel line, red when the recipient has colour on."""
     if can_see_colour(client):
         return red(text.rstrip("\n")) + "\n"
     return text
 
 
-def paint_coder(client: Client, text: str) -> str:
+def paint_coder(client: ColourClient, text: str) -> str:
     """Return a coder-channel line, magenta when the recipient has colour on."""
     if can_see_colour(client):
         return magenta(text.rstrip("\n")) + "\n"
