@@ -2,27 +2,12 @@
 
 ## Config Keys
 
-| Key               | Required                    | Meaning                                                              |
-| ----------------- | --------------------------- | -------------------------------------------------------------------- |
-| `host`            | No                          | Bind address. Defaults to `0.0.0.0`.                                 |
-| `port`            | One of `port` or `ssh_port` | Telnet port, 1 to 65535.                                             |
-| `ssh_port`        | One of `port` or `ssh_port` | SSH port, 1 to 65535. Omit to leave SSH off.                         |
-| `rooms`           | Yes                         | Rooms file. A relative path is read beside the config.               |
-| `start`           | Yes                         | Room id where a new player appears.                                  |
-| `help`            | Yes                         | Help file. A relative path is read beside the config.                |
-| `players`         | No                          | Saved-player directory. Defaults to `players` beside the config.     |
-| `admin`           | No                          | Admin name. Defaults to `admin`. Must be a name that can be saved.   |
-| `login_timeout`   | No                          | Minutes to enter a room. Defaults to 3. A whole number of at least 1.|
-| `background`      | No                          | `true` forks after the listen lines. Defaults to false.              |
-| `allow_newbies`   | No                          | `false` blocks new players at startup. Defaults to true.             |
-| `allow_residents` | No                          | `false` blocks residents at startup. Defaults to true.               |
-| `mfa_enabled`     | No                          | `false` skips the login code. Defaults to true.                      |
+The same list is split into hot and cold in [Getting Started](getting-started.md).
 
-The same number cannot be used for `port` and `ssh_port`. When `ssh_port`
-is set, the server keeps an Ed25519 key in `ssh_host_key` beside the
-config. That path is not a config key. A string, a float, a boolean, a
-missing required key, or any other key stops startup. See [SSH](security/ssh.md)
-and [MFA](security/mfa.md).
+`config.yml` itself has required keys `hot` and `cold`.
+
+`ssh_host_key` is written beside the config when SSH is on. It is not a key.
+A bad value or a missing required key stops startup. A key the server does not use does not stop startup. A key in the wrong file stops startup.
 
 | Result                           | Where  | Exit |
 | -------------------------------- | ------ | ---- |
@@ -30,25 +15,49 @@ and [MFA](security/mfa.md).
 | Bad config, or the port is taken | stderr | `1`  |
 | Clean shutdown                   |        | `0`  |
 
+## Hot
+
+| Key                | Required          | Default     |
+| ------------------ | ----------------- | ----------- |
+| `allow_newbies`    | No                | true        |
+| `allow_residents`  | No                | true        |
+| `country_database` | When lookup is on |             |
+| `country_lookup`   | No                | false       |
+| `login_timeout`    | No                | 3           |
+| `max_connections`  | Yes               |             |
+| `max_newbies`      | Yes               |             |
+| `mfa_enabled`      | No                | true        |
+| `newbie_start`     | No                | `start`     |
+| `start`            | Yes               |             |
+
+## Cold
+
+| Key             | Required             | Default                     |
+| --------------- | -------------------- | --------------------------- |
+| `background`    | No                   | false                       |
+| `help`          | Yes                  |                             |
+| `host`          | No                   | `0.0.0.0`                   |
+| `messages_path` | Yes                  |                             |
+| `players`       | No                   | `players` beside this file  |
+| `port`          | One of the two ports |                             |
+| `rooms`         | Yes                  |                             |
+| `ssh_port`      | One of the two ports | SSH off when omitted        |
+| `stack`         | No                   | `ipv4`                      |
+
 ## Names
 
 A name is 3 to 20 ASCII letters or digits, and it cannot start with a
-digit. `me`, `who`, and `quit` are reserved in any case. An unsaved name
-is unique in lowercase. The spelling they type is the one shown. A saved
-name must be typed in the spelling it was saved with.
+digit. `me`, `who`, `quit`, `ssh`, `telnet`, and `system` are reserved in any
+case. A name is also refused when its house file would be the rooms file or
+the help file. An unsaved name is unique in lowercase. The spelling they type
+is the one shown. A saved name must be typed in the spelling it was saved with.
 
 ## Ranks
 
-Newbie, then resident, then super user, then admin, then Super Admin.
+Newbie, then resident, then SU Channel, then super user, then admin, then coder, then Super Admin.
+What each rank can run is on [Players](usage/players.md).
 
-A newbie is not saved. A resident is saved and has a password. A super
-user can save a newbie, delete a saved player, disconnect a lower rank,
-and use the staff channel. An admin can shut the server down, promote a
-resident, and demote a super user. Only the Super Admin can promote
-someone to admin or demote them from admin.
-
-`lsu` and `staff` are for every rank. `shout` and `prompt` start at
-resident. `connections` starts at super user.
+`roles` on a player file is a non-negative integer. `1` is the Site Admin role. `broadcast`, `reload`, `shutdown`, `reboot`, `network`, and `system` are rank Coder or that role.
 
 ## Public Names
 
@@ -56,6 +65,10 @@ resident. `connections` starts at super user.
 `ServerError`, `__version__`, and `get_version()`.
 
 ## Development
+
+These pages are for someone using the talker. If you are changing the
+server, adding a command, a config key, or a role, start in
+`developer-docs/` in the repository. That folder is not part of this site.
 
 ```bash
 make init

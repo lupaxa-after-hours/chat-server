@@ -13,12 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 def asset_version(*, cwd: Path | None = None) -> str:
     """Return a short git SHA, or ``dev`` when git is unavailable."""
     try:
-        return subprocess.check_output(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=cwd or REPO_ROOT,
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], cwd=cwd or REPO_ROOT, text=True, stderr=subprocess.DEVNULL).strip()  # fmt: skip  # noqa: E501
     except (OSError, subprocess.CalledProcessError):
         return "dev"
 
@@ -41,10 +36,7 @@ def apply_asset_version(html: str, paths: list[str], version: str) -> str:
     unique = sorted({path for path in paths if path}, key=len, reverse=True)
     joined = "|".join(re.escape(path) for path in unique)
     pattern = re.compile(rf'(?P<attr>href|src)="(?P<before>[^"?]*?)(?P<path>{joined})(?:\?[^"]*)?"')
-    return pattern.sub(
-        rf'\g<attr>="\g<before>\g<path>?v={version}"',
-        html,
-    )
+    return pattern.sub(rf'\g<attr>="\g<before>\g<path>?v={version}"', html)
 
 
 def on_post_page(output: str, page: object, config: dict[str, Any]) -> str:

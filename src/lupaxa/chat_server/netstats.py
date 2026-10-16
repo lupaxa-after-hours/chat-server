@@ -5,10 +5,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import ROUND_HALF_UP, Decimal
 
-_STEP = Decimal(1000)
-_TENTH = Decimal("0.1")
-_BYTE_UNITS = ("B", "KB", "MB", "GB", "TB")
-_PACKET_UNITS = ("", "K", "M", "G", "T")
+STEP = Decimal(1000)
+TENTH = Decimal("0.1")
+BYTE_UNITS = ("B", "KB", "MB", "GB", "TB")
+PACKET_UNITS = ("", "K", "M", "G", "T")
 
 
 @dataclass
@@ -45,13 +45,7 @@ def record(counter: NetStats, direction: str, size: int) -> None:
     counter.out_pack_current += 1
 
 
-def note_traffic(
-    port: NetStats,
-    combined: NetStats,
-    connection: NetStats,
-    direction: str,
-    size: int,
-) -> None:
+def note_traffic(port: NetStats, combined: NetStats, connection: NetStats, direction: str, size: int) -> None:
     """Record ``size`` on the port, the combined counter, and the connection."""
     record(port, direction, size)
     record(combined, direction, size)
@@ -92,28 +86,28 @@ def roll(counter: NetStats) -> None:
 
 def format_amount(value: int, *, packets: bool) -> tuple[str, str]:
     """Return the number and unit. Scaled units use one decimal, half up."""
-    units = _PACKET_UNITS if packets else _BYTE_UNITS
+    units = PACKET_UNITS if packets else BYTE_UNITS
     scaled = Decimal(value)
     index = 0
-    while index < len(units) - 1 and scaled >= _STEP:
-        scaled /= _STEP
+    while index < len(units) - 1 and scaled >= STEP:
+        scaled /= STEP
         index += 1
     if index == 0:
         return str(value), units[0]
-    shown = scaled.quantize(_TENTH, rounding=ROUND_HALF_UP)
-    while shown >= _STEP and index < len(units) - 1:
-        shown = (shown / _STEP).quantize(_TENTH, rounding=ROUND_HALF_UP)
+    shown = scaled.quantize(TENTH, rounding=ROUND_HALF_UP)
+    while shown >= STEP and index < len(units) - 1:
+        shown = (shown / STEP).quantize(TENTH, rounding=ROUND_HALF_UP)
         index += 1
     return f"{shown:.1f}", units[index]
 
 
-def _cell(value: int, *, packets: bool) -> str:
+def cell(value: int, *, packets: bool) -> str:
     """Return the number in six columns and the unit in the next two."""
     number, unit = format_amount(value, packets=packets)
     return f"{number:>6} {unit:<2}"
 
 
-def _row(label: str, left: str, right: str) -> str:
+def row(label: str, left: str, right: str) -> str:
     """Return one inset stats line."""
     padded = f"{label:<18}"
     return f" {padded} : (In)  {left}  (Out) {right}"
@@ -121,24 +115,12 @@ def _row(label: str, left: str, right: str) -> str:
 
 def network_rows(counter: NetStats) -> tuple[str, ...]:
     """Return the six stats lines, without a border."""
-    pairs = (
-        ("Total bytes", counter.in_total, counter.out_total, False),
-        ("Average bytes", counter.in_average, counter.out_average, False),
-        ("Bytes per second", counter.in_bps, counter.out_bps, False),
-        ("Total packets", counter.in_pack_total, counter.out_pack_total, True),
-        (
-            "Average packets",
-            counter.in_pack_average,
-            counter.out_pack_average,
-            True,
-        ),
-        ("Packets per second", counter.in_pps, counter.out_pps, True),
-    )
+    pairs = (("Total bytes", counter.in_total, counter.out_total, False), ("Average bytes", counter.in_average, counter.out_average, False), ("Bytes per second", counter.in_bps, counter.out_bps, False), ("Total packets", counter.in_pack_total, counter.out_pack_total, True), ("Average packets", counter.in_pack_average, counter.out_pack_average, True), ("Packets per second", counter.in_pps, counter.out_pps, True))  # fmt: skip  # noqa: E501
     rows: list[str] = []
     for label, incoming, outgoing, packets in pairs:
-        left = _cell(incoming, packets=packets)
-        right = _cell(outgoing, packets=packets)
-        rows.append(_row(label, left, right))
+        left = cell(incoming, packets=packets)
+        right = cell(outgoing, packets=packets)
+        rows.append(row(label, left, right))
     return tuple(rows)
 
 

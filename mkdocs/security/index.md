@@ -1,9 +1,8 @@
 # Security
 
-The server treats security as part of the design. A saved player is checked
-in more than one place before they enter a room: the connection, the
-password, and a second factor. Each of those checks is implemented, and a
-failure at any of them keeps the player out.
+A saved player is checked in more than one place before they enter a room:
+the connection, the password, and a second factor. Fail any one of those
+and they stay outside.
 
 ## Core Features
 
@@ -26,7 +25,7 @@ See [SSH](ssh.md).
 ## MFA
 
 MFA is a six-digit code from an authenticator, checked after the password.
-Residents may turn it on. Super users, admins, and the Super Admin must have
+Residents may turn it on. SU Channel and above must have
 it while `mfa_enabled` is true. The secret in the player file is sealed with
 a key derived from the password, so a copy of that directory without the
 password does not reveal the token.

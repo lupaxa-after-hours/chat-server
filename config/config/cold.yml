@@ -1,0 +1,30 @@
+# IP address to bind. 0.0.0.0 listens on every IPv4 interface.
+host: 0.0.0.0
+
+# Which families to accept: ipv4, ipv6, or dual.
+# ipv6 with this host listens on ::. dual listens on 0.0.0.0 and ::.
+stack: ipv4
+
+# TCP port for telnet, from 1 to 65535. Omit this when only ssh_port is set.
+port: 9000
+
+# TCP port for SSH, from 1 to 65535. Omit this to leave SSH off.
+ssh_port: 9022
+
+# Rooms file. A relative path is read from this file's directory.
+rooms: ../rooms/system.yml
+
+# Help file. A relative path is read from this file's directory.
+help: ../help.yml
+
+# Directory of banner.msg, full.msg, and no-more-newbies.msg.
+# A relative path is read from this file's directory. ../ walks up from there.
+messages_path: ../files
+
+# Directory of one file per saved player. A relative path is read from
+# this file's directory. The server creates it when it is missing.
+players: ../players
+
+# Fork into the background after the listening lines.
+# Omit or false stays in the foreground.
+background: false

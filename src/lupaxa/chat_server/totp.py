@@ -12,8 +12,8 @@ from urllib.parse import quote
 import qrcode
 from qrcode.constants import ERROR_CORRECT_L
 
-_ISSUER = "Chat Server"
-_STEP = 30
+ISSUER = "Chat Server"
+STEP = 30
 
 
 def new_secret() -> str:
@@ -23,17 +23,19 @@ def new_secret() -> str:
 
 def otpauth_uri(name: str, secret: str) -> str:
     """Return an ``otpauth://`` URI for ``name`` and ``secret``."""
-    label = f"{_ISSUER}:{name}"
-    return f"otpauth://totp/{quote(label)}?secret={secret}&issuer={quote(_ISSUER)}"
+    label = f"{ISSUER}:{name}"
+    return f"otpauth://totp/{quote(label)}?secret={secret}&issuer={quote(ISSUER)}"
 
 
-def _secret_key(secret: str) -> bytes:
+def secret_key(secret: str) -> bytes:
+    """Return the decoded bytes of a base32 MFA secret."""
     pad = "=" * ((8 - len(secret) % 8) % 8)
     return base64.b32decode(secret + pad)
 
 
-def _code_at(secret: str, step: int) -> str:
-    digest = hmac.new(_secret_key(secret), struct.pack(">Q", step), sha1).digest()
+def code_at(secret: str, step: int) -> str:
+    """Return the six-digit code for ``secret`` at ``step``."""
+    digest = hmac.new(secret_key(secret), struct.pack(">Q", step), sha1).digest()
     offset = digest[-1] & 0x0F
     binary = struct.unpack(">I", digest[offset : offset + 4])[0] & 0x7FFFFFFF
     return f"{binary % 1_000_000:06d}"
@@ -43,11 +45,11 @@ def verify_totp(secret: str, code: str, *, now: int, used: int | None) -> int | 
     """Return the matched 30-second timestep, or ``None`` when the code does not apply."""
     if len(code) != 6 or not code.isdigit():
         return None
-    current = now // _STEP
+    current = now // STEP
     for step in (current - 1, current, current + 1):
         if used is not None and step <= used:
             continue
-        if _code_at(secret, step) == code:
+        if code_at(secret, step) == code:
             return step
     return None
 

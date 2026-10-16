@@ -1,0 +1,34 @@
+# Room id where a new player appears. It must be a room in the rooms file.
+start: reception
+
+# Room id where a newbie appears. Omit this to use start.
+# newbie_start: reception
+
+# Open connections allowed at once, including people still at the name prompt.
+# Admin and super admin ranks can still connect past this. At least 1.
+max_connections: 128
+
+# Newbies allowed at once. A whole number up to max_connections, or a
+# percentage such as 25%. The percentage rounds up. At least 1.
+max_newbies: 20
+
+# Minutes a connection may take to enter a room. A whole number of at least 1.
+login_timeout: 3
+
+# When false, new players cannot enter while the server is running.
+allow_newbies: true
+
+# When false, residents cannot enter while the server is running.
+allow_residents: true
+
+# When false, login never asks for a code and mfa is not a command.
+# Omit or true requires a code for super users and admins.
+mfa_enabled: false
+
+# When true, look up a country as each connection's hostname is resolved.
+# country_database is required. A relative path is read from this file's
+# directory. A missing or unreadable file turns lookup off at startup.
+country_lookup: true
+
+# MMDB country database. This file is not part of the repository.
+country_database: ../countries/ipinfo_lite.mmdb

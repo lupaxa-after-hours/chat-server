@@ -1,14 +1,6 @@
 """Counters, the 10-second roll, and the network box."""
 
-from lupaxa.chat_server.net import (
-    NetStats,
-    add_counts,
-    format_amount,
-    network_box,
-    note_traffic,
-    record,
-    roll,
-)
+from lupaxa.chat_server.netstats import NetStats, add_counts, format_amount, network_box, note_traffic, record, roll
 
 
 def test_record_adds_one_packet_and_ignores_an_empty_one() -> None:

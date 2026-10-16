@@ -5,22 +5,19 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timezone
 
-from .channel import broadcast_room_split, occupancy, others, player_named
+from .broadcast import broadcast_room, broadcast_staff
 from .client import Client
-from .commands_list import Host
-from .defaults import DEFAULT_PROMPT
+from .commands import held_roles
+from .defaults import DEFAULT_LOGINMSG, DEFAULT_PROMPT
 from .exceptions import ConfigError
 from .globals import NAME_PROMPT
-from .player import Player
-from .rooms import full_line
-from .saved_player import RANK_NEWBIE, RANK_SUPER, SavedPlayer, rank_allows, save_player
-from .utilities import (
-    _find_saved,
-    connected_from_line,
-    connected_line,
-    reconnected_from_line,
-    reconnected_line,
-)
+from .player import Player, find_player
+from .ranks import Rank, rank_allows
+from .roles import Roles, join_names
+from .rooms import full_line, house_path, house_path_blocked, house_room_id, is_full, load_house, others, spoken_line, system_room_ids
+from .saved_player import SavedPlayer, save_player, super_admins
+from .server import Server
+from .utilities import find_saved, get_clients, reconnected_line
 
 
 def name_taken_reply(name: str) -> str:
@@ -38,7 +35,7 @@ def player_prompt(client: Client) -> str:
     return prompt + " "
 
 
-def _ask(client: Client, stage: str, name: str, saved: SavedPlayer | None) -> None:
+def ask(client: Client, stage: str, name: str, saved: SavedPlayer | None) -> None:
     """Hold ``name`` while the player answers a password prompt."""
     client.auth = stage
     client.pending_name = name
@@ -50,116 +47,228 @@ def _ask(client: Client, stage: str, name: str, saved: SavedPlayer | None) -> No
     client.password_failures = 0
 
 
-def _restart_login(client: Client) -> None:
+def restart_login(client: Client) -> None:
     """Forget the held name and go back to asking for one."""
-    _ask(client, "name", "", None)
+    ask(client, "name", "", None)
 
 
-def _closed_status(host: Host) -> str | None:
+def closed_status(server: Server) -> str | None:
     """Return the staff line for a closed talker, or None when it is open."""
-    if not host._allow_residents:
+    if not server.allow_residents:
         return "[ Status ] The talker is closed to newbies and residents.\n"
-    if not host._allow_newbies:
+    if not server.allow_newbies:
         return "[ Status ] The talker is closed to newbies.\n"
     return None
 
 
-def _enter(host: Host, client: Client, name: str, rank: str) -> None:
-    """Put the player in the start room, or refuse them when it is full."""
-    taken = {item.lower() for item in host._taken_names()}
-    if name.lower() in host._unsaved_names(skip=client) or name.lower() in taken:
-        _restart_login(client)
-        host.send(client, name_taken_reply(name))
-        return
-    start = host._config.start
-    if occupancy(host._clients.values(), start) >= host._layout.rooms[start].max_occupancy:
-        host.send(client, full_line(host._layout.display_name(start)))
-        host.drop(client, announce=False)
-        return
-    _restart_login(client)
-    newbie_text = "I am new here"
-    description = newbie_text if rank == RANK_NEWBIE else ""
-    client.player = Player(
-        name,
-        start,
-        datetime.now(timezone.utc),
-        rank=rank,
-        description=description,
-    )
-    _load_profile(host, client.player)
-    _remember_address(host, client)
-    broadcast_room_split(
-        host,
-        start,
-        connected_line(name),
-        connected_from_line(name, client.address),
-        skip=client,
-    )
-    brief = host._layout.brief(start, others(host._clients.values(), start, client))
-    if host.send(client, brief):
-        user = client.player
-        if user is not None and rank_allows(user.rank, RANK_SUPER):
-            status = _closed_status(host)
-            if status is not None:
-                host.send(client, status)
-        host.send(client, player_prompt(client))
+NEWBIE_ALERT = "[ Newbie Alert ] "
 
 
-def _enter_fresh(host: Host, client: Client, held: SavedPlayer) -> None:
-    """Enter with the rank in the file now, or go back to the name prompt when it is gone."""
+def announce_login(server: Server, client: Client) -> None:
+    """Tell the room the login sentence."""
+    user = client.player
+    name = "" if user is None else user.name
+    sentence = DEFAULT_LOGINMSG if user is None else user.loginmsg
+    room = client.room if user is None else user.room
+    broadcast_room(server, room, spoken_line(name, sentence), skip=client)
+
+
+def announce_reconnect(server: Server, client: Client) -> None:
+    """Tell the room this name took over a session."""
+    user = client.player
+    name = "" if user is None else user.name
+    room = client.room if user is None else user.room
+    broadcast_room(server, room, reconnected_line(name), skip=client)
+
+
+def announce_newbie_connecting(server: Server, client: Client, name: str) -> None:
+    """Tell staff a newbie has typed a free name."""
+    host = client.hostname or client.address or "unknown"
+    pad = " " * len(NEWBIE_ALERT)
+    broadcast_staff(server, f"{NEWBIE_ALERT}AWOOGA AWOOGA!!\n{pad}{name} is connecting from {host}\n", skip=client)
+
+
+def announce_newbie_quit(server: Server, name: str) -> None:
+    """Tell staff a newbie refused the disclaimer."""
+    broadcast_staff(server, f"{NEWBIE_ALERT}{name} quit at the disclaimer\n")
+
+
+def announce_newbie_landed(server: Server, client: Client, name: str) -> None:
+    """Tell staff which room a newbie entered."""
+    room = "" if client.room is None else client.room
+    shown = server.layout.display_name(room) if room else ""
+    broadcast_staff(server, f"{NEWBIE_ALERT}{name} is in {shown}.\n", skip=client)
+
+
+def announce_logout(server: Server, name: str, room: str | None, sentence: str) -> None:
+    """Tell the room the logout sentence after the socket is gone."""
+    broadcast_room(server, room, spoken_line(name, sentence), skip=None)
+
+
+def issue_lines(server: Server) -> tuple[str, ...]:
+    """Return the site-admin issue lines for extra super admins and obsolete keys."""
+    lines: list[str] = []
     try:
-        fresh = _find_saved(host, held.name)
+        found = super_admins(server.roster_dir)
     except (ConfigError, OSError) as exc:
         print(exc)
-        _restart_login(client)
-        host.send(client, f"That name cannot be used right now.\n{NAME_PROMPT}")
+        found = ()
+    if len(found) > 1:
+        names = join_names(player.name for player in found)
+        lines.append(f"[ Issue Located ] There are multi super-admins '{names}' - this needs to be resolved before the next restart.\n")
+    if server.config.obsolete_hot:
+        keys = join_names(server.config.obsolete_hot)
+        lines.append(f"[ Issue Located ] Obsolete keys found in {server.config.hot_path.name}: {keys}. Please remove them.\n")
+    if server.config.obsolete_cold:
+        keys = join_names(server.config.obsolete_cold)
+        lines.append(f"[ Issue Located ] Obsolete keys found in {server.config.cold_path.name}: {keys}. Please remove them.\n")
+    return tuple(lines)
+
+
+def warn_site_admin(server: Server, client: Client) -> None:
+    """Tell this site admin about extra super admins and obsolete config keys."""
+    if (held_roles(client) & int(Roles.SITE_ADMIN)) == 0:
+        return
+    from .password import send_lock_line
+
+    for line in issue_lines(server):
+        send_lock_line(server, client, line)
+
+
+def warn_connected_site_admins(server: Server) -> None:
+    """Tell every connected site admin about extra super admins and obsolete config keys."""
+    for person in list(get_clients(server)):
+        warn_site_admin(server, person)
+
+
+def settle_unknown_rank(server: Server, client: Client) -> None:
+    """Rewrite an unknown file rank to resident and tell the site admins."""
+    user = client.player
+    if user is None:
+        return
+    try:
+        saved = find_saved(server, user.name)
+    except (ConfigError, OSError) as exc:
+        print(exc)
+        return
+    if saved is None or saved.unknown_rank is None:
+        return
+    word = saved.unknown_rank
+    try:
+        save_player(server.roster_dir, replace(saved, rank=Rank.RESIDENT, unknown_rank=None))
+    except (ConfigError, OSError) as exc:
+        print(exc)
+        return
+    user.rank = Rank.RESIDENT
+    server.send(client, f"You logged in with an unknown rank '{word}' and have been auto-demoted to 'resident'.\n")
+    line = f"[ Issue Located ] {saved.name} logged in with an unknown rank '{word}' and has been auto-demoted to 'resident'.\n"
+    for person in get_clients(server):
+        if (held_roles(person) & int(Roles.SITE_ADMIN)) == 0:
+            continue
+        server.send(person, line)
+
+
+def enter(server: Server, client: Client, name: str, rank: Rank) -> None:
+    """Put a newbie in newbie_start, others in home or start, or refuse when full."""
+    taken = {item.lower() for item in server.taken_names()}
+    if name.lower() in server.unsaved_names(skip=client) or name.lower() in taken:
+        restart_login(client)
+        server.send(client, name_taken_reply(name))
+        return
+    if rank == Rank.NEWBIE:
+        start = server.config.newbie_start or server.config.start
+    else:
+        start = server.config.start
+        try:
+            chosen = find_saved(server, name)
+        except (ConfigError, OSError):
+            chosen = None
+        if chosen is not None and chosen.home and chosen.home_login and not house_path_blocked(server.config.rooms, server.config.help, chosen.name):
+            try:
+                rooms = load_house(house_path(server.config.rooms, chosen.name), chosen.name, system_room_ids(server.layout))
+            except (ConfigError, OSError):
+                rooms = None
+            home_id = house_room_id(chosen.name)
+            if rooms is not None and home_id in rooms:
+                server.layout = server.layout.with_house(chosen.name, rooms)
+                start = home_id
+    if is_full(server.layout, get_clients(server), start):
+        server.send(client, full_line(server.layout.display_name(start)))
+        server.drop(client, announce=False)
+        return
+    restart_login(client)
+    newbie_text = "I am new here"
+    description = newbie_text if rank == Rank.NEWBIE else ""
+    client.player = Player(name, start, datetime.now(timezone.utc), rank=rank, description=description)
+    client.room = start
+    load_profile(server, client.player)
+    sync_country(client)
+    remember_address(server, client)
+    announce_login(server, client)
+    if rank == Rank.NEWBIE:
+        announce_newbie_landed(server, client, name)
+    brief = server.layout.brief(start, others(get_clients(server), start, client))
+    if server.send(client, brief):
+        user = client.player
+        if user is not None and rank_allows(user.rank, Rank.SU_CHANNEL):
+            status = closed_status(server)
+            if status is not None:
+                server.send(client, status)
+        warn_site_admin(server, client)
+        settle_unknown_rank(server, client)
+        server.send(client, player_prompt(client))
+
+
+def enter_fresh(server: Server, client: Client, held: SavedPlayer) -> None:
+    """Enter with the rank in the file now, or go back to the name prompt when it is gone."""
+    try:
+        fresh = find_saved(server, held.name)
+    except (ConfigError, OSError) as exc:
+        print(exc)
+        restart_login(client)
+        server.send(client, f"That name cannot be used right now.\n{NAME_PROMPT}")
         return
     if fresh is None:
-        _restart_login(client)
-        host.send(client, NAME_PROMPT)
+        restart_login(client)
+        server.send(client, NAME_PROMPT)
         return
-    live = player_named(host._clients.values(), fresh.name)
+    live = find_player(server, client, fresh.name, quiet=True)
     if live is not None:
-        _reconnect(host, live, client, fresh)
+        reconnect(server, live, client, fresh)
         return
-    _enter(host, client, fresh.name, fresh.rank)
+    enter(server, client, fresh.name, fresh.rank)
 
 
-def _reconnect(host: Host, live: Client, newcomer: Client, fresh: SavedPlayer) -> None:
+def reconnect(server: Server, live: Client, newcomer: Client, fresh: SavedPlayer) -> None:
     """Keep ``live`` and attach ``newcomer``'s socket to it."""
     user = live.player
     if user is None:
-        _enter(host, newcomer, fresh.name, fresh.rank)
+        enter(server, newcomer, fresh.name, fresh.rank)
         return
     user.idle_seconds = 0
     user.rank = fresh.rank
-    host._replace_socket(live, newcomer)
+    server.replace_socket(live, newcomer)
     if live.auth in ("current", "renew", "renew_confirm"):
-        _restart_login(live)
-    _remember_address(host, live)
-    broadcast_room_split(
-        host,
-        user.room,
-        reconnected_line(user.name),
-        reconnected_from_line(user.name, live.address),
-        skip=live,
-    )
-    brief = host._layout.brief(user.room, others(host._clients.values(), user.room, live))
-    if host.send(live, brief):
+        restart_login(live)
+    remember_address(server, live)
+    announce_reconnect(server, live)
+    brief = server.layout.brief(user.room, others(get_clients(server), user.room, live))
+    if server.send(live, brief):
         user = live.player
-        if user is not None and rank_allows(user.rank, RANK_SUPER):
-            status = _closed_status(host)
+        if user is not None and rank_allows(user.rank, Rank.SU_CHANNEL):
+            status = closed_status(server)
             if status is not None:
-                host.send(live, status)
-        host.send(live, player_prompt(live))
+                server.send(live, status)
+        settle_unknown_rank(server, live)
+        server.send(live, player_prompt(live))
 
 
-def _load_profile(host: Host, user: Player) -> None:
+def load_profile(server: Server, user: Player) -> None:
     """Start a saved player's total and prompt from the file. A newbie keeps the defaults."""
-    if user.rank == RANK_NEWBIE:
+    if user.rank == Rank.NEWBIE:
         return
     try:
-        saved = _find_saved(host, user.name)
+        saved = find_saved(server, user.name)
     except (ConfigError, OSError) as exc:
         print(exc)
         return
@@ -171,23 +280,44 @@ def _load_profile(host: Host, user: Player) -> None:
         user.prompt = saved.prompt
     if saved.entermsg is not None:
         user.entermsg = saved.entermsg
+    if saved.loginmsg is not None:
+        user.loginmsg = saved.loginmsg
+    if saved.logoutmsg is not None:
+        user.logoutmsg = saved.logoutmsg
     user.colour = saved.colour
     user.description = saved.description
+    user.plan = saved.plan
+    user.country_name = saved.country_name
+    user.country_code = saved.country_code
+    user.roles = saved.roles
 
 
-def _remember_address(host: Host, client: Client) -> None:
+def sync_country(client: Client) -> None:
+    """Keep the live player and this connection on the same country."""
+    user = client.player
+    if user is None:
+        return
+    if client.country_name:
+        user.country_name = client.country_name
+        user.country_code = client.country_code
+        return
+    client.country_name = user.country_name
+    client.country_code = user.country_code
+
+
+def remember_address(server: Server, client: Client) -> None:
     """Save where a saved player connected from, when it differs from the file."""
     user = client.player
-    if user is None or user.rank == RANK_NEWBIE:
+    if user is None or user.rank == Rank.NEWBIE:
         return
     try:
-        saved = _find_saved(host, user.name)
-        if saved is not None and (
-            saved.ip_address != client.address or saved.hostname != client.hostname
-        ):
-            save_player(
-                host._roster_dir,
-                replace(saved, ip_address=client.address, hostname=client.hostname),
-            )
+        saved = find_saved(server, user.name)
+        if saved is None:
+            return
+        country_name = client.country_name or saved.country_name
+        country_code = client.country_code or saved.country_code
+        if saved.ip_address == client.address and saved.hostname == client.hostname and saved.country_name == country_name and saved.country_code == country_code:
+            return
+        save_player(server.roster_dir, replace(saved, ip_address=client.address, hostname=client.hostname, country_name=country_name, country_code=country_code))
     except (ConfigError, OSError) as exc:
         print(exc)

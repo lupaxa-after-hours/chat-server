@@ -1,49 +1,67 @@
 """Shared text, frames, addresses, and roster lookups."""
 
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
 import ipaddress
 import socket
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
+from typing import Literal, overload
 
 from .client import Client
-from .colour import cyan, green, plain_len, red
-from .commands_list import Host
+from .colour import plain_len
 from .exceptions import ConfigError
 from .globals import CANNOT_NOW
-from .saved_player import (
-    RANK_ADMIN,
-    RANK_NEWBIE,
-    RANK_SUPER,
-    RANK_SUPER_ADMIN,
-    SavedPlayer,
-    load_saved,
-    normalize_super_admin,
-    player_path,
-    rank_label,
-    savable_name,
-    save_player,
-)
+from .ranks import Rank, duty_cell as duty_cell, lsu_rank_cell as lsu_rank_cell, rank_cell as rank_cell, rank_words as rank_words, shown_rank as shown_rank, shown_rank_cell as shown_rank_cell
+from .saved_player import SavedPlayer, load_saved, player_path, savable_name  # fmt: skip  # noqa: E501
+from .server import Server
 from .time import duration_phrase
 
-_DEFAULT_FRAME = 80
-_MIN_IDLE = 8
-_GAP = 2
-_CENTER_HEADERS = frozenset({"Rank", "Room", "Idle"})
-_CENTER_VALUES = frozenset({"Rank"})
+DEFAULT_FRAME = 80
+MIN_IDLE = 10
+GAP = 2
+CENTER_HEADERS = frozenset({"Rank", "Room", "Idle"})
+CENTER_VALUES = frozenset({"Rank"})
+
+
+def connected_place(hostname: str, address: str) -> str:
+    """Return ``hostname (address)`` for an examine from-line."""
+    host = hostname.strip()
+    ip = address.strip()
+    if host == "" and ip == "":
+        return "unknown"
+    if host == "":
+        host = ip
+    if ip == "":
+        return host
+    return f"{host} ({ip})"
+
+
+def login_place(hostname: str, address: str, *, ssh: bool) -> str:
+    """Return the logged-in from value, including telnet or ssh."""
+    kind = "ssh" if ssh else "telnet"
+    return f"{connected_place(hostname, address)} [via {kind}]"
 
 
 def display_address(host: str) -> str:
     """Return ``host`` for display, unwrapping IPv4-mapped IPv6 when applicable."""
     if host == "":
         return "unknown"
-    if host.lower().startswith("::ffff:"):
-        remainder = host[len("::ffff:") :]
-        try:
-            return str(ipaddress.IPv4Address(remainder))
-        except ValueError:
-            return host
-    return host
+    bare = host.split("%", 1)[0]
+    try:
+        address = ipaddress.ip_address(bare)
+    except ValueError:
+        return host
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return str(address.ipv4_mapped)
+    return str(address)
+
+
+def peer_address(address: object) -> str:
+    """Return the IP string from an accept address."""
+    host = address[0] if isinstance(address, tuple) and address else address
+    if isinstance(host, bytes):
+        host = host.decode("ascii", "replace")
+    return display_address("" if host is None else str(host))
 
 
 def lookup_hostname(ip: str) -> str:
@@ -59,15 +77,18 @@ def lookup_hostname(ip: str) -> str:
     return name
 
 
-def time_frame(current: str, uptime: str, width: int) -> str:
-    """Return the ruled clock. There is no title."""
+def time_frame(current: str, booted: str, uptime: str, rebooted: str | None = None) -> str:
+    """Return the clock box, ending with a newline."""
     label_width = len("Current time")
-    fields = (("Current time", current), ("Uptime", uptime))
-    body = [f"  {label.ljust(label_width)} : {value}" for label, value in fields]
-    width = max(width, *(len(line) for line in body))
-    rule = "-" * width
-    lines = [rule, *(line.ljust(width) for line in body), rule]
-    return "\n".join(lines) + "\n"
+    fields = [("Current time", current), ("Booted at", booted)]
+    if rebooted is not None:
+        fields.append(("Rebooted at", rebooted))
+    fields.append(("Uptime", uptime))
+    rows = [f" {label.ljust(label_width)} : {value}" for label, value in fields]
+    inner = max(len(row) for row in rows) + 1
+    border = "+" + ("-" * inner) + "+"
+    body = ["|" + row.ljust(inner) + "|" for row in rows]
+    return "\n".join((border, *body, border)) + "\n"
 
 
 def frame_width(discovered: int | None, manual: int | None) -> int:
@@ -76,31 +97,18 @@ def frame_width(discovered: int | None, manual: int | None) -> int:
         return manual
     if discovered is not None and discovered > 0:
         return discovered
-    return _DEFAULT_FRAME
+    return DEFAULT_FRAME
 
 
-def terminal_size_value(
-    discovered_columns: int | None,
-    discovered_rows: int | None,
-    manual: int | None,
-) -> str:
+def terminal_size_value(discovered_columns: int | None, discovered_rows: int | None, manual: int | None) -> str:
     """Return the examine value for this client's terminal."""
     width = frame_width(discovered_columns, manual)
-    if (
-        discovered_columns is not None
-        and discovered_rows is not None
-        and discovered_columns > 0
-        and discovered_rows > 0
-    ):
+    if discovered_columns is not None and discovered_rows is not None and discovered_columns > 0 and discovered_rows > 0:
         return f"{width}x{discovered_rows} ({discovered_columns}x{discovered_rows} discovered)"
     return f"{width}  (Pending)"
 
 
-def terminal_size_line(
-    discovered_columns: int | None,
-    discovered_rows: int | None,
-    manual: int | None,
-) -> str:
+def terminal_size_line(discovered_columns: int | None, discovered_rows: int | None, manual: int | None) -> str:
     """Return the one examine field line for the terminal."""
     label = "Terminal Size"
     label_width = max(len("Logged in from"), len(label))
@@ -108,18 +116,11 @@ def terminal_size_line(
     return f"  {label.ljust(label_width)} : {value}\n"
 
 
-def _width_ceiling(client: Client) -> int:
+def width_ceiling(client: Client) -> int:
     """Return the widest manual width this client may set."""
     if client.discovered_columns is not None and client.discovered_columns > 0:
         return client.discovered_columns
-    return _DEFAULT_FRAME
-
-
-def rank_words(rank: str) -> str:
-    """Return the examine rank words, with no brackets."""
-    if rank == RANK_NEWBIE:
-        return "Newbie"
-    return rank_label(rank)
+    return DEFAULT_FRAME
 
 
 def examine_idle(seconds: int) -> str:
@@ -129,75 +130,88 @@ def examine_idle(seconds: int) -> str:
     return duration_phrase(seconds)
 
 
-def shown_rank(rank: str, enabled: bool) -> str:
-    """Return the examine rank words, coloured when ``enabled`` is true."""
-    words = rank_words(rank)
-    if not enabled:
-        return words
-    if rank == RANK_NEWBIE:
-        return green(words)
-    if rank == RANK_SUPER:
-        return cyan(words)
-    if rank in (RANK_ADMIN, RANK_SUPER_ADMIN):
-        return red(words)
-    return words
-
-
-def shown_rank_cell(rank: str, enabled: bool) -> str:
-    """Return the list rank cell, coloured when ``enabled`` is true."""
-    cell = rank_cell(rank)
-    if not enabled:
-        return cell
-    if rank == RANK_SUPER:
-        return cyan(cell)
-    if rank in (RANK_ADMIN, RANK_SUPER_ADMIN):
-        return red(cell)
-    return cell
-
-
-def _visible_width(terminal: int, content: int) -> int:
+def visible_width(terminal: int, content: int) -> int:
     """Return the wider of the terminal and the plain content."""
     return max(content, terminal)
 
 
-def examine_frame(
-    name: str,
-    fields: Sequence[tuple[str, str]],
-    width: int,
-    description: str = "",
-) -> str:
-    """Return the ruled examine profile. The name is centered."""
-    label_width = max(len("Logged in from"), *(len(label) for label, _value in fields))
-    body = [f"  {label.ljust(label_width)} : {value}" for label, value in fields]
+def center_block(text: str, width: int) -> str:
+    """Pad every line so the widest line sits in the middle of ``width``."""
+    if width <= 0 or text == "":
+        return text
+    newline = text.endswith("\n")
+    lines = text[:-1].split("\n") if newline else text.split("\n")
+    widest = max((plain_len(line) for line in lines), default=0)
+    pad = max(0, (width - widest) // 2)
+    if pad == 0:
+        return text
+    centered = "\n".join(" " * pad + line for line in lines)
+    return centered + "\n" if newline else centered
+
+
+def wrap_words(words: Sequence[str], width: int) -> str:
+    """Join ``words`` into lines no wider than ``width`` visible characters."""
+    lines: list[str] = []
+    current: list[str] = []
+    for word in words:
+        trial = word if not current else " ".join((*current, word))
+        if current and plain_len(trial) > width:
+            lines.append(" ".join(current))
+            current = [word]
+        else:
+            current.append(word)
+    if current:
+        lines.append(" ".join(current))
+    return "\n".join(lines)
+
+
+def examine_frame(name: str, fields: Sequence[tuple[str, str]], width: int, description: str = "", plan: str = "") -> str:
+    """Return the ruled examine profile. The name is centered.
+
+    The room sentences sit in their own block. A description sits under the
+    name when set. A plan sits under the sentences when set.
+    """
+    label_width = max(len("Logged in from"), *(len(label) for label, value in fields))
+    profile: list[str] = []
+    messages: list[str] = []
+    for label, value in fields:
+        line = f"  {label.ljust(label_width)} : {value}"
+        if label in ("Enter message", "Login message", "Logout message"):
+            messages.append(line)
+        else:
+            profile.append(line)
     desc_line = f"  {description}" if description else ""
-    content = max(len(name), *(plain_len(line) for line in body))
+    plan_line = f"  {plan}" if plan else ""
+    content = max(len(name), *(plain_len(line) for line in (*profile, *messages)))
     if desc_line:
         content = max(content, plain_len(desc_line))
-    width = _visible_width(width, content)
+    if plan_line:
+        content = max(content, plain_len(plan_line))
+    width = visible_width(width, content)
     rule = "-" * width
+
+    def fit(line: str) -> str:
+        gap = width - plain_len(line)
+        return line + (" " * gap if gap > 0 else "")
+
     lines = [rule, name.center(width), rule]
     if desc_line:
-        gap = width - plain_len(desc_line)
-        lines.append(desc_line + (" " * gap if gap > 0 else ""))
+        lines.append(fit(desc_line))
         lines.append(rule)
-    for line in body:
-        gap = width - plain_len(line)
-        lines.append(line + (" " * gap if gap > 0 else ""))
+    for line in profile:
+        lines.append(fit(line))
     lines.append(rule)
+    for line in messages:
+        lines.append(fit(line))
+    if messages:
+        lines.append(rule)
+    if plan_line:
+        lines.append(fit(plan_line))
+        lines.append(rule)
     return "\n".join(lines) + "\n"
 
 
-def rank_cell(rank: str) -> str:
-    """Return the list rank cell. Admin uses square brackets. Super user uses angles."""
-    label = rank_words(rank)
-    if rank in (RANK_ADMIN, RANK_SUPER_ADMIN):
-        return f"[ {label} ]"
-    if rank == RANK_SUPER:
-        return f"< {label} >"
-    return label
-
-
-def _fit_cell(text: str, width: int, center_it: bool) -> str:
+def fit_cell(text: str, width: int, center_it: bool) -> str:
     """Return ``text`` in a column of ``width``. Odd leftover space goes on the right."""
     if not center_it:
         gap = width - plain_len(text)
@@ -212,16 +226,16 @@ def list_frame(headers: Sequence[str], rows: Sequence[Sequence[str]], width: int
     headers = list(headers)
     col_widths = [len(header) for header in headers]
     if col_widths:
-        col_widths[-1] = max(col_widths[-1], _MIN_IDLE)
+        col_widths[-1] = max(col_widths[-1], MIN_IDLE)
     for row in rows:
         for index, cell in enumerate(row):
             col_widths[index] = max(col_widths[index], plain_len(cell))
     gap_count = max(len(headers) - 1, 0)
-    base = 4 + sum(col_widths) + (_GAP * gap_count)
-    width = _visible_width(width, base)
+    base = 4 + sum(col_widths) + (GAP * gap_count)
+    width = visible_width(width, base)
     extra = width - base
     share, leftover = divmod(extra, gap_count) if gap_count else (0, 0)
-    gaps = [_GAP + share] * gap_count
+    gaps = [GAP + share] * gap_count
     for index in range(leftover):
         gaps[index] += 1
 
@@ -229,8 +243,8 @@ def list_frame(headers: Sequence[str], rows: Sequence[Sequence[str]], width: int
         parts = ["  "]
         for index, cell in enumerate(cells):
             header = headers[index]
-            center_it = header in _CENTER_HEADERS if kind == "header" else header in _CENTER_VALUES
-            parts.append(_fit_cell(cell, col_widths[index], center_it))
+            center_it = header in CENTER_HEADERS if kind == "header" else header in CENTER_VALUES
+            parts.append(fit_cell(cell, col_widths[index], center_it))
             if index < gap_count:
                 parts.append(" " * gaps[index])
         text = "".join(parts)
@@ -246,42 +260,28 @@ def list_frame(headers: Sequence[str], rows: Sequence[Sequence[str]], width: int
     return "\n".join(lines) + "\n"
 
 
-def _rank_of(client: Client) -> str:
+def get_clients(server: Server, *, alphabetical: bool = False) -> Collection[Client]:
+    """Return the connected clients in login order, or by name when ``alphabetical`` is true.
+
+    A connection with no name sorts last.
+    """
+    clients = server.clients.values()
+    if not alphabetical:
+        return clients
+    return sorted(clients, key=lambda client: (client.name is None, (client.name or "").lower()))
+
+
+def has_rank(client: Client) -> Rank:
     """Return this player's rank, or newbie when they have not entered."""
     user = client.player
     if user is None:
-        return RANK_NEWBIE
+        return Rank.NEWBIE
     return user.rank
-
-
-def connected_line(name: str) -> str:
-    """Return the room line for a player who just chose a name."""
-    return f"[{name} has connected]\n"
-
-
-def disconnected_line(name: str) -> str:
-    """Return the room line for a named player who left."""
-    return f"[{name} has disconnected]\n"
-
-
-def connected_from_line(name: str, address: str) -> str:
-    """Return the staff room line for a player who connected from ``address``."""
-    return f"[{name} has connected from {address}]\n"
 
 
 def reconnected_line(name: str) -> str:
     """Return the room line for a player who took over their own session."""
     return f"[{name} has reconnected]\n"
-
-
-def reconnected_from_line(name: str, address: str) -> str:
-    """Return the staff room line for a player who reconnected from ``address``."""
-    return f"[{name} has reconnected from {address}]\n"
-
-
-def disconnected_from_line(name: str, address: str) -> str:
-    """Return the staff room line for a player who left from ``address``."""
-    return f"[{name} has disconnected from {address}]\n"
 
 
 def goes_to_line(name: str | None, destination: str) -> str:
@@ -291,56 +291,74 @@ def goes_to_line(name: str | None, destination: str) -> str:
     return f"{name} goes to {destination}.\n"
 
 
-def _name_of(client: Client) -> str:
+@overload
+def get_parts(text: str | None, *, split: Literal[False] = False) -> str: ...
+
+
+@overload
+def get_parts(text: str | None, *, split: Literal[True]) -> list[str]: ...
+
+
+def get_parts(text: str | None, *, split: bool = False) -> str | list[str]:
+    """Return ``text`` stripped, or its words when ``split`` is true."""
+    cleaned = (text or "").strip()
+    if split:
+        return cleaned.split()
+    return cleaned
+
+
+def get_player_name(client: Client) -> str:
     """Return the name of a player who is in a room."""
     return client.name or ""
 
 
-def _is_admin(host: Host, name: str) -> bool:
-    """Return whether ``name`` is the admin, in any case."""
-    return name.lower() == host._config.admin.lower()
+def is_admin(server: Server, name: str) -> bool:
+    """Return whether ``name`` is a super admin on disk or online."""
+    saved = find_saved(server, name)
+    if saved is not None and saved.rank == Rank.SUPER_ADMIN:
+        return True
+    lowered = name.lower()
+    return any(client.name is not None and client.name.lower() == lowered and client.player is not None and client.player.rank == Rank.SUPER_ADMIN for client in get_clients(server))  # fmt: skip  # noqa: E501
 
 
-def _lookup(host: Host, client: Client, name: str) -> tuple[bool, SavedPlayer | None]:
-    """Return ``(True, saved)`` for ``name``, or tell ``player`` and return ``(False, None)``."""
+def get_saved_player(server: Server, client: Client, name: str, *, quiet: bool = False) -> tuple[bool, SavedPlayer | None]:
+    """Return the saved player for ``name``.
+
+    A missing file tells ``client`` there is no saved player. A file that cannot
+    be read tells them the name cannot be used right now. ``quiet`` leaves both
+    unsaid. The bool is false only when the file could not be read.
+    """
     try:
-        return True, _find_saved(host, name)
+        saved = find_saved(server, name)
     except (ConfigError, OSError) as exc:
         print(exc)
-        host.send(client, CANNOT_NOW)
+        if not quiet:
+            server.send(client, CANNOT_NOW)
         return False, None
+    if saved is None and not quiet:
+        server.send(client, f"No saved player '{name}'.\n")
+    return True, saved
 
 
-def _normalize_saved_rank(host: Host, saved: SavedPlayer) -> SavedPlayer:
-    """Return ``saved`` after config-account rank normalization, persisting when needed."""
-    normalized = normalize_super_admin(saved, host._config.admin)
-    if normalized.rank != saved.rank:
-        save_player(host._roster_dir, normalized)
-    return normalized
-
-
-def _find_saved(host: Host, name: str) -> SavedPlayer | None:
+def find_saved(server: Server, name: str) -> SavedPlayer | None:
     """Return the saved player whose file ``name`` points at, or ``None``."""
     if not savable_name(name):
         return None
-    saved = load_saved(player_path(host._roster_dir, name))
-    if saved is None:
-        return None
-    return _normalize_saved_rank(host, saved)
+    return load_saved(player_path(server.roster_dir, name))
 
 
-def refuses_self(host: Host, client: Client, name: str) -> bool:
+def refuses_self(server: Server, client: Client, name: str) -> bool:
     """Send the self refusal when ``name`` is this player. Return whether it was."""
     own = client.name
     if own is None or name.lower() != own.lower():
         return False
-    host.send(client, "You cannot do that to yourself.\n")
+    server.send(client, "You cannot do that to yourself.\n")
     return True
 
 
-def _saved_players(host: Host) -> list[SavedPlayer]:
+def saved_players(server: Server) -> list[SavedPlayer]:
     """Return readable roster files, lowercase path then the stored spelling."""
-    directory = host._roster_dir
+    directory = server.roster_dir
     try:
         paths = directory.glob("*.yml")
     except OSError as exc:
@@ -352,14 +370,14 @@ def _saved_players(host: Host) -> list[SavedPlayer]:
             saved = load_saved(path)
             if saved is None:
                 continue
-            loaded.append(_normalize_saved_rank(host, saved))
+            loaded.append(saved)
         except (ConfigError, OSError) as exc:
             print(exc)
             continue
     return loaded
 
 
-def _name_prefixes_argument(argument: str, stored: str) -> bool:
+def name_prefixes_argument(argument: str, stored: str) -> bool:
     """Return whether ``stored`` is a space-bounded prefix of ``argument``."""
     if len(argument) < len(stored):
         return False

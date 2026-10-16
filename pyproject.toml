@@ -14,6 +14,8 @@ dependencies = [
   "bcrypt>=4.0",
   "colorama>=0.4.6",
   "cryptography>=44",
+  "maxminddb>=2.6",
+  "psutil>=5.9",
   "pyyaml>=6.0",
   "qrcode>=7.4",
 ]
@@ -79,7 +81,7 @@ include = [
 packages = ["src/lupaxa"]
 
 [tool.ruff]
-line-length = 100
+line-length = 250
 target-version = "py310"
 
 [tool.ruff.lint]
@@ -90,8 +92,8 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**/*.py" = ["S101", "ANN001", "ANN201"]
-"src/lupaxa/chat_server/server.py" = ["S104"]
+"tests/**/*.py" = ["S101", "ANN001", "ANN201", "D101", "D102", "D103", "D105"]
+"src/lupaxa/chat_server/chatserver.py" = ["S104"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "numpy"

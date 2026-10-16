@@ -1,106 +1,183 @@
 # Players
 
-A name with no saved file enters at once as a newbie. A newbie can use
-the commands that were already in the game, except `shout`, `!`, and
-`prompt`. `lsu`, `term_width`, `time`, `main`, and `remote` are for every
-rank, including a newbie. A newbie cannot use `prompt`, `save`, `retire`,
-`resident`, `warn`, `nuke`,
-`disconnect`, `su`, `se`, `st`, `au`, `ae`, `at`, `lsn`, `connections`, `promote`, `demote`,
-`allow`, `shutdown`, or `mfa`.
+## Ranks
 
-A saved name asks for a password. A wrong password is answered with
-`Wrong password.` and asked again. The third wrong password disconnects.
-`password` is for every rank. A newbie is told they have no saved
-password. A saved player is asked for the current password, then the new
-one, twice. A saved name must be typed in the spelling it was saved with.
-Any other case is told how the name is saved and asked for again.
+| Rank        | Saved | What they can do                                                                             |
+| ----------- | ----- | -------------------------------------------------------------------------------------------- |
+| Newbie      | No    | The room commands, except `shout` and `!`. No resident or staff commands.                    |
+| Resident    | Yes   | `prompt`, `retire`, `save`, `set`, and `shout`.                                              |
+| SU Channel  | Yes   | The staff channel, plus `connections`, `lsn`, `off_duty`, `on_duty`, `se`, `st`, and `su`.   |
+| Super User  | Yes   | `disconnect`, `grab`, `nuke`, `resident`, and `warn`.                                        |
+| Admin       | Yes   | `allow`, `appoint`, `demote`, `dismiss`, `promote`, and the admin channel.                   |
+| Coder       | Yes   | The coder channel, `ce`, `ct`, and `cu`, and promote or demote between Super User and Admin. |
+| Super Admin | Yes   | One account, created by setup. Outranks every other rank.                                    |
 
-When `mfa_enabled` is true in the config file, which is the default, a saved
-player with a secret is asked for `Code:` after the password. Super users
-and admins must turn MFA on. Login walks them through setup when they have
-no secret yet. When `mfa_enabled` is false, login never asks for a code and
-the in-room `mfa` command does not exist. See [MFA](../security/mfa.md).
+`cls`, `lsu`, `main`, `remote`, `rthink`, `term_width`, `testcard`, and
+`time` are for every rank, including a newbie. `broadcast`, `network`,
+`reboot`, `reload`, `shutdown`, and `system` are Coder, or the Site Admin
+role. Those six are listed under Roles.
 
-A saved player who logs in while that name is already in a room takes
-over that session. The old connection is told it has been reconnected
-from elsewhere. The room hears `[Bea has reconnected]`, not a disconnect
-and a connect. A super user or the admin in that room sees the address
-on that line.
+When colour is on, `examine`, `who`, and `lsu` show a super user in cyan,
+an admin in red, a coder in magenta, and the Super Admin in light blue.
+On `who` and `lsu`, Coder uses `{ }` and the Super Admin uses `( )`.
+A resident or newbie sees an SU Channel player as Resident. SU Channel
+and above see Super User Channel (cyan when colour is on).
 
-| Rank        | What they can do                                                                    |
-| ----------- | ----------------------------------------------------------------------------------- |
-| Newbie      | Not saved. Game commands except `shout` and `!`. No `prompt` or super-user commands.|
-| Resident    | Saved, with a password. May `shout`, `prompt`, `save`, `retire`, and `lsu`.         |
-| Super User  | `resident`, `warn`, `nuke`, `disconnect`, `su`, `se`, `st`, `lsn`, `connections`.   |
-| Admin       | Also `allow`, `shutdown`, `promote`, `demote`, `au`, `ae`, and `at`.                |
-| Super Admin | The config account only. Outranks every other rank.                                 |
+## Login
+
+A new name walks straight in. A saved name has to prove who they are.
+
+- A name with no saved file enters at once as a newbie.
+- A saved name asks for a password. A wrong password is `Wrong password.` The third wrong password disconnects.
+- A saved name must be typed in the spelling it was saved with. Any other case is told how the name is saved and asked for again.
+- `password` is for every rank. A newbie is told they have no saved password. A saved player types the current password, then the new one, twice.
+- With MFA on, which is the default, a saved player with a secret is asked for `Code:` after the password. SU Channel and above must turn MFA on.
+- Login walks them through setup when they have no secret yet. With MFA off, login never asks for a code and `mfa` does not exist. See [MFA](../security/mfa.md).
+- A saved player who logs in while that name is already in a room takes over that session. The old connection is told it has been reconnected from elsewhere. The room hears `[Bea has reconnected]`.
+
+## Player Files
 
 The `players/` directory is one file per person, named by the lowercase
-name, such as `players/bea.yml`. Each file holds the saved spelling of the
-name, the rank, a bcrypt password hash, the total seconds they have been
-connected, the prompt they chose with `prompt` when it is not the usual one,
-and, once they have left, the UTC time they logged out. A normal quit writes
-the logout time and the total. The file is also written every five minutes
-while they are here, and a resident may run `save` to write it at once. The
-password is never stored as typed.
+name, such as `players/bea.yml`.
 
-The first time the name from the config is typed, it has to come from localhost, and
-no other name can log in until the Super Admin is saved. The server asks for a password
-twice. With `mfa_enabled` true (the default), enrolment follows; the file is written only
-after the login code matches, then they are let in. With MFA off, the two passwords save
-the Super Admin and let them in. After that, the Super Admin
-can connect from any address. Only the config account is created as super admin; promote
-never grants that rank. A super user or an admin runs
-`resident <name>` on a connected newbie, who is then asked for a password
-twice and is saved as a resident. The staff
-channel sees `< SU > <name> makes <name> a resident.` The super user who
-asked also sees that the player `is now a resident`. `warn <name> <reason>`
-sends a line with a blank line above and below. When colour is on the line is cyan, and
-the terminal beeps once. `nuke <name> <reason>` deletes a saved player and
-disconnects them if they are here. A saved player may `retire` to delete
-their own file after confirmation and the password. The admin cannot
-retire. Only an admin runs `promote <name>` and `demote <name>`. The target must be in a
-room; logged off replies `Bea is not connected.` With MFA on, no secret replies
-`Bea must turn on MFA first.` Any admin may move someone to or from super user. Only the
-Super Admin named in the config may promote to admin or demote from admin. A player promoted
-to admin may use the admin commands, including `au`, `ae`, and `at`, and may be demoted
-again by the Super Admin. The super admin cannot be demoted.
-An admin also runs
-`allow newbies|residents on|off`, to open or close logins until the server
-stops. Resident off blocks rank resident only; super users and the admin
-still connect. That command does not rewrite `allow_newbies`, `allow_residents`, or
-`mfa_enabled` in the config file. Those settings in the config file decide whether newbies
-and residents may connect when the server starts and whether MFA is enforced.
+Each file holds:
 
-`resident`, `warn`, `nuke`, `disconnect`, `promote`, and `demote` refuse your own
-name with `You cannot do that to yourself.` `nuke` and `disconnect` also refuse someone of your rank or higher.
-`tell` and `remote` refuse your
-own name with `Talking to yourself is the first sign of madness.`
+- the saved spelling, the rank, and a bcrypt password hash
+- total seconds connected, and the prompt when it is not the usual one
+- the enter, login, and logout sentences, the description, and the plan
+- the last address, and the UTC logout time once they have left
+- the country name and two-letter code, when lookup stored a result
 
-`examine <name>` is open to everyone. Someone in a room is shown with
-their name, location, rank, status when one is set, this login, total login,
-and idle. Examining yourself
-also adds the terminal size. `me` is the player who typed it. A connected
-newbie is found only by the exact spelling. A saved name shows that same
-block when they are here. When they are logged out it shows rank, the
-logged-out time as a calendar phrase such as
-`Monday 12th October 2026, 13:45:03 UTC`, how long ago that was, and their
-total login. `Logged out: unknown` has no Ago line when the file has no
-logout time. A name with nobody here and no file is not found. `x Bea` is
-examine, and `xBea` is not.
+The password is never stored as typed. A normal quit writes the logout time
+and the total. The file is also written every five minutes while they are
+here. A resident may run `save` to write it at once.
 
-Super users and the admin share a channel. `su <message>` speaks on it,
-`se <message>` emotes, and `st <message>` thinks, each shown as
-`< SU > Ada says 'hello'`. The sender sees `You` in place of their name.
-Residents and newbies hear nothing, and for them these commands do not
-exist. Admins also have `au`, `ae`, and `at` on a separate admin channel,
-shown as `[ Admin ] Ada says 'hello'` and red when colour is on. Other
-admins hear the line; no one else does.
-`resident`, `nuke`, `disconnect` use staff; to/from admin, promote/demote use `[ Admin ]`.
-`staff` runs `lsu`, which lists the connected
-super users and the admin in a frame with their rank, room, and idle.
-Every rank can run it. `lsn` lists the connected newbies in a frame with
-the hostname, the room, and idle. A super user or the admin in the room
-sees the address on connect, disconnect, reconnect, and `examine`. On
-examine, that line is `Logged in from` when the player is here and
-`Last from` when they are logged out.
+## Super Admin
+
+The super admin account is created with `chat-server setup -c` and the config path
+while the talker is stopped. Promote never grants that rank.
+The super admin cannot retire.
+
+## Roles
+
+A role is a flag on the player. It does not change their rank. The player
+file stores the integer under `roles`. A missing key means no roles. `1`
+is Site Admin. The token you type is `site_admin`.
+
+| Role       | What it unlocks                                                                      |
+| ---------- | ------------------------------------------------------------------------------------ |
+| Site Admin | `broadcast`, `network`, `reboot`, `reload`, `shutdown`, and `system`, or rank Coder. |
+
+`appoint` and `dismiss` are admin commands. `roles` is resident and
+above. An admin may look up another name. The Site Admin role does not
+unlock appoint, dismiss, or that lookup.
+
+You may give a role to yourself, including as the super admin. You may
+not change roles on a different super admin.
+
+## Staff
+
+`resident <name>` is for a super user or an admin, and only on a connected
+newbie. The newbie is asked for a password twice and saved as a resident.
+The staff channel sees `< SU > <name> makes <name> a resident.` The super
+user who asked also sees that the player `is now a resident`.
+
+| Command      | Who        | What it does                                                                                                                                                                    |
+| ------------ | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `allow`      | Admin      | `allow newbies on`, `allow newbies off`, `allow residents on`, or `allow residents off`, until the server stops. It does not rewrite the config file.                           |
+| `demote`     | Admin      | One rank down. `demote <name> force` drops SU Channel, a super user, an admin, or a coder straight to resident.                                                                 |
+| `disconnect` | Super user | Disconnects a player of lower rank.                                                                                                                                             |
+| `nuke`       | Super user | Deletes a saved player and disconnects them if they are here.                                                                                                                   |
+| `promote`    | Admin      | One rank up. The target must be in a room. Logged off is `No such player 'Bea'.`                                                                                                |
+| `retire`     | Resident   | Deletes your own file after confirmation and the password.                                                                                                                      |
+| `warn`       | Super user | A line with a blank line above and below. Cyan when colour is on, and the terminal beeps once.                                                                                  |
+
+With MFA on, promote of someone with no secret replies `Bea must turn on MFA first.`
+An admin may move someone among resident, SU Channel, and super user.
+A coder or the super admin may move someone between super user and admin.
+Only the super admin moves someone onto or off Coder. Every rank change is
+told on the staff channel. The super admin cannot be demoted.
+A player promoted to admin or coder may use the admin commands, including
+`ae`, `at`, and `au`.
+
+`allow residents off` blocks rank resident only. SU Channel and above
+still connect. `allow` does not change `allow_newbies`, `allow_residents`,
+or `mfa_enabled`. Those config keys decide the startup defaults.
+
+`resident`, `warn`, `nuke`, `disconnect`, `promote`, and `demote` refuse
+your own name with `You cannot do that to yourself.` `nuke`, `disconnect`,
+`warn`, and `grab` also refuse someone of your rank or higher.
+
+## Tells and Chains
+
+`tell`, `remote`, and `rthink` refuse your own name with
+`Talking to yourself is the first sign of madness.`
+
+A comma-separated list sends to several people. Two or more other people
+form a chain.
+
+| Rule                                 | Limit                                 |
+| ------------------------------------ | ------------------------------------- |
+| People on one chain                  | 10                                    |
+| Chain closes                         | Below three people                    |
+| Idle chain                           | Deleted after 2 hours with no message |
+| `chains`                             | Lists the ones you are on             |
+| `chains leave` / `remove` / `delete` | Change one chain                      |
+| Reboot                               | Chains are kept                       |
+| Shutdown                             | Chains are dropped                    |
+
+## Examine
+
+`examine <name>` is open to everyone. `x Bea` is examine. `xBea` is not.
+`me` is the player who typed it.
+
+| They are…          | The frame shows                                                                                                                         |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| In a room          | Name, location, rank, roles when one is set, status when set, this login, total login, and idle. Yourself also shows the terminal size. |
+| A connected newbie | Found only by the exact spelling.                                                                                                       |
+| Logged out         | Rank, roles when one is set, the logout time as a calendar phrase, how long ago, and total login.                                       |
+| No logout time     | `Logged out: unknown`, and no Ago line.                                                                                                 |
+| Unknown            | Not found. Nobody here and no file.                                                                                                     |
+
+A plan, when one is set, sits under the room sentences in both frames.
+`Logged in from` and `Last from` show `hostname (address)`. A player in a
+room also shows `[via telnet]` or `[via ssh]`.
+
+## Staff Channels
+
+The channel is SU Channel and above. Residents and newbies do not hear it.
+
+| Command | Channel | Shown as                                            |
+| ------- | ------- | --------------------------------------------------- |
+| `ae`    | Admin   | Emote                                               |
+| `at`    | Admin   | Think                                               |
+| `au`    | Admin   | `[ Admin ] Ada says 'hello'`, red when colour is on |
+| `se`    | Staff   | Emote on that channel                               |
+| `st`    | Staff   | Think on that channel                               |
+| `su`    | Staff   | `< SU > Ada says 'hello'`                           |
+
+The sender sees `You` in place of their name. Other admins hear the admin
+channel. No one else does.
+
+`resident`, `nuke`, and `disconnect` use the staff channel. `promote` and
+`demote` use the staff channel only. `appoint` and `dismiss` use the staff
+channel, and tell the player when they would not have heard it.
+
+`staff` runs `lsu`. It lists connected players at SU Channel and above, with
+rank, room, and idle. An SU Channel row is hidden from residents and newbies,
+and SU Channel and above see `< Channel Only >`. Every rank can run it.
+
+| Command      | Who        | Effect                                                                                |
+| ------------ | ---------- | ------------------------------------------------------------------------------------- |
+| `lsn`        | SU Channel | Connected newbies, with hostname, room, and idle.                                     |
+| `off_duty`   | SU Channel | Staff channel is told. Staff commands reply `You are off duty` until `on_duty`.       |
+| `off_list`   | Admin      | Still working. `lsu` shows Off List, and people who are not staff do not see the row. |
+| `on_duty`    | SU Channel | Asks for the saved password. A wrong one leaves them off duty and tells staff.        |
+| `on_list`    | Admin      | Puts the public row back.                                                             |
+| `screenlock` | Resident   | Locks the screen until the password. Staff who use it go off duty until it unlocks.   |
+
+On `lsu`, Off Duty uses the same colour, and only staff still see that row.
+
+A new name tells staff `[ Newbie Alert ]` as soon as it is known, again if
+they refuse the disclaimer, and again when they reach the start room. Those
+lines use the staff colour and do not start with `< SU >`.

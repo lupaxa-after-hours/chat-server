@@ -43,14 +43,21 @@ Use any line-based TCP client. `nc` and `telnet` both work.
 nc 127.0.0.1 9000
 ```
 
-The first non-blank line is the name, except `who` and `quit`. `who` in any
-case shows who is connected, then asks for a name again. `quit` in any case
-says `Goodbye!` and disconnects. A name is 3 to 20 letters or digits, and it
-cannot start with a digit. An unsaved name is unique in lowercase, and the
-spelling they type is the one shown. The names `me`, `who`, and `quit` are
-refused in any case, using the spelling they typed, and no player file is
-opened. A blank line does nothing. A line longer than 1024 characters drops
-that connection.
+The first non-blank line is the name, except `who` and `quit`.
+
+| Line                        | Result                                               |
+| --------------------------- | ---------------------------------------------------- |
+| `quit`, any case            | Says `Goodbye!` and disconnects                      |
+| `who`, any case             | Shows who is connected, then asks for a name again   |
+| A blank line                | Nothing                                              |
+| Longer than 1024 characters | Told the input is too long, and that line is dropped |
+
+A name is 3 to 20 letters or digits, and it cannot start with a digit.
+An unsaved name is unique in lowercase. The spelling they type is the one
+shown. `me`, `who`, `quit`, `ssh`, `telnet`, and `system` are refused in
+any case, using the spelling they typed, and no player file is opened. A
+name whose house file would be the rooms file or the help file is refused
+the same way.
 
 A connection that has not entered a room within `login_timeout` minutes is
 told `Login timed out.` and dropped. Typing does not start that clock again.

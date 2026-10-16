@@ -3,33 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal
 
-_WEEKDAYS = (
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-    "Sunday",
-)
-_MONTHS = (
-    "January",
-    "February",
-    "March",
-    "April",
-    "May",
-    "June",
-    "July",
-    "August",
-    "September",
-    "October",
-    "November",
-    "December",
-)
+WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+MONTHS = ("January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December")
 
 
-def _ordinal(day: int) -> str:
+def ordinal(day: int) -> str:
     """Return ``day`` with an English ending. 11, 12, and 13 use ``th``."""
     if day % 100 in (11, 12, 13):
         ending = "th"
@@ -49,10 +29,10 @@ def clock_phrase(moment: datetime) -> str:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
     moment = moment.astimezone(timezone.utc)
-    weekday = _WEEKDAYS[moment.weekday()]
-    month = _MONTHS[moment.month - 1]
+    weekday = WEEKDAYS[moment.weekday()]
+    month = MONTHS[moment.month - 1]
     clock = moment.strftime("%H:%M:%S")
-    return f"{weekday} {_ordinal(moment.day)} {month} {moment.year}, {clock} UTC"
+    return f"{weekday} {ordinal(moment.day)} {month} {moment.year}, {clock} UTC"
 
 
 def duration_phrase(seconds: int) -> str:
@@ -60,19 +40,45 @@ def duration_phrase(seconds: int) -> str:
     if seconds < 0:
         seconds = 0
     if seconds < 60:
-        return _count(seconds, "second")
-    minutes, _unused = divmod(seconds, 60)
+        return count(seconds, "second")
+    minutes, unused = divmod(seconds, 60)
     if minutes < 60:
-        return _count(minutes, "minute")
+        return count(minutes, "minute")
     hours, minutes = divmod(minutes, 60)
     if hours < 24:
         if minutes == 0:
-            return _count(hours, "hour")
-        return f"{_count(hours, 'hour')}, {_count(minutes, 'minute')}"
+            return count(hours, "hour")
+        return f"{count(hours, 'hour')}, {count(minutes, 'minute')}"
     days, hours = divmod(hours, 24)
     if hours == 0:
-        return _count(days, "day")
-    return f"{_count(days, 'day')}, {_count(hours, 'hour')}"
+        return count(days, "day")
+    return f"{count(days, 'day')}, {count(hours, 'hour')}"
+
+
+def cpu_phrase(seconds: float) -> str:
+    """Return CPU seconds in words, keeping a fractional second."""
+    if seconds < 0:
+        seconds = 0.0
+    rounded = Decimal(str(seconds)).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+    tenths = int(rounded * 10)
+    if tenths == 0:
+        return "0 seconds"
+    days, rest = divmod(tenths, 864000)
+    hours, rest = divmod(rest, 36000)
+    minutes, rest = divmod(rest, 600)
+    whole, frac = divmod(rest, 10)
+    parts: list[str] = []
+    if days:
+        parts.append(count(days, "day"))
+    if hours:
+        parts.append(count(hours, "hour"))
+    if minutes:
+        parts.append(count(minutes, "minute"))
+    if frac:
+        parts.append(f"{whole}.{frac} seconds")
+    elif whole:
+        parts.append(count(whole, "second"))
+    return ", ".join(parts)
 
 
 def connected_phrase(connected_at: datetime, now: datetime) -> str:
@@ -80,16 +86,24 @@ def connected_phrase(connected_at: datetime, now: datetime) -> str:
     return duration_phrase(int((now - connected_at).total_seconds()))
 
 
+IDLE_ACTIVE_SECONDS = 5 * 60
+IDLE_RED_SECONDS = 30 * 60
+IDLE_BLANK_SECONDS = 60 * 60
+
+
 def idle_clock(seconds: int) -> str:
-    """Return ``HH:MM:SS`` when ``seconds`` is greater than 10, else an empty string."""
-    if seconds <= 10:
-        return ""
-    hours, rest = divmod(seconds, 3600)
+    """Return ``[ Active ]`` under five minutes, ``[--:--:--]`` from one hour, else ``[HH:MM:SS]``."""
+    if seconds < IDLE_ACTIVE_SECONDS:
+        return "[ Active ]"
+    if seconds >= IDLE_BLANK_SECONDS:
+        return "[--:--:--]"
+    hours, rest = divmod(max(seconds, 0), 3600)
     minutes, secs = divmod(rest, 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"[{hours:02d}:{minutes:02d}:{secs:02d}]"
 
 
-def _count(amount: int, unit: str) -> str:
+def count(amount: int, unit: str) -> str:
+    """Return ``amount`` and ``unit``, with a plural s when needed."""
     if amount == 1:
         return f"1 {unit}"
     return f"{amount} {unit}s"

@@ -1,264 +1,318 @@
 """Commands for super users and the admin."""
 
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
-from .channel import (
-    broadcast_staff,
-    connections,
-    newbies,
-    paint_staff,
-    player_named,
-    who,
-)
+from collections.abc import Iterable
+
+from .broadcast import broadcast_room, broadcast_staff
 from .client import Client
-from .colour import cyan
-from .commands_list import COMMANDS, Command, Host
-from .entry import _ask
+from .commands import Command, shown_syntax
+from .colour import can_see_colour, cyan, paint_idle, paint_staff
+from .entry import ask
 from .exceptions import ConfigError
-from .globals import CANNOT_NOW
-from .password import set_password_prompt
-from .saved_player import (
-    RANK_NEWBIE,
-    RANK_SUPER,
-    SavedPlayer,
-    delete_player,
-    rank_allows,
-    savable_name,
-)
-from .time import idle_clock
-from .utilities import (
-    _find_saved,
-    _is_admin,
-    _lookup,
-    _name_of,
-    _name_prefixes_argument,
-    _rank_of,
-    _saved_players,
-    frame_width,
-    list_frame,
-    refuses_self,
-)
+from .globals import CANNOT_NOW, COMMANDS
+from .password import password_prompt, set_password_prompt
+from .player import find_player, is_logged_in, match_online_player
+from .rooms import full_line, is_full, others, release_empty_houses, spoken_line, system_room_ids, unlink_house
+from .saved_player import SavedPlayer, delete_player, savable_name
+from .server import Server
+from .utilities import find_saved, frame_width, get_clients, get_parts, get_player_name, get_saved_player, has_rank, is_admin, list_frame, name_prefixes_argument, refuses_self, saved_players  # fmt: skip  # noqa: E501
+from .ranks import Rank, rank_allows
 
 
-def command_resident(host: Host, client: Client, command: Command, text: str | None) -> None:
+def command_resident(server: Server, client: Client, command: Command, text: str | None) -> None:
     """Ask a connected newbie for a password so they can be saved as a resident.
 
     The name must match in full. A prefix is not enough.
     """
-    del command
-    name = (text or "").strip()
-    if refuses_self(host, client, name):
+    name = get_parts(text)
+    if refuses_self(server, client, name):
         return
-    if _is_admin(host, name):
-        host.send(client, "The admin cannot be removed.\n")
+    try:
+        if is_admin(server, name):
+            server.send(client, "The super admin cannot be removed.\n")
+            return
+    except (ConfigError, OSError) as exc:
+        print(exc)
+        server.send(client, CANNOT_NOW)
         return
-    found, saved = _lookup(host, client, name)
+    found, saved = get_saved_player(server, client, name, quiet=True)
     if not found:
+        server.send(client, CANNOT_NOW)
         return
     if saved is not None:
-        host.send(client, f"{name} is already saved.\n")
+        server.send(client, f"{name} is already saved.\n")
         return
-    target = player_named(host._clients.values(), name)
+    target = find_player(server, client, name)
     if target is None or target.player is None:
-        host.send(client, f"Player {name} not found.\n")
         return
-    if target.player.rank != RANK_NEWBIE:
-        host.send(client, f"{name} is already saved.\n")
+    if target.player.rank != Rank.NEWBIE:
+        server.send(client, f"{name} is already saved.\n")
         return
     if not savable_name(target.player.name):
-        host.send(client, "That name cannot be saved.\n")
+        server.send(client, "That name cannot be saved.\n")
         return
-    _ask(target, "set", target.player.name, None)
-    target.pending_issuer = _name_of(client)
-    broadcast_staff(
-        host,
-        f"< SU > {_name_of(client)} makes {target.player.name} a resident.\n",
-    )
-    host.send(target, set_password_prompt())
+    ask(target, "set", target.player.name, None)
+    target.pending_issuer = get_player_name(client)
+    broadcast_staff(server, f"< SU > {get_player_name(client)} makes {target.player.name} a resident.\n")
+    server.send(target, set_password_prompt())
 
 
-def command_nuke(host: Host, client: Client, command: Command, text: str | None) -> None:
+def command_nuke(server: Server, client: Client, command: Command, text: str | None) -> None:
     """Delete a saved player and drop them when they are connected.
 
     The name must match in full. A prefix is not enough.
     """
-    resolved = _resolve_nuke(host, text)
+    resolved = resolve_nuke(server, text)
     if resolved is None:
-        host.send(client, f"Syntax: {command.syntax}\n")
+        server.send(client, f"Syntax: {shown_syntax(command)}\n")
         return
     if isinstance(resolved, str):
-        host.send(client, f"Player {resolved} not found.\n")
+        server.send(client, f"Player {resolved} not found.\n")
         return
     name, reason = resolved
-    if refuses_self(host, client, name):
+    if refuses_self(server, client, name):
         return
     try:
-        saved = _find_saved(host, name)
+        saved = find_saved(server, name)
     except (ConfigError, OSError) as exc:
         print(exc)
         saved = None
-    target = player_named(host._clients.values(), name if saved is None else saved.name)
+    target = find_player(server, client, name if saved is None else saved.name, quiet=True)
     ranks = []
     if saved is not None:
         ranks.append(saved.rank)
     if target is not None and target.player is not None:
         ranks.append(target.player.rank)
-    if any(not _may_remove(host, client, rank) for rank in ranks):
+    if any(not may_remove(server, client, rank) for rank in ranks):
         shown = saved.name if saved is not None else name
-        host.send(client, f"You cannot nuke {shown}.\n")
+        server.send(client, f"You cannot nuke {shown}.\n")
         return
     try:
-        deleted = delete_player(host._roster_dir, name)
+        deleted = delete_player(server.roster_dir, name)
     except OSError as exc:
         print(exc)
-        host.send(client, CANNOT_NOW)
+        server.send(client, CANNOT_NOW)
         return
     if not deleted:
-        host.send(client, f"Player {name} not found.\n")
+        server.send(client, f"Player {name} not found.\n")
         return
+    unlink_house(server, name)
     shown = name if target is None or target.name is None else target.name
     if target is not None:
-        host.send(target, "You have been removed.\n")
-        host.drop(target, announce=True)
-    broadcast_staff(host, f"< SU > {_name_of(client)} nukes {shown}: {reason}\n")
+        server.send(target, "You have been removed.\n")
+        server.drop(target, announce=True)
+    broadcast_staff(server, f"< SU > {get_player_name(client)} nukes {shown}: {reason}\n")
 
 
-def command_warn(host: Host, client: Client, command: Command, text: str | None) -> None:
+def command_warn(server: Server, client: Client, command: Command, text: str | None) -> None:
     """Warn one named player and tell the staff channel."""
-    parts = (text or "").strip().split(None, 1)
+    parts = get_parts(text).split(None, 1)
     if len(parts) < 2:
-        host.send(client, f"Syntax: {command.syntax}\n")
+        server.send(client, f"Syntax: {shown_syntax(command)}\n")
         return
     name, reason = parts
-    if refuses_self(host, client, name):
+    if refuses_self(server, client, name):
         return
-    target = player_named(host._clients.values(), name)
+    target = find_player(server, client, name)
     if target is None or target.player is None:
-        host.send(client, f"Player {name} not found.\n")
         return
-    plain = f"-=> {_name_of(client)} warn you: {reason}"
-    shown = cyan(plain) if target.player.colour else plain
-    host.send(target, f"\n\n{shown}\n\n\n\a")
-    staff = f"< SU > {_name_of(client)} warns {target.player.name} : {reason}\n"
-    broadcast_staff(host, staff)
+    if not may_remove(server, client, target.player.rank):
+        server.send(client, f"You cannot warn {target.name}.\n")
+        return
+    plain = f"-=> {get_player_name(client)} warn you: {reason}"
+    shown = cyan(plain) if can_see_colour(target) else plain
+    server.send(target, f"\n\n{shown}\n\n\n\a")
+    staff = f"< SU > {get_player_name(client)} warns {target.player.name} : {reason}\n"
+    broadcast_staff(server, staff)
 
 
-def command_disconnect(host: Host, client: Client, command: Command, text: str | None) -> None:
+def command_disconnect(server: Server, client: Client, command: Command, text: str | None) -> None:
     """Drop a player of lower rank who is already in a room.
 
     The name must match in full. A prefix is not enough.
     """
-    resolved = _resolve_disconnect(host, text)
-    if resolved is None:
-        host.send(client, f"Syntax: {command.syntax}\n")
+    parts = get_parts(text).split(None, 1)
+    if len(parts) < 2:
+        server.send(client, f"Syntax: {shown_syntax(command)}\n")
         return
-    if isinstance(resolved, str):
-        host.send(client, f"Player {resolved} not found.\n")
+    name, reason = parts
+    if refuses_self(server, client, name):
         return
-    name, reason = resolved
-    if refuses_self(host, client, name):
-        return
-    target = player_named(host._clients.values(), name)
+    target = find_player(server, client, name)
     if target is None or target.player is None:
-        host.send(client, f"Player {name} not found.\n")
         return
-    if not _may_remove(host, client, target.player.rank):
-        host.send(client, f"You cannot disconnect {target.name}.\n")
+    if not may_remove(server, client, target.player.rank):
+        server.send(client, f"You cannot disconnect {target.name}.\n")
         return
     shown = target.name or name
-    host.send(target, "You have been disconnected.\n")
-    host.drop(target, announce=True)
-    broadcast_staff(host, f"< SU > {_name_of(client)} disconnects {shown}: {reason}\n")
+    server.send(target, "You have been disconnected.\n")
+    server.drop(target, announce=True)
+    broadcast_staff(server, f"< SU > {get_player_name(client)} disconnects {shown}: {reason}\n")
 
 
-def _may_remove(host: Host, client: Client, target_rank: str) -> bool:
+def command_grab(server: Server, client: Client, command: Command, text: str | None) -> None:
+    """Pull a lower-rank player into this super user's office room."""
+    from .newbie import enter_sentence
+
+    del command
+    name = get_parts(text)
+    target, error = match_online_player(get_clients(server), name)
+    if error is not None:
+        server.send(client, error)
+        return
+    if target is None or target.room is None or target.player is None:
+        server.send(client, f"Player {name} not found.\n")
+        return
+    if target is client or (target.name or "").casefold() == (client.name or "").casefold():
+        server.send(client, "You cannot do that to yourself.\n")
+        return
+    if not may_remove(server, client, target.player.rank):
+        server.send(client, f"You cannot grab {target.name}.\n")
+        return
+    if target.room == client.room:
+        server.send(client, f"But {target.name} is already in the same room as you!\n")
+        return
+    destination = client.room
+    if destination is None or destination not in system_room_ids(server.layout):
+        server.send(client, "You can only grab someone into a system room.\n")
+        return
+    if is_full(server.layout, get_clients(server), destination):
+        server.send(client, full_line(server.layout.display_name(destination)))
+        return
+    origin = target.room
+    broadcast_room(server, origin, spoken_line(target.name, f"is grabbed by {client.name}"), skip=target)
+    target.room = destination
+    server.layout = release_empty_houses(server.layout, get_clients(server))
+    grabbed = f" -=> {client.name} stretches out and grabs you !!!!!!\n"
+    if not server.send(target, grabbed):
+        return
+    brief = server.layout.brief(destination, others(get_clients(server), destination, target))
+    if not server.send(target, brief):
+        return
+    broadcast_room(server, destination, spoken_line(target.name, enter_sentence(target)), skip=target)
+
+
+def may_remove(server: Server, client: Client, target_rank: Rank) -> bool:
     """Return whether this caller outranks ``target_rank``."""
-    del host
-    return not rank_allows(target_rank, _rank_of(client))
+    return not rank_allows(target_rank, has_rank(client))
 
 
-def command_su(host: Host, client: Client, command: Command, text: str | None) -> None:
+def command_su(server: Server, client: Client, command: Command, text: str | None) -> None:
     """Speak on the super-user channel."""
-    del command
-    _staff_line(host, client, f"You say '{text}'", f"{_name_of(client)} says '{text}'")
+    staff_line(server, client, f"You say '{text}'", f"{get_player_name(client)} says '{text}'")
 
 
-def command_se(host: Host, client: Client, command: Command, text: str | None) -> None:
+def command_se(server: Server, client: Client, command: Command, text: str | None) -> None:
     """Emote on the super-user channel."""
-    del command
-    _staff_line(host, client, f"You emote: {text}", f"{_name_of(client)} {text}")
+    staff_line(server, client, f"You emote: {text}", f"{get_player_name(client)} {text}")
 
 
-def command_st(host: Host, client: Client, command: Command, text: str | None) -> None:
+def command_st(server: Server, client: Client, command: Command, text: str | None) -> None:
     """Think on the super-user channel."""
-    del command
-    _staff_line(
-        host,
-        client,
-        f"You think . o O ( {text} )",
-        f"{_name_of(client)} thinks . o O ( {text} )",
-    )
+    staff_line(server, client, f"You think . o O ( {text} )", f"{get_player_name(client)} thinks . o O ( {text} )")
 
 
-def command_lsn(host: Host, client: Client, command: Command, text: str | None) -> None:
+def command_off_duty(server: Server, client: Client, command: Command, text: str | None) -> None:
+    """Step away from the staff role until on_duty."""
+    user = client.player
+    reason = (text or "").strip()
+    if user is None or reason == "":
+        server.send(client, f"Syntax: {shown_syntax(command)}\n")
+        return
+    if user.off_duty:
+        server.send(client, "You are already off duty.\n")
+        return
+    broadcast_staff(server, f"< SU > {user.name} goes off duty because '{reason}'.\n")
+    user.off_duty = True
+
+
+def command_on_duty(server: Server, client: Client, command: Command, text: str | None) -> None:
+    """Ask for the saved password before returning to the staff role."""
+    if text:
+        server.send(client, f"Syntax: {shown_syntax(command)}\n")
+        return
+    user = client.player
+    if user is None:
+        return
+    if not user.off_duty:
+        server.send(client, "You are already on duty.\n")
+        return
+    client.auth = "on_duty_password"
+    server.send(client, password_prompt())
+
+
+def newbies(clients: Iterable[Client]) -> list[tuple[str, str, str, int]]:
+    """Return each connected newbie's name, hostname, room, and idle seconds, sorted."""
+    rows: list[tuple[str, str, str, int]] = []
+    for client in clients:
+        user = client.player
+        if not is_logged_in(client) or user is None or user.rank != Rank.NEWBIE:
+            continue
+        rows.append((user.name, client.hostname, user.room, user.idle_seconds))
+    rows.sort()
+    return rows
+
+
+def command_lsn(server: Server, client: Client, command: Command, text: str | None) -> None:
     """List connected newbies and the address each one came from."""
-    del command
     if text:
-        host.send(client, "Syntax: lsn\n")
+        server.send(client, f"Syntax: {shown_syntax(command)}\n")
         return
-    rows = [
-        (name, hostname, host._layout.display_name(room_id), idle_clock(idle))
-        for name, hostname, room_id, idle in newbies(host._clients.values())
-    ]
+    rows = [(name, hostname, server.layout.location_name(room_id, name), paint_idle(idle, can_see_colour(client))) for name, hostname, room_id, idle in newbies(get_clients(server))]
     if not rows:
-        host.send(client, " -=> There are no newbies connected currently.\n")
+        server.send(client, " -=> There are no newbies connected currently.\n")
         return
-    host.send(
-        client,
-        list_frame(
-            ("Name", "Address", "Room", "Idle"),
-            rows,
-            frame_width(client.discovered_columns, client.frame_columns),
-        ),
-    )
+    server.send(client, list_frame(("Name", "Address", "Room", "Idle"), rows, frame_width(client.discovered_columns, client.frame_columns)))
 
 
-def command_connections(host: Host, client: Client, command: Command, text: str | None) -> None:
+def connections(clients: Iterable[Client], *, country: bool = False) -> list[tuple[str, ...]]:
+    """Return each socket's name, hostname, IP, optional country, and telnet or ssh."""
+    rows: list[tuple[str, ...]] = []
+    for client in clients:
+        player = client.player
+        if player is not None:
+            name = player.name
+        elif client.pending_name:
+            name = client.pending_name
+        else:
+            name = "<pending>"
+        kind = "ssh" if client.ssh else "telnet"
+        if country:
+            rows.append((name, client.hostname, client.address, client.country_name, kind))
+        else:
+            rows.append((name, client.hostname, client.address, kind))
+    rows.sort(key=lambda row: (row[0], row[2]))
+    return rows
+
+
+def command_connections(server: Server, client: Client, command: Command, text: str | None) -> None:
     """List every open socket, including people still logging in."""
-    del command
     if text:
-        host.send(client, "Syntax: connections\n")
+        server.send(client, f"Syntax: {shown_syntax(command)}\n")
         return
-    host.send(
-        client,
-        list_frame(
-            ("Name", "Hostname", "IP Address", "Type"),
-            connections(host._clients.values()),
-            frame_width(client.discovered_columns, client.frame_columns),
-        ),
-    )
+    headers = ("Name", "Hostname", "IP Address", "Country", "Type") if server.country_lookup else ("Name", "Hostname", "IP Address", "Type")
+    server.send(client, list_frame(headers, connections(get_clients(server), country=server.country_lookup), frame_width(client.discovered_columns, client.frame_columns)))  # fmt: skip  # noqa: E501
 
 
-def _staff_line(host: Host, client: Client, mine: str, theirs: str) -> None:
+def staff_line(server: Server, client: Client, mine: str, theirs: str) -> None:
     """Send the sender ``mine`` and the rest of the staff channel ``theirs``."""
-    if not host.send(client, paint_staff(client, f"< SU > {mine}\n")):
+    if not server.send(client, paint_staff(client, f"< SU > {mine}\n")):
         return
-    broadcast_staff(host, f"< SU > {theirs}\n", skip=client)
+    broadcast_staff(server, f"< SU > {theirs}\n", skip=client)
 
 
-def _resolve_nuke(host: Host, text: str | None) -> tuple[str, str] | str | None:
+def resolve_nuke(server: Server, text: str | None) -> tuple[str, str] | str | None:
     """Return a stored name and reason, a shorter missing name, or ``None``.
 
     ``None`` means the reason is missing. A bare string is a typed name that
     is not a saved player and is only the start of a longer saved name.
     """
-    argument = (text or "").strip()
-    if argument == "":
-        return None
-    saved_players = _saved_players(host)
+    argument = get_parts(text)
+    found = saved_players(server)
     longest: SavedPlayer | None = None
-    for saved in saved_players:
-        if not _name_prefixes_argument(argument, saved.name):
+    for saved in found:
+        if not name_prefixes_argument(argument, saved.name):
             continue
         if longest is None or len(saved.name) > len(longest.name):
             longest = saved
@@ -269,7 +323,7 @@ def _resolve_nuke(host: Host, text: str | None) -> tuple[str, str] | str | None:
         return longest.name, reason
     if " " not in argument:
         lowered = argument.lower()
-        for saved in saved_players:
+        for saved in found:
             if saved.name.lower().startswith(f"{lowered} "):
                 return argument
     parts = argument.split(None, 1)
@@ -278,53 +332,20 @@ def _resolve_nuke(host: Host, text: str | None) -> tuple[str, str] | str | None:
     return parts[0], parts[1].strip()
 
 
-def _resolve_disconnect(host: Host, text: str | None) -> tuple[str, str] | str | None:
-    """Return the live name and reason, a missing name, or ``None``."""
-    argument = (text or "").strip()
-    if argument == "":
-        return None
-    names = [room_name for room_name, _rank, _room, _status, _idle in who(host._clients.values())]
-    longest: str | None = None
-    for room_name in names:
-        if not _name_prefixes_argument(argument, room_name):
-            continue
-        if longest is None or len(room_name) > len(longest):
-            longest = room_name
-    if longest is not None:
-        reason = argument[len(longest) :].strip()
-        if reason == "":
-            return None
-        return longest, reason
-    parts = argument.split(None, 1)
-    if len(parts) < 2 or parts[1].strip() == "":
-        return None
-    return parts[0]
-
-
 COMMANDS.extend(
     (
-        Command("resident", command_resident, False, "resident <name>", rank=RANK_SUPER),
-        Command("nuke", command_nuke, False, "nuke <name> <reason>", rank=RANK_SUPER),
-        Command(
-            "disconnect",
-            command_disconnect,
-            False,
-            "disconnect <name> <reason>",
-            rank=RANK_SUPER,
-        ),
-        Command("warn", command_warn, False, "warn <name> <reason>", rank=RANK_SUPER),
-        Command("su", command_su, False, "su <message>", rank=RANK_SUPER),
-        Command("se", command_se, False, "se <message>", rank=RANK_SUPER),
-        Command("st", command_st, False, "st <message>", rank=RANK_SUPER),
-        Command("lsn", command_lsn, False, None, rank=RANK_SUPER),
-        Command("connections", command_connections, False, None, rank=RANK_SUPER),
-        Command(
-            "conns",
-            command_connections,
-            True,
-            None,
-            needs_space=True,
-            rank=RANK_SUPER,
-        ),
+        Command("resident", command_resident, False, "<name>", rank=Rank.SUPER_USER),
+        Command("nuke", command_nuke, False, "<name> <reason>", rank=Rank.SUPER_USER),
+        Command("disconnect", command_disconnect, False, "<name> <reason>", rank=Rank.SUPER_USER),
+        Command("grab", command_grab, False, "<name>", rank=Rank.SUPER_USER),
+        Command("warn", command_warn, False, "<name> <reason>", rank=Rank.SUPER_USER),
+        Command("su", command_su, False, "<message>", rank=Rank.SU_CHANNEL),
+        Command("se", command_se, False, "<message>", rank=Rank.SU_CHANNEL),
+        Command("st", command_st, False, "<message>", rank=Rank.SU_CHANNEL),
+        Command("off_duty", command_off_duty, False, "<reason>", rank=Rank.SU_CHANNEL),
+        Command("on_duty", command_on_duty, False, None, rank=Rank.SU_CHANNEL),
+        Command("lsn", command_lsn, False, None, rank=Rank.SU_CHANNEL),
+        Command("connections", command_connections, False, None, rank=Rank.SU_CHANNEL),
+        Command("conns", command_connections, True, None, needs_space=True, rank=Rank.SU_CHANNEL),
     )
 )

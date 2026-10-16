@@ -16,42 +16,11 @@ from .defaults import DEFAULT_PASSWORD_ROUNDS
 from .exceptions import ConfigError
 from .mfa_seal import legacy_mfa_secret
 from .player import Player
+from .ranks import SAVED_RANKS, Rank, saved_rank
 
-RANK_NEWBIE = "newbie"
-RANK_RESIDENT = "resident"
-RANK_SUPER = "super"
-RANK_ADMIN = "admin"
-RANK_SUPER_ADMIN = "super_admin"
-
-_RANK_ORDER = (RANK_NEWBIE, RANK_RESIDENT, RANK_SUPER, RANK_ADMIN, RANK_SUPER_ADMIN)
-_SAVED_RANKS = frozenset({RANK_RESIDENT, RANK_SUPER, RANK_ADMIN, RANK_SUPER_ADMIN})
-_RANK_LABELS = {
-    RANK_RESIDENT: "Resident",
-    RANK_SUPER: "Super User",
-    RANK_ADMIN: "Admin",
-    RANK_SUPER_ADMIN: "Super Admin",
-}
-_PLAYER_KEYS = frozenset(
-    {
-        "address",
-        "colour",
-        "connected_seconds",
-        "description",
-        "entermsg",
-        "hostname",
-        "ip_address",
-        "logged_out_at",
-        "lowercase_name",
-        "mfa_on",
-        "mfa_secret",
-        "name",
-        "password",
-        "prompt",
-        "rank",
-    }
-)
-_SAVABLE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9]{2,19}")
-_MAX_PASSWORD_BYTES = 72
+PLAYER_KEYS = frozenset({"address", "colour", "connected_seconds", "country_code", "country_name", "description", "entermsg", "home", "home_login", "hostname", "ip_address", "logged_out_at", "loginmsg", "logoutmsg", "lowercase_name", "mfa_on", "mfa_secret", "name", "password", "plan", "prompt", "rank", "roles",})  # fmt: skip  # noqa: E501
+SAVABLE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9]{2,19}")
+MAX_PASSWORD_BYTES = 72
 
 
 @dataclass(frozen=True)
@@ -59,7 +28,7 @@ class SavedPlayer:
     """One player file: spelling, rank, bcrypt hash, and last logout."""
 
     name: str
-    rank: str
+    rank: Rank
     password_hash: str
     logged_out_at: datetime | None = None
     ip_address: str | None = None
@@ -72,6 +41,15 @@ class SavedPlayer:
     mfa_secret: str | None = None
     mfa_on: bool = False
     entermsg: str | None = None
+    loginmsg: str | None = None
+    logoutmsg: str | None = None
+    plan: str = ""
+    country_name: str = ""
+    country_code: str = ""
+    home: bool = False
+    home_login: bool = False
+    roles: int = 0
+    unknown_rank: str | None = None
 
     def __post_init__(self) -> None:
         """Fill the key from the display spelling when the caller did not pass one."""
@@ -81,35 +59,16 @@ class SavedPlayer:
             object.__setattr__(self, "hostname", self.ip_address)
 
 
-def rank_allows(have: str, need: str) -> bool:
-    """Return whether ``have`` is ``need`` or a higher rank."""
-    try:
-        return _RANK_ORDER.index(have) >= _RANK_ORDER.index(need)
-    except ValueError:
-        return False
+def has_set_mfa(saved: SavedPlayer | None) -> bool:
+    """Return whether ``saved`` has an MFA secret."""
+    return saved is not None and saved.mfa_secret is not None
 
 
-def rank_label(rank: str) -> str:
-    """Return the label players see for a saved ``rank``.
-
-    Raises
-    ------
-    ConfigError
-        ``rank`` is not ``resident``, ``super``, ``admin``, or ``super_admin``.
-    """
-    try:
-        return _RANK_LABELS[rank]
-    except KeyError as exc:
-        raise ConfigError(f"Unknown rank {rank}.") from exc
-
-
-def normalize_super_admin(saved: SavedPlayer, admin_name: str) -> SavedPlayer:
-    """Return ``saved`` with the config account raised to super admin."""
-    if saved.rank == RANK_SUPER_ADMIN and saved.name.lower() != admin_name.lower():
-        raise ConfigError("Only the config admin can be a super admin.")
-    if saved.name.lower() == admin_name.lower() and saved.rank == RANK_ADMIN:
-        return replace(saved, rank=RANK_SUPER_ADMIN)
-    return saved
+def has_saved_rank(saved: SavedPlayer | None, rank: Rank, *ranks: Rank) -> SavedPlayer | None:
+    """Return ``saved`` when it exists and its rank is one of the given ranks."""
+    if saved is not None and saved.rank in (rank, *ranks):
+        return saved
+    return None
 
 
 def savable_name(name: str) -> bool:
@@ -120,14 +79,14 @@ def savable_name(name: str) -> bool:
     """
     if name == "" or ".." in name:
         return False
-    return _SAVABLE_NAME.fullmatch(name) is not None
+    return SAVABLE_NAME.fullmatch(name) is not None
 
 
 def password_problem(password: str) -> str | None:
     """Return the sentence for a bad ``password``, or ``None`` when it is usable."""
     if password == "":
         return "Password cannot be empty.\n"
-    if len(password.encode("utf-8")) > _MAX_PASSWORD_BYTES:
+    if len(password.encode("utf-8")) > MAX_PASSWORD_BYTES:
         return "Password is too long.\n"
     return None
 
@@ -173,41 +132,38 @@ def load_saved(path: Path) -> SavedPlayer | None:
         raise ConfigError(f"Invalid YAML in {path}: {exc}") from exc
     if not isinstance(payload, dict):
         raise ConfigError(f"Player file {path} must be a YAML mapping.")
-    extra = sorted(str(key) for key in payload if key not in _PLAYER_KEYS)
+    extra = sorted(str(key) for key in payload if key not in PLAYER_KEYS)
     if extra:
         raise ConfigError(f"Unknown player key in {path}: {', '.join(extra)}")
-    name = _player_name(path, payload.get("name"))
-    lowercase_name = _lowercase_name(path, name, payload.get("lowercase_name"))
-    rank = _player_rank(path, payload.get("rank"))
-    password_hash = _player_hash(path, payload.get("password"))
-    logged_out_at = _logged_out_at(path, payload.get("logged_out_at"))
-    ip_address = _player_address(path, payload.get("ip_address"))
+    name = player_name(path, payload.get("name"))
+    lowercase_name = player_lowercase_name(path, name, payload.get("lowercase_name"))
+    rank, unknown_rank = player_rank(path, payload.get("rank"))
+    password_hash = player_hash(path, payload.get("password"))
+    logged_out_at = player_logged_out_at(path, payload.get("logged_out_at"))
+    ip_address = player_address(path, payload.get("ip_address"))
     if ip_address is None:
-        ip_address = _player_address(path, payload.get("address"))
-    hostname = _player_address(path, payload.get("hostname")) or ""
-    connected_seconds = _connected_seconds(path, payload.get("connected_seconds"))
-    prompt = _player_prompt(path, payload.get("prompt"))
-    colour = _player_colour(path, payload.get("colour"))
-    description = _player_description(path, payload.get("description"))
-    mfa_secret = _player_mfa_secret(path, payload.get("mfa_secret"))
-    mfa_on = _player_mfa_on(path, payload.get("mfa_on"))
-    entermsg = _player_entermsg(path, payload.get("entermsg"))
-    return SavedPlayer(
-        name,
-        rank,
-        password_hash,
-        logged_out_at,
-        ip_address,
-        hostname,
-        connected_seconds,
-        prompt,
-        lowercase_name,
-        colour,
-        description,
-        mfa_secret,
-        mfa_on,
-        entermsg,
-    )
+        ip_address = player_address(path, payload.get("address"))
+    hostname = player_address(path, payload.get("hostname")) or ""
+    connected_seconds = player_connected_seconds(path, payload.get("connected_seconds"))
+    prompt = player_prompt(path, payload.get("prompt"))
+    colour = player_colour(path, payload.get("colour"))
+    description = player_description(path, payload.get("description"))
+    plan = player_plan(path, payload.get("plan"))
+    mfa_secret = player_mfa_secret(path, payload.get("mfa_secret"))
+    mfa_on = player_mfa_on(path, payload.get("mfa_on"))
+    entermsg = player_sentence(path, "entermsg", payload.get("entermsg"))
+    loginmsg = player_sentence(path, "loginmsg", payload.get("loginmsg"))
+    logoutmsg = player_sentence(path, "logoutmsg", payload.get("logoutmsg"))
+    country_name = player_country_name(path, payload.get("country_name"))
+    country_code = player_country_code(path, payload.get("country_code"))
+    for bool_key in ("home", "home_login"):
+        line = re.search(rf"^{bool_key}:\s*(.+)$", raw_text, re.MULTILINE)
+        if line is not None and re.fullmatch(r"yes|no|on|off", line.group(1).strip(), re.IGNORECASE):
+            raise ConfigError(f"Player file {path} {bool_key} must be true or false.")
+    home = player_bool(path, "home", payload.get("home"))
+    home_login = player_bool(path, "home_login", payload.get("home_login"))
+    roles = player_roles(path, payload.get("roles"))
+    return SavedPlayer(name, rank, password_hash, logged_out_at, ip_address, hostname, connected_seconds, prompt, lowercase_name, colour, description, mfa_secret, mfa_on, entermsg, loginmsg, logoutmsg, plan, country_name, country_code, home, home_login, roles=roles, unknown_rank=unknown_rank)  # fmt: skip  # noqa: E501
 
 
 def save_player(directory: Path, player: SavedPlayer) -> None:
@@ -222,17 +178,19 @@ def save_player(directory: Path, player: SavedPlayer) -> None:
     """
     if not savable_name(player.name):
         raise ConfigError(f"{player.name} cannot be saved.")
-    if player.rank not in _SAVED_RANKS:
-        raise ConfigError(
-            f"Player file for {player.name} rank must be resident, super, admin, or super_admin."
-        )
+    if player.unknown_rank is not None:
+        stored_rank = player.unknown_rank
+    elif player.rank not in SAVED_RANKS:
+        raise ConfigError(f"Player file for {player.name} rank must be resident, su_channel, super_user, admin, coder, or super_admin.")
+    else:
+        stored_rank = player.rank.value
     if player.lowercase_name != player.name.lower():
         raise ConfigError(f"{player.name} cannot be saved.")
     path = player_path(directory, player.lowercase_name)
     payload: dict[str, str | int | bool] = {
         "name": player.name,
         "lowercase_name": player.lowercase_name,
-        "rank": player.rank,
+        "rank": stored_rank,
         "password": player.password_hash,
     }
     if player.logged_out_at is not None:
@@ -249,28 +207,40 @@ def save_player(directory: Path, player: SavedPlayer) -> None:
         payload["colour"] = False
     if player.description != "":
         payload["description"] = player.description
+    if player.plan != "":
+        payload["plan"] = player.plan
     if player.mfa_secret is not None:
         payload["mfa_secret"] = player.mfa_secret
     if player.mfa_on:
         payload["mfa_on"] = True
     if player.entermsg is not None:
         payload["entermsg"] = player.entermsg
-    _replace_file(path, yaml.safe_dump(payload, sort_keys=False, allow_unicode=True))
+    if player.loginmsg is not None:
+        payload["loginmsg"] = player.loginmsg
+    if player.logoutmsg is not None:
+        payload["logoutmsg"] = player.logoutmsg
+    if player.country_name != "":
+        payload["country_name"] = player.country_name
+    if player.country_code != "":
+        payload["country_code"] = player.country_code
+    if player.home:
+        payload["home"] = True
+    if player.home_login:
+        payload["home_login"] = True
+    if player.roles != 0:
+        payload["roles"] = player.roles
+    replace_file(path, yaml.safe_dump(payload, sort_keys=False, allow_unicode=True))
 
 
 def record_saved_logout(directory: Path, player: Player) -> None:
     """Write the logout time and the total seconds for a saved player."""
-    if player.rank == RANK_NEWBIE:
+    if player.rank is Rank.NEWBIE:
         return
     try:
         saved = load_saved(player_path(directory, player.lowercase_name))
         if saved is None:
             return
-        stamped = replace(
-            saved,
-            logged_out_at=datetime.now(timezone.utc),
-            connected_seconds=player.connected_seconds,
-        )
+        stamped = replace(saved, logged_out_at=datetime.now(timezone.utc), connected_seconds=player.connected_seconds)
         save_player(directory, stamped)
     except (ConfigError, OSError) as exc:
         print(exc)
@@ -300,7 +270,17 @@ def ensure_players_directory(directory: Path) -> None:
     directory.mkdir(parents=True, exist_ok=True)
 
 
-def _lowercase_name(path: Path, name: str, raw: object) -> str:
+def super_admins(directory: Path) -> tuple[SavedPlayer, ...]:
+    """Return saved super admins, sorted by name."""
+    found: list[SavedPlayer] = []
+    for path in directory.glob("*.yml"):
+        saved = load_saved(path)
+        if saved is not None and saved.rank == Rank.SUPER_ADMIN:
+            found.append(saved)
+    return tuple(sorted(found, key=lambda player: player.name.casefold()))
+
+
+def player_lowercase_name(path: Path, name: str, raw: object) -> str:
     """Return the key, or the folded display spelling when the file has none."""
     if raw is None:
         return name.lower()
@@ -309,7 +289,8 @@ def _lowercase_name(path: Path, name: str, raw: object) -> str:
     return raw
 
 
-def _player_name(path: Path, value: object) -> str:
+def player_name(path: Path, value: object) -> str:
+    """Return the saved spelling, or reject a name that does not match the file."""
     if not isinstance(value, str) or not savable_name(value):
         raise ConfigError(f"Player file {path} name must be savable.")
     if path.name != f"{value.lower()}.yml":
@@ -317,21 +298,40 @@ def _player_name(path: Path, value: object) -> str:
     return value
 
 
-def _player_rank(path: Path, value: object) -> str:
-    if not isinstance(value, str) or value not in _SAVED_RANKS:
-        raise ConfigError(
-            f"Player file {path} rank must be resident, super, admin, or super_admin."
-        )
-    return value
+def player_rank(path: Path, value: object) -> tuple[Rank, str | None]:
+    """Return a saved rank, or resident plus an unknown word."""
+    if not isinstance(value, str):
+        raise ConfigError(f"Player file {path} rank must be resident, su_channel, super_user, admin, coder, or super_admin.")
+    return saved_rank(value)
 
 
-def _player_hash(path: Path, value: object) -> str:
+def player_hash(path: Path, value: object) -> str:
+    """Return the stored password hash."""
     if not isinstance(value, str) or value == "":
         raise ConfigError(f"Player file {path} password must be a hash.")
     return value
 
 
-def _player_address(path: Path, value: object) -> str | None:
+def player_country_name(path: Path, value: object) -> str:
+    """Return a country name, or an empty string when the file omits it."""
+    if value is None:
+        return ""
+    if not isinstance(value, str) or value == "" or "\n" in value or len(value) > 80:
+        raise ConfigError(f"Player file {path} country_name must be one line of at most 80 characters.")
+    return value
+
+
+def player_country_code(path: Path, value: object) -> str:
+    """Return a two-letter country code, or an empty string when the file omits it."""
+    if value is None:
+        return ""
+    if not isinstance(value, str) or len(value) != 2 or not value.isalpha() or value != value.upper():
+        raise ConfigError(f"Player file {path} country_code must be two uppercase letters.")
+    return value
+
+
+def player_address(path: Path, value: object) -> str | None:
+    """Return an address string, or None when the file omits it."""
     if value is None:
         return None
     if not isinstance(value, str) or value == "":
@@ -339,7 +339,8 @@ def _player_address(path: Path, value: object) -> str | None:
     return value
 
 
-def _player_prompt(path: Path, value: object) -> str | None:
+def player_prompt(path: Path, value: object) -> str | None:
+    """Return a saved prompt, or None when the file omits it."""
     if value is None:
         return None
     if not isinstance(value, str) or value == "":
@@ -347,19 +348,18 @@ def _player_prompt(path: Path, value: object) -> str | None:
     return value
 
 
-def _player_mfa_secret(path: Path, value: object) -> str | None:
+def player_mfa_secret(path: Path, value: object) -> str | None:
+    """Return a saved MFA secret, or None when the file omits it."""
     if value is None:
         return None
     if not isinstance(value, str) or value == "":
-        raise ConfigError(
-            f"Player file {path} mfa_secret must be a sealed secret or a base32 secret."
-        )
+        raise ConfigError(f"Player file {path} mfa_secret must be a sealed secret or a base32 secret.")
     if value.startswith("enc1$") or legacy_mfa_secret(value):
         return value
     raise ConfigError(f"Player file {path} mfa_secret must be a sealed secret or a base32 secret.")
 
 
-def _player_mfa_on(path: Path, value: object) -> bool:
+def player_mfa_on(path: Path, value: object) -> bool:
     """Return whether this file still shows that MFA was on."""
     if value is None:
         return False
@@ -368,26 +368,43 @@ def _player_mfa_on(path: Path, value: object) -> bool:
     raise ConfigError(f"Player file {path} mfa_on must be true or false.")
 
 
-def _player_entermsg(path: Path, value: object) -> str | None:
-    """Return a custom enter sentence, or None for the default."""
+def player_bool(path: Path, key: str, value: object) -> bool:
+    """Return a saved flag. A missing key is false."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    raise ConfigError(f"Player file {path} {key} must be true or false.")
+
+
+def player_sentence(path: Path, key: str, value: object) -> str | None:
+    """Return a custom room sentence, or None for the default."""
     if value is None:
         return None
     if not isinstance(value, str) or value == "" or "\n" in value or len(value) > 80:
-        raise ConfigError(f"Player file {path} entermsg must be one line of at most 80 characters.")
+        raise ConfigError(f"Player file {path} {key} must be one line of at most 80 characters.")
     return value
 
 
-def _player_description(path: Path, value: object) -> str:
+def player_plan(path: Path, value: object) -> str:
+    """Return a saved plan, or an empty string when the file omits it."""
     if value is None:
         return ""
     if not isinstance(value, str) or value == "" or "\n" in value or len(value) > 80:
-        raise ConfigError(
-            f"Player file {path} description must be one line of at most 80 characters."
-        )
+        raise ConfigError(f"Player file {path} plan must be one line of at most 80 characters.")
     return value
 
 
-def _player_colour(path: Path, value: object) -> bool:
+def player_description(path: Path, value: object) -> str:
+    """Return a saved description, or an empty string when the file omits it."""
+    if value is None:
+        return ""
+    if not isinstance(value, str) or value == "" or "\n" in value or len(value) > 80:
+        raise ConfigError(f"Player file {path} description must be one line of at most 80 characters.")
+    return value
+
+
+def player_colour(path: Path, value: object) -> bool:
     """Return the saved colour. A missing key means on."""
     if value is None:
         return True
@@ -396,17 +413,26 @@ def _player_colour(path: Path, value: object) -> bool:
     raise ConfigError(f"Player file {path} colour must be true or false.")
 
 
-def _connected_seconds(path: Path, value: object) -> int:
+def player_connected_seconds(path: Path, value: object) -> int:
+    """Return the saved connected seconds, or zero when the file omits them."""
     if value is None:
         return 0
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ConfigError(
-            f"Player file {path} connected_seconds must be a whole number of seconds."
-        )
+        raise ConfigError(f"Player file {path} connected_seconds must be a whole number of seconds.")
     return value
 
 
-def _logged_out_at(path: Path, value: object) -> datetime | None:
+def player_roles(path: Path, value: object) -> int:
+    """Return ``roles`` when it is a non-negative integer, or 0 when it is omitted."""
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigError(f"Player file {path} roles must be a whole number.")
+    return value
+
+
+def player_logged_out_at(path: Path, value: object) -> datetime | None:
+    """Return the saved logout time, or None when the file omits it."""
     if value is None:
         return None
     if not isinstance(value, str):
@@ -417,7 +443,7 @@ def _logged_out_at(path: Path, value: object) -> datetime | None:
         raise ConfigError(f"Player file {path} logged_out_at must be a time.") from exc
 
 
-def _replace_file(path: Path, text: str) -> None:
+def replace_file(path: Path, text: str) -> None:
     """Write ``text`` to ``path`` by renaming a temporary file beside it."""
     descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
     temporary = Path(name)

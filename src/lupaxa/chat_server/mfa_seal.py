@@ -8,11 +8,11 @@ import secrets
 
 from cryptography.fernet import Fernet, InvalidToken
 
-_N = 2**14
-_R = 8
-_P = 1
-_SALT_BYTES = 16
-_MAXMEM = 32 * 1024 * 1024
+N = 2**14
+R = 8
+P = 1
+SALT_BYTES = 16
+MAXMEM = 32 * 1024 * 1024
 
 
 def legacy_mfa_secret(stored: str) -> bool:
@@ -29,8 +29,8 @@ def legacy_mfa_secret(stored: str) -> bool:
 
 def seal_mfa_secret(password: str, secret: str) -> str:
     """Return ``secret`` sealed with a key derived from ``password``."""
-    salt = secrets.token_bytes(_SALT_BYTES)
-    token = _fernet(password, salt).encrypt(secret.encode("utf-8"))
+    salt = secrets.token_bytes(SALT_BYTES)
+    token = fernet(password, salt).encrypt(secret.encode("utf-8"))
     salt_text = base64.urlsafe_b64encode(salt).decode("ascii").rstrip("=")
     return f"enc1${salt_text}${token.decode('ascii')}"
 
@@ -42,7 +42,7 @@ def open_mfa_secret(password: str, stored: str) -> str | None:
         return None
     try:
         salt = base64.urlsafe_b64decode(parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4))
-        raw = _fernet(password, salt).decrypt(parts[2].encode("ascii"))
+        raw = fernet(password, salt).decrypt(parts[2].encode("ascii"))
     except (InvalidToken, ValueError):
         return None
     return raw.decode("utf-8")
@@ -60,14 +60,7 @@ def refresh_mfa_secret(password: str, stored: str | None) -> tuple[str | None, s
     return plain, seal_mfa_secret(password, plain), True
 
 
-def _fernet(password: str, salt: bytes) -> Fernet:
-    derived = hashlib.scrypt(
-        password.encode("utf-8"),
-        salt=salt,
-        n=_N,
-        r=_R,
-        p=_P,
-        dklen=32,
-        maxmem=_MAXMEM,
-    )
+def fernet(password: str, salt: bytes) -> Fernet:
+    """Return the cipher for ``password`` and ``salt``."""
+    derived = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=N, r=R, p=P, dklen=32, maxmem=MAXMEM)
     return Fernet(base64.urlsafe_b64encode(derived))

@@ -1,120 +1,87 @@
 """Protocol text with no sockets."""
 
-from __future__ import annotations
+from __future__ import annotations  # noqa: I001
 
+import contextlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
+from types import SimpleNamespace
+import threading
+
+import psutil
 
 import pytest
 from totp_fixtures import TOTP_TEST_SEED
 
 import lupaxa.chat_server.admin as admin_api
+import lupaxa.chat_server.reboot as reboot_api
+import lupaxa.chat_server.broadcast as broadcast_api
 import lupaxa.chat_server.commands as command_api
 import lupaxa.chat_server.entry as entry_api
 import lupaxa.chat_server.login as login_api
 import lupaxa.chat_server.mfa as mfa_api
+import lupaxa.chat_server.newbie as newbie_api
 import lupaxa.chat_server.password as password_api
+import lupaxa.chat_server.player as player_api
+import lupaxa.chat_server.resident as resident_api
+import lupaxa.chat_server.rooms as rooms_api
+import lupaxa.chat_server.coder as coder_api
 import lupaxa.chat_server.su as su_api
 import lupaxa.chat_server.timer as timer_api
-from lupaxa.chat_server import channel as channel_api
 from lupaxa.chat_server.admin import command_allow, command_demote, command_promote
-from lupaxa.chat_server.channel import (
-    connections,
-    match_name,
-    multiple_matches_message,
-    paint_admin,
-    paint_staff,
-)
-from lupaxa.chat_server.colour import center_block, cyan, green, plain_len, red, yellow
-from lupaxa.chat_server.commands import command_remote, command_save, command_tell
-from lupaxa.chat_server.commands_list import Command, command_words, wrap_words
+from lupaxa.chat_server.client import output_hidden
+from lupaxa.chat_server.colour import cls, cyan, green, paint_admin, paint_coder, paint_staff, plain_len, red, yellow
+from lupaxa.chat_server.commands import Command, by_name, command_words, subcommand_words
 from lupaxa.chat_server.config import Config
-from lupaxa.chat_server.entry import name_taken_reply
+from lupaxa.chat_server.entry import enter, enter_fresh
 from lupaxa.chat_server.exceptions import ConfigError
-from lupaxa.chat_server.globals import NAME_PROMPT
-from lupaxa.chat_server.help import (
-    HelpBook,
-    HelpEntry,
-    HelpStamp,
-    help_stamp,
-    load_help,
-)
-from lupaxa.chat_server.login import (
-    admin_gate_reply,
-    name_prompt,
-    process_input,
-    process_login,
-    welcome_text,
-)
-from lupaxa.chat_server.net import NetStats
+from lupaxa.chat_server.globals import NAME_PROMPT, RESERVED_NAMES
+from lupaxa.chat_server.help import HelpBook, HelpEntry, HelpStamp, help_stamp, load_help
+from lupaxa.chat_server.login import name_prompt, process_input, process_login, refusal_text, welcome_text
+from lupaxa.chat_server.netstats import NetStats
+from lupaxa.chat_server.newbie import command_remote, command_tell
 from lupaxa.chat_server.parse import consider_name, parse_direction, process_commands
 from lupaxa.chat_server.password import confirm_password_prompt
-from lupaxa.chat_server.player import Player
-from lupaxa.chat_server.rooms import Layout, Room
-from lupaxa.chat_server.saved_player import (
-    RANK_ADMIN,
-    RANK_NEWBIE,
-    RANK_RESIDENT,
-    RANK_SUPER,
-    RANK_SUPER_ADMIN,
-    SavedPlayer,
-    delete_player,
-    hash_password,
-    load_saved,
-    password_ok,
-    player_path,
-    rank_allows,
-    record_saved_logout,
-    save_player,
-)
-from lupaxa.chat_server.su import (
-    command_disconnect,
-    command_nuke,
-    command_resident,
-    command_warn,
-)
-from lupaxa.chat_server.time import clock_phrase, duration_phrase, idle_clock
-from lupaxa.chat_server.timer import (
-    apply_net_tick,
-    consume_seconds,
-    note_connected_time,
-    process_timer,
-)
-from lupaxa.chat_server.utilities import (
-    examine_frame,
-    frame_width,
-    list_frame,
-    shown_rank,
-    time_frame,
-)
+from lupaxa.chat_server.player import Player, match_name, multiple_matches_message
+from lupaxa.chat_server.resident import command_save
+from lupaxa.chat_server.roles import Roles
+from lupaxa.chat_server.rooms import Layout, Room, house_room_id, load_house, load_layout, write_default_house
+from lupaxa.chat_server.saved_player import SavedPlayer, delete_player, hash_password, load_saved, password_ok, player_path, record_saved_logout, save_player  # fmt: skip  # noqa: E501
+from lupaxa.chat_server.su import command_disconnect, command_nuke, command_resident, command_warn, connections
+from lupaxa.chat_server.time import clock_phrase, cpu_phrase, duration_phrase, idle_clock
+from lupaxa.chat_server.chatserver import ChatServer
+from lupaxa.chat_server.timer import apply_net_tick, consume_seconds, message_file_stamps, note_connected_time, process_timer, reload_messages
+from lupaxa.chat_server.utilities import center_block, examine_frame, frame_width, list_frame, shown_rank, time_frame, wrap_words
 from lupaxa.chat_server.version import get_version
+from lupaxa.chat_server.ranks import Rank, rank_allows
 
-_SHIPPED_HELP = load_help(Path(__file__).resolve().parents[1] / "config" / "help.yml")
+SHIPPED_HELP = load_help(Path(__file__).resolve().parents[1] / "config" / "help.yml")
+
+ROOM_SENTENCES = (("Enter message", "arrives."), ("Login message", "has connected."), ("Logout message", "has disconnected."))
+LOCAL_FROM = "127.0.0.1 (127.0.0.1) [via telnet]"
 
 
-class _ClientMap:
-    """People on the host, so a scan can find that host from ``values()``."""
+class FakeClientMap:
+    """People on the server, so a scan can find that server from ``values()``."""
 
-    def __init__(self, host: _Host) -> None:
-        self.host = host
+    def __init__(self, server: FakeServer) -> None:
+        self.server = server
 
-    def values(self) -> _ClientMap:
-        """Return this map. Iteration yields the host's people."""
+    def values(self) -> FakeClientMap:
+        """Return this map. Iteration yields the server's people."""
         return self
 
-    def __iter__(self) -> Iterator[_Player]:
-        return iter(self.host.people)
+    def __iter__(self) -> Iterator[FakePlayer]:
+        return iter(self.server.people)
 
 
 @dataclass
-class _Player:
+class FakePlayer:
     name: str | None = "Ada"
     room: str | None = "reception"
-    player: Player | None = field(
-        default_factory=lambda: Player("Ada", "reception", datetime.now(timezone.utc))
-    )
+    player: Player | None = field(default_factory=lambda: Player("Ada", "reception", datetime.now(timezone.utc)))
     auth: str = "name"
     pending_name: str = ""
     pending_saved: SavedPlayer | None = None
@@ -125,6 +92,8 @@ class _Player:
     password_failures: int = 0
     address: str = "127.0.0.1"
     hostname: str = ""
+    country_name: str = ""
+    country_code: str = ""
     ssh: bool = False
     accepted_at: float = 0.0
     discovered_columns: int | None = 72
@@ -132,6 +101,7 @@ class _Player:
     frame_columns: int | None = None
     sent: list[str] = field(default_factory=list)
     net: NetStats = field(default_factory=NetStats)
+    show_lock: bool = False
 
     def __post_init__(self) -> None:
         if self.hostname == "":
@@ -150,101 +120,118 @@ class _Player:
 
 
 @dataclass
-class _Host:
+class FakeServer:
     sent: list[str] = field(default_factory=list)
     room_lines: list[str] = field(default_factory=list)
-    replaced: list[_Player] = field(default_factory=list)
+    replaced: list[FakePlayer] = field(default_factory=list)
     dropped: bool = False
     stopped: bool = False
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    _timer_mark: float | None = None
-    _timer_remainder: float = 0.0
-    _net_count: int = 10
-    _telnet_net: NetStats = field(default_factory=NetStats)
-    _ssh_net: NetStats = field(default_factory=NetStats)
-    _combined_net: NetStats = field(default_factory=NetStats)
-    _shutdown_seconds: int | None = None
-    _shutdown_reason: str = ""
-    _allow_newbies: bool = True
-    _allow_residents: bool = True
-    _mfa_enabled: bool = False
-    _mfa_steps: dict[str, int] = field(default_factory=dict)
-    dropped_clients: list[_Player] = field(default_factory=list)
+    rebooted_at: datetime | None = None
+    process: object | None = None
+    timer_mark: float | None = None
+    timer_remainder: float = 0.0
+    net_count: int = 10
+    telnet_net: NetStats = field(default_factory=NetStats)
+    ssh_net: NetStats = field(default_factory=NetStats)
+    combined_net: NetStats = field(default_factory=NetStats)
+    shutdown_seconds: int | None = None
+    shutdown_reason: str = ""
+    allow_newbies: bool = True
+    allow_residents: bool = True
+    full_message: str = ""
+    newbie_message: str = ""
+    mfa_enabled: bool = False
+    country_lookup: bool = False
+    mfa_steps: dict[str, int] = field(default_factory=dict)
+    dropped_clients: list[FakePlayer] = field(default_factory=list)
+    flushed: list[FakePlayer] = field(default_factory=list)
     announced: list[bool] = field(default_factory=list)
     staff_lines: list[str] = field(default_factory=list)
     admin_lines: list[str] = field(default_factory=list)
+    coder_lines: list[str] = field(default_factory=list)
     occupied: int = 0
-    people: list[_Player] = field(default_factory=list)
+    chains: list = field(default_factory=list)
+    people: list[FakePlayer] = field(default_factory=list)
     all_lines: list[str] = field(default_factory=list)
     newbies: list[tuple[str, str, str, int]] = field(default_factory=list)
-    _layout: Layout = field(
-        default_factory=lambda: Layout(
-            rooms={
-                "reception": Room("The desk.", 4, {"nw": "hall"}),
-                "hall": Room("A hall.", 4, {}),
-            }
-        )
-    )
-    _config: Config = field(
-        default_factory=lambda: Config(
-            port=1,
-            rooms=Path("rooms.yml"),
-            start="reception",
-            help=Path("help.yml"),
-            players=Path("players"),
-            mfa_enabled=False,
-        )
-    )
-    _help: HelpBook = field(default_factory=lambda: HelpBook(entries=()))
-    _help_stamp: HelpStamp = field(default_factory=lambda: HelpStamp(-1, -1))
-    _help_failed: HelpStamp | None = None
-    _help_check_seconds: int = 0
-    _roster_dir: Path = Path("players")
-    _client_map: dict[str, _Player] | None = None
+    layout: Layout = field(default_factory=lambda: Layout(rooms={"reception": Room("The desk.", 4, {"nw": "hall"}), "hall": Room("A hall.", 4, {}),}))  # fmt: skip  # noqa: E501
+    config: Config = field(default_factory=lambda: Config(port=1, rooms=Path("rooms.yml"), start="reception", help=Path("help.yml"), players=Path("players"), mfa_enabled=False))  # fmt: skip  # noqa: E501
+    help: HelpBook = field(default_factory=lambda: HelpBook(entries=()))
+    help_stamp: HelpStamp = field(default_factory=lambda: HelpStamp(-1, -1))
+    help_failed: HelpStamp | None = None
+    rooms_stamp: HelpStamp = field(default_factory=lambda: HelpStamp(-1, -1))
+    rooms_failed: HelpStamp | None = None
+    house_stamps: dict[str, HelpStamp] = field(default_factory=dict)
+    house_failed: dict[str, HelpStamp] = field(default_factory=dict)
+    banner: str = ""
+    message_stamps: dict[str, HelpStamp] = field(default_factory=lambda: {"banner": HelpStamp(-1, -1), "full": HelpStamp(-1, -1), "no-more-newbies": HelpStamp(-1, -1)})
+    message_failed: dict[str, HelpStamp] = field(default_factory=dict)
+    help_check_seconds: int = 0
+    roster_dir: Path = Path("players")
+    client_map: dict[str, FakePlayer] | None = None
+    hot_stamp: HelpStamp = field(default_factory=lambda: HelpStamp(-1, -1))
+    hot_failed: HelpStamp | None = None
+    country_db: object | None = None
+    country_lock: threading.Lock = field(default_factory=threading.Lock)
 
     @property
-    def _clients(self) -> dict[str, _Player]:
-        if self._client_map is None:
-            return _ClientMap(self)  # type: ignore[return-value]
-        return self._client_map
+    def clients(self) -> dict[str, FakePlayer]:
+        if self.client_map is None:
+            return FakeClientMap(self)  # type: ignore[return-value]
+        return self.client_map
 
-    @_clients.setter
-    def _clients(self, value: dict[str, _Player]) -> None:
-        self._client_map = value
+    @clients.setter
+    def clients(self, value: dict[str, FakePlayer]) -> None:
+        self.client_map = value
 
-    def send(self, client: _Player, text: str) -> bool:
+    def send(self, client: FakePlayer, text: str) -> bool:
+        if output_hidden(client):
+            return True
         self.sent.append(text)
         client.sent.append(text)
         return True
 
-    def _broadcast_room(self, room_id: str, text: str, *, skip: _Player | None) -> None:
-        del room_id, skip
+    def broadcast_room(self, room_id: str, text: str, *, skip: FakePlayer | None) -> None:
         self.room_lines.append(text)
+        for person in self.people:
+            if person.room != room_id or person.name is None:
+                continue
+            if skip is not None and person is skip:
+                continue
+            self.send(person, text)
 
-    def _broadcast_room_split(
-        self, room_id: str, plain: str, staff: str, *, skip: _Player | None
-    ) -> None:
+    def broadcast_room_split(self, room_id: str, plain: str, staff: str, *, skip: FakePlayer | None) -> None:
         del room_id, staff, skip
         self.room_lines.append(plain)
 
-    def drop(self, client: _Player, *, announce: bool) -> None:
+    def drop(self, client: FakePlayer, *, announce: bool, skip_chain_departure: bool = False) -> None:
+        del skip_chain_departure
         self.dropped = True
         self.dropped_clients.append(client)
         self.announced.append(announce)
 
-    def _broadcast_staff(self, text: str, *, skip: _Player | None = None) -> None:
+    def flush(self, client: FakePlayer) -> bool:
+        self.flushed.append(client)
+        return True
+
+    def broadcast_staff(self, text: str, *, skip: FakePlayer | None = None) -> None:
         del skip
         self.staff_lines.append(text)
 
-    def _broadcast_admin(self, text: str, *, skip: _Player | None = None) -> None:
+    def broadcast_admin(self, text: str, *, skip: FakePlayer | None = None) -> None:
         del skip
         self.admin_lines.append(text)
 
-    def _occupancy(self, room_id: str) -> int:
+    def broadcast_coder(self, text: str, *, skip: FakePlayer | None = None) -> None:
+        del skip
+        self.coder_lines.append(text)
+
+    def occupancy(self, room_id: str) -> int:
         del room_id
         return self.occupied
 
-    def _broadcast_all(self, text: str, *, skip: _Player | None) -> None:
+    def broadcast_all(self, text: str, *, skip: FakePlayer | None) -> None:
         del skip
         self.all_lines.append(text)
 
@@ -254,7 +241,7 @@ class _Host:
     def is_stopping(self) -> bool:
         return self.stopped
 
-    def _player_named(self, name: str) -> _Player | None:
+    def find_player(self, name: str) -> FakePlayer | None:
         key = name.lower()
         for person in self.people:
             player = person.player
@@ -264,106 +251,70 @@ class _Host:
                 return person
         return None
 
-    def _idlers(self) -> list[tuple[str, int]]:
-        rows = [
-            (person.player.name, person.player.idle_seconds)
-            for person in self.people
-            if person.player is not None
-        ]
+    def idlers(self) -> list[tuple[str, int]]:
+        rows = [(person.player.name, person.player.idle_seconds) for person in self.people if person.player is not None]
         return sorted(rows)
 
-    def _newbies(self) -> list[tuple[str, str, str, int]]:
-        return list(self.newbies)
-
-    def _who(self) -> list[tuple[str, str, str, str, int]]:
-        rows = [
-            (
-                person.name,
-                person.player.rank,
-                person.room,
-                person.player.status,
-                person.player.idle_seconds,
-            )
-            for person in self.people
-            if person.name is not None and person.room is not None and person.player is not None
-        ]
+    def who(self) -> list[tuple[str, str, str, str, int]]:
+        rows = [(person.name, person.player.rank, person.room, person.player.status, person.player.idle_seconds) for person in self.people if person.name is not None and person.room is not None and person.player is not None]
         return sorted(rows)
 
-    def _others(self, room_id: str, client: _Player) -> list[str]:
+    def others(self, room_id: str, client: FakePlayer) -> list[str]:
         del room_id, client
         return []
 
-    def _taken_names(self) -> set[str]:
-        return {
-            person.name
-            for person in self.people
-            if person.name is not None and person not in self.dropped_clients
-        }
+    def taken_names(self) -> set[str]:
+        return {person.name for person in self.people if person.name is not None and person not in self.dropped_clients}
 
-    def _unsaved_names(self, skip: _Player | None = None) -> set[str]:
+    def unsaved_names(self, skip: FakePlayer | None = None) -> set[str]:
         claimed: set[str] = set()
         for person in self.people:
             if person is skip or person in self.dropped_clients:
                 continue
             user = person.player
-            if user is not None and user.rank == RANK_NEWBIE:
+            if user is not None and user.rank == Rank.NEWBIE:
                 claimed.add(user.name.lower())
-            elif (
-                user is None and person.auth in ("set", "confirm", "agree") and person.pending_name
-            ):
+            elif user is None and person.auth in ("set", "confirm", "agree") and person.pending_name:
                 claimed.add(person.pending_name.lower())
         return claimed
 
-    def _replace_socket(self, live: _Player, newcomer: _Player) -> None:
+    def replace_socket(self, live: FakePlayer, newcomer: FakePlayer) -> None:
         self.replaced.append(live)
         live.address = newcomer.address
         live.hostname = newcomer.hostname
 
 
-def _host_from_clients(clients: object) -> _Host | None:
-    host = getattr(clients, "host", None)
-    if isinstance(host, _Host):
-        return host
+def server_from_clients(clients: object) -> FakeServer | None:
+    server = getattr(clients, "server", None)
+    if isinstance(server, FakeServer):
+        return server
     return None
 
 
 @pytest.fixture(autouse=True)
-def _route_scans_to_the_host_fake(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Record scans on ``_Host`` and restore the channel functions after each test."""
+def route_scans_to_the_host_fake(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Record scans on ``FakeServer`` and restore the channel functions after each test."""
 
     def broadcast_room(server: object, room_id: str | None, text: str, *, skip: object) -> None:
-        if isinstance(server, _Host):
-            server._broadcast_room(room_id, text, skip=skip)  # type: ignore[arg-type]
+        if isinstance(server, FakeServer):
+            server.broadcast_room(room_id, text, skip=skip)  # type: ignore[arg-type]
             return
-        channel_api.broadcast_room(server, room_id, text, skip=skip)  # type: ignore[arg-type]
+        broadcast_api.broadcast_room(server, room_id, text, skip=skip)  # type: ignore[arg-type]
 
-    def broadcast_room_split(
-        server: object,
-        room_id: str | None,
-        plain: str,
-        staff: str,
-        *,
-        skip: object,
-    ) -> None:
-        if isinstance(server, _Host):
-            server._broadcast_room_split(room_id, plain, staff, skip=skip)  # type: ignore[arg-type]
+    def broadcast_room_split(server: object, room_id: str | None, plain: str, staff: str, *, skip: object) -> None:
+        if isinstance(server, FakeServer):
+            server.broadcast_room_split(room_id, plain, staff, skip=skip)  # type: ignore[arg-type]
             return
-        channel_api.broadcast_room_split(
-            server,  # type: ignore[arg-type]
-            room_id,
-            plain,
-            staff,
-            skip=skip,  # type: ignore[arg-type]
-        )
+        broadcast_api.broadcast_room_split(server, room_id, plain, staff, skip=skip)  # type: ignore[arg-type]
 
     def broadcast_all(server: object, text: str, *, skip: object) -> None:
-        if isinstance(server, _Host):
-            server._broadcast_all(text, skip=skip)  # type: ignore[arg-type]
+        if isinstance(server, FakeServer):
+            server.broadcast_all(text, skip=skip)  # type: ignore[arg-type]
             return
-        channel_api.broadcast_all(server, text, skip=skip)  # type: ignore[arg-type]
+        broadcast_api.broadcast_all(server, text, skip=skip)  # type: ignore[arg-type]
 
     def broadcast_shout(server: object, line: str, *, skip: object) -> None:
-        if isinstance(server, _Host):
+        if isinstance(server, FakeServer):
             painted = yellow(line) + "\n"
             for person in server.people:
                 if skip is not None and person is skip:
@@ -374,69 +325,105 @@ def _route_scans_to_the_host_fake(monkeypatch: pytest.MonkeyPatch) -> None:
                 if user is None or not user.colour:
                     painted = line + "\n"
                 break
-            server._broadcast_all(painted, skip=skip)  # type: ignore[arg-type]
+            server.broadcast_all(painted, skip=skip)  # type: ignore[arg-type]
+            for person in server.people:
+                if skip is not None and person is skip:
+                    continue
+                if person.name is None or person.room is None:
+                    continue
+                user = person.player
+                if user is not None and user.colour:
+                    server.send(person, yellow(line) + "\n")
+                else:
+                    server.send(person, line + "\n")
             return
-        channel_api.broadcast_shout(server, line, skip=skip)  # type: ignore[arg-type]
+        broadcast_api.broadcast_shout(server, line, skip=skip)  # type: ignore[arg-type]
 
     def broadcast_staff(server: object, text: str, *, skip: object = None) -> None:
-        if isinstance(server, _Host):
+        if isinstance(server, FakeServer):
             for person in server.people:
                 user = person.player
-                if user is None or not rank_allows(user.rank, RANK_SUPER):
+                if user is None or not rank_allows(user.rank, Rank.SU_CHANNEL) or user.off_duty:
                     continue
                 if skip is not None and person is skip:
                     continue
-                server._broadcast_staff(paint_staff(person, text), skip=skip)  # type: ignore[arg-type]
+                painted = paint_staff(person, text)
+                server.broadcast_staff(painted, skip=skip)  # type: ignore[arg-type]
+                if not output_hidden(person):
+                    person.sent.append(painted)
             return
-        channel_api.broadcast_staff(server, text, skip=skip)  # type: ignore[arg-type]
+        broadcast_api.broadcast_staff(server, text, skip=skip)  # type: ignore[arg-type]
 
     def broadcast_admin(server: object, text: str, *, skip: object = None) -> None:
-        if isinstance(server, _Host):
+        if isinstance(server, FakeServer):
             for person in server.people:
                 user = person.player
-                if user is None or not rank_allows(user.rank, RANK_ADMIN):
+                if user is None or not rank_allows(user.rank, Rank.ADMIN) or user.off_duty:
                     continue
                 if skip is not None and person is skip:
                     continue
-                server._broadcast_admin(paint_admin(person, text), skip=skip)  # type: ignore[attr-defined]
+                server.broadcast_admin(paint_admin(person, text), skip=skip)  # type: ignore[attr-defined]
             return
-        channel_api.broadcast_admin(server, text, skip=skip)  # type: ignore[arg-type]
+        broadcast_api.broadcast_admin(server, text, skip=skip)  # type: ignore[arg-type]
+
+    def broadcast_coder(server: object, text: str, *, skip: object = None) -> None:
+        if isinstance(server, FakeServer):
+            for person in server.people:
+                user = person.player
+                if user is None or not rank_allows(user.rank, Rank.CODER):
+                    continue
+                if skip is not None and person is skip:
+                    continue
+                painted = paint_coder(person, text)
+                server.broadcast_coder(painted, skip=skip)  # type: ignore[attr-defined]
+                if not output_hidden(person):
+                    person.sent.append(painted)
+            return
+        broadcast_api.broadcast_coder(server, text, skip=skip)  # type: ignore[attr-defined]
+
+    real_occupancy = rooms_api.occupancy
 
     def occupancy(clients: object, room_id: str) -> int:
-        host = _host_from_clients(clients)
-        if host is not None:
-            return host._occupancy(room_id)
-        return channel_api.occupancy(clients, room_id)  # type: ignore[arg-type]
+        server = server_from_clients(clients)
+        if server is not None:
+            return server.occupancy(room_id)
+        return real_occupancy(clients, room_id)  # type: ignore[arg-type]
 
     def others(clients: object, room_id: str, skip: object) -> list[str]:
-        host = _host_from_clients(clients)
-        if host is not None:
-            return host._others(room_id, skip)  # type: ignore[arg-type]
-        return channel_api.others(clients, room_id, skip)  # type: ignore[arg-type]
+        server = server_from_clients(clients)
+        if server is not None:
+            return server.others(room_id, skip)  # type: ignore[arg-type]
+        return rooms_api.others(clients, room_id, skip)  # type: ignore[arg-type]
+
+    listed_who = newbie_api.who
+    listed_idlers = newbie_api.idlers
+    listed_newbies = su_api.newbies
 
     def who(clients: object) -> list[tuple[str, str, str, str, int]]:
-        host = _host_from_clients(clients)
-        if host is not None:
-            return host._who()
-        return channel_api.who(clients)  # type: ignore[arg-type]
+        server = server_from_clients(clients)
+        if server is not None:
+            return server.who()
+        return listed_who(clients)  # type: ignore[arg-type]
 
     def idlers(clients: object) -> list[tuple[str, int]]:
-        host = _host_from_clients(clients)
-        if host is not None:
-            return host._idlers()
-        return channel_api.idlers(clients)  # type: ignore[arg-type]
+        server = server_from_clients(clients)
+        if server is not None:
+            return server.idlers()
+        return listed_idlers(clients)  # type: ignore[arg-type]
 
     def newbies(clients: object) -> list[tuple[str, str, str, int]]:
-        host = _host_from_clients(clients)
-        if host is not None:
-            return host._newbies()
-        return channel_api.newbies(clients)  # type: ignore[arg-type]
+        server = server_from_clients(clients)
+        if server is not None:
+            return list(server.newbies)
+        return listed_newbies(clients)  # type: ignore[arg-type]
 
-    def player_named(clients: object, name: str) -> object:
-        host = _host_from_clients(clients)
-        if host is not None:
-            return host._player_named(name)
-        return channel_api.player_named(clients, name)  # type: ignore[arg-type]
+    def find_player(server: object, client: object, name: str, *, quiet: bool = False) -> object:
+        if isinstance(server, FakeServer):
+            found = server.find_player(name)
+            if found is None and not quiet:
+                server.send(client, f"No such player '{name}'.\n")  # type: ignore[arg-type]
+            return found
+        return player_api.find_player(server, client, name, quiet=quiet)  # type: ignore[arg-type]
 
     replacements = {
         "broadcast_room": broadcast_room,
@@ -445,26 +432,28 @@ def _route_scans_to_the_host_fake(monkeypatch: pytest.MonkeyPatch) -> None:
         "broadcast_shout": broadcast_shout,
         "broadcast_staff": broadcast_staff,
         "broadcast_admin": broadcast_admin,
+        "broadcast_coder": broadcast_coder,
         "occupancy": occupancy,
         "others": others,
         "who": who,
         "idlers": idlers,
         "newbies": newbies,
-        "player_named": player_named,
+        "find_player": find_player,
     }
-    for module in (command_api, admin_api, su_api, login_api, password_api, entry_api, mfa_api):
+    for module in (newbie_api, resident_api, command_api, admin_api, reboot_api, su_api, coder_api, login_api, password_api, entry_api, mfa_api):
         for name, func in replacements.items():
             if hasattr(module, name):
                 monkeypatch.setattr(module, name, func)
+    monkeypatch.setattr(rooms_api, "occupancy", occupancy)
     monkeypatch.setattr(timer_api, "broadcast_all", broadcast_all)
-    monkeypatch.setattr(timer_api, "broadcast_admin", broadcast_admin)
+    monkeypatch.setattr(timer_api, "broadcast_coder", broadcast_coder)
 
 
-def _run(line: str, player: _Player | None = None) -> tuple[_Host, _Player]:
-    current = player or _Player()
-    host = _Host(people=[current], _help=_SHIPPED_HELP)
-    process_commands(host, current, line)  # type: ignore[arg-type]
-    return host, current
+def run(line: str, player: FakePlayer | None = None) -> tuple[FakeServer, FakePlayer]:
+    current = player or FakePlayer()
+    server = FakeServer(people=[current], help=SHIPPED_HELP)
+    process_commands(server, current, line)  # type: ignore[arg-type]
+    return server, current
 
 
 def test_welcome_centers_the_banner() -> None:
@@ -491,15 +480,13 @@ def test_me_cannot_be_a_name(tmp_path: Path) -> None:
     for typed in ("me", "Me", "ME", " me "):
         decision = consider_name(typed, {"me"})
         assert decision.name is None
-        assert decision.reply == (
-            f"{typed.strip()} cannot be used. Pick another name.\n\n{name_prompt()}"
-        )
+        assert decision.reply == (f"{typed.strip()} cannot be used. Pick another name.\n\n{name_prompt()}")
 
-    host = _login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "ME")  # type: ignore[arg-type]
+    server = login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "ME")  # type: ignore[arg-type]
     assert player.player is None
-    assert host.sent == ["ME cannot be used. Pick another name.\n\nPlease enter your name: "]
+    assert server.sent == ["ME cannot be used. Pick another name.\n\nPlease enter your name: "]
     assert load_saved(player_path(tmp_path, "me")) is None
     assert not (tmp_path / "me.yml").exists()
 
@@ -509,49 +496,41 @@ def test_who_and_quit_cannot_be_names() -> None:
     for typed in ("who", "Who", "WHO", "quit", "Quit", "QUIT"):
         decision = consider_name(typed, set())
         assert decision.name is None
-        assert decision.reply == (
-            f"{typed} cannot be used. Pick another name.\n\nPlease enter your name: "
-        )
+        assert decision.reply == (f"{typed} cannot be used. Pick another name.\n\nPlease enter your name: ")
 
 
 def test_who_at_the_name_prompt_lists_players(tmp_path: Path) -> None:
     """Who shows the connected frame and asks for a name again."""
-    host = _login_host(tmp_path)
+    server = login_host(tmp_path)
     when = datetime.now(timezone.utc)
-    host.people = [
-        _Player(
-            name="Ada",
-            room="reception",
-            player=Player("Ada", "reception", when, idle_seconds=10),
-        )
-    ]
-    asker = _Player(player=None)
-    process_input(host, asker, "WHO")  # type: ignore[arg-type]
+    server.people = [FakePlayer(name="Ada", room="reception", player=Player("Ada", "reception", when, idle_seconds=10))]
+    asker = FakePlayer(player=None)
+    process_input(server, asker, "WHO")  # type: ignore[arg-type]
     assert asker.player is None
     assert asker.auth == "name"
-    assert host.sent[0].splitlines()[0] == "-" * 72
-    assert "Ada" in host.sent[0]
-    assert host.sent[-1] == "Please enter your name: "
+    assert server.sent[0].splitlines()[0] == "-" * 72
+    assert "Ada" in server.sent[0]
+    assert server.sent[-1] == "Please enter your name: "
 
 
 def test_quit_at_the_name_prompt_disconnects(tmp_path: Path) -> None:
     """Quit says goodbye and drops the connection."""
-    host = _login_host(tmp_path)
-    asker = _Player(player=None)
-    process_input(host, asker, "Quit")  # type: ignore[arg-type]
-    assert host.sent == ["Goodbye!\n"]
-    assert host.dropped_clients == [asker]
+    server = login_host(tmp_path)
+    asker = FakePlayer(player=None)
+    process_input(server, asker, "Quit")  # type: ignore[arg-type]
+    assert server.sent == ["Goodbye!\n"]
+    assert server.dropped_clients == [asker]
     assert asker.player is None
 
 
 def test_who_please_is_not_the_login_list(tmp_path: Path) -> None:
     """A space keeps the letters-and-digits refusal."""
-    host = _login_host(tmp_path)
-    asker = _Player(player=None)
-    process_input(host, asker, "who please")  # type: ignore[arg-type]
+    server = login_host(tmp_path)
+    asker = FakePlayer(player=None)
+    process_input(server, asker, "who please")  # type: ignore[arg-type]
     assert asker.player is None
-    assert host.sent == ["A name can use only letters and digits.\n\nPlease enter your name: "]
-    assert host.dropped_clients == []
+    assert server.sent == ["A name can use only letters and digits.\n\nPlease enter your name: "]
+    assert server.dropped_clients == []
 
 
 def test_a_name_must_be_three_to_twenty_letters_or_digits() -> None:
@@ -575,321 +554,689 @@ def test_duplicate_name() -> None:
     """A taken name keeps the player unnamed and asks again."""
     decision = consider_name("Ada", {"Ada"})
     assert decision.name is None
-    assert decision.reply == (
-        "Ada is already in use. Pick another name.\n\nPlease enter your name: "
-    )
+    assert decision.reply == ("Ada is already in use. Pick another name.\n\nPlease enter your name: ")
 
 
 def test_say_emote_and_think() -> None:
     """Room lines and the sender's copy use the spec wording."""
-    say, _player = _run("say hello there")
+    say, _ = run("say hello there")
     assert say.sent == ["You say 'hello there'\n"]
     assert say.room_lines == ["- Ada says 'hello there'\n"]
 
-    emote, _player = _run(":waves")
+    emote, _ = run(":waves")
     assert emote.sent == ["You emote: waves\n"]
     assert emote.room_lines == ["- Ada waves\n"]
 
-    think, _player = _run("~ lunch")
+    think, _ = run("~ lunch")
     assert think.sent == ["You think . o O ( lunch )\n"]
     assert think.room_lines == ["- Ada thinks . o O ( lunch )\n"]
 
 
 def test_alias_does_not_need_a_space() -> None:
     """An alias is a command even when the text follows immediately."""
-    host, _player = _run("'hello there")
-    assert host.sent == ["You say 'hello there'\n"]
-    assert host.room_lines == ["- Ada says 'hello there'\n"]
+    server, _ = run("'hello there")
+    assert server.sent == ["You say 'hello there'\n"]
+    assert server.room_lines == ["- Ada says 'hello there'\n"]
 
 
 def test_missing_message_uses_the_canonical_name() -> None:
     """A command with syntax, and no text, shows that syntax."""
-    host, _player = _run("say")
-    assert host.sent == ["Syntax: say <message>\n"]
-    assert host.room_lines == []
+    server, _ = run("say")
+    assert server.sent == ["Syntax: say <message>\n"]
+    assert server.room_lines == []
 
-    host, _player = _run("'")
-    assert host.sent == ["Syntax: say <message>\n"]
-    assert host.dropped is False
+    server, _ = run("'")
+    assert server.sent == ["Syntax: '<message>\n"]
+    assert server.dropped is False
 
-    host, _player = _run("emote")
-    assert host.sent == ["Syntax: emote <message>\n"]
+    server, _ = run("emote")
+    assert server.sent == ["Syntax: emote <message>\n"]
 
-    host, _player = _run("think")
-    assert host.sent == ["Syntax: think <message>\n"]
+    server, _ = run("think")
+    assert server.sent == ["Syntax: think <message>\n"]
 
 
 def test_unknown_command() -> None:
     """An unknown word is quoted back to the sender."""
-    host, _player = _run("dance")
-    assert host.sent == ["No such command 'dance'\n"]
-    assert host.room_lines == []
+    server, _ = run("dance")
+    assert server.sent == ["No such command 'dance'\n"]
+    assert server.room_lines == []
 
 
 def test_glued_command_name_is_unknown() -> None:
     """A command name still needs a space before its text."""
-    host, _player = _run("sayhello")
-    assert host.sent == ["No such command 'sayhello'\n"]
+    server, _ = run("sayhello")
+    assert server.sent == ["No such command 'sayhello'\n"]
+
+
+def test_a_command_word_matches_in_any_case() -> None:
+    """VERSION and L are the same commands as version and look."""
+    version_result, _ = run("VERSION")
+    assert version_result.sent == [f"The current version is: {get_version()}\n"]
+    looked, _ = run("L")
+    assert "The desk." in looked.sent[0]
+    glued, _ = run("SAYhello")
+    assert glued.sent == ["No such command 'SAYhello'\n"]
 
 
 def test_help_version_and_commands() -> None:
     """Local replies do not go to the room."""
-    help_result, _player = _run("help")
+    help_result, _ = run("help")
     assert help_result.sent == ["Syntax: help <topic>\n"]
     assert help_result.room_lines == []
 
-    version_result, _player = _run("version")
+    version_result, _ = run("version")
     assert version_result.sent == [f"The current version is: {get_version()}\n"]
 
-    resident = _Player(
-        player=Player("Ada", "reception", datetime.now(timezone.utc), rank=RANK_RESIDENT)
-    )
-    listed, _player = _run("commands", resident)
-    words = command_words(RANK_RESIDENT).split()
+    resident = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    listed, _ = run("commands", resident)
+    words = command_words(Rank.RESIDENT).split()
     width = frame_width(resident.discovered_columns, resident.frame_columns)
     wrapped = wrap_words(words, width)
     assert listed.sent == [f"Commands available:\n{wrapped}\n"]
-    assert command_words(RANK_RESIDENT) == (
-        "! \" ' , . : ; < > ? ` ~ alarm auto_reply color colour commands description emote "
-        "entermsg examine go help join look lsu main map password prompt quit recap remote "
-        "retire save say "
-        "shout "
-        "staff status tell term_width think time version w who x"
-    )
+    assert command_words(Rank.RESIDENT) == ("! \" ' , . : ; < > ? ` ~ alarm chains cls color colour commands emote examine go help home join l look lsu main map password quit recap remote retire roles rthink save say screenlock set shout staff tell term_width testcard think time version w who x")  # fmt: skip  # noqa: E501
+
+
+def test_commands_a_filters_the_visible_list() -> None:
+    """A letter keeps the visible names that start with it, in either case."""
+    resident = staff("Ada", Rank.RESIDENT)
+    resident.frame_columns = 200
+    lower, _ = run("commands a", resident)
+    upper, _ = run("commands A", resident)
+    assert lower.sent == upper.sent
+    body = lower.sent[0]
+    assert body.startswith("Commands available:\n")
+    assert "alarm" in body
+    assert "!" not in body
+
+
+def test_commands_z_says_nothing_starts_with_that_letter() -> None:
+    """A letter with no names replaces the header."""
+    resident = staff("Ada", Rank.RESIDENT)
+    upper, _ = run("commands Z", resident)
+    assert upper.sent == ["No commands found beginning with 'Z'.\n"]
+    lower, _ = run("commands z", resident)
+    assert lower.sent == ["No commands found beginning with 'z'.\n"]
+
+
+def test_commands_aliases_lists_the_visible_aliases() -> None:
+    """Aliases keeps punctuation marks first and leaves real names out."""
+    resident = staff("Ada", Rank.RESIDENT)
+    assert resident.player is not None
+    resident.player.colour = False
+    resident.frame_columns = 200
+    server, _ = run("commands Aliases", resident)
+    words = server.sent[0].split("Commands available:\n", 1)[1].split()
+    assert "!" in words
+    assert "x" in words
+    assert "say" not in words
+
+
+def test_commands_su_lists_channel_commands_for_su_channel() -> None:
+    """SU Channel sees the channel commands and not warn. A super user sees both."""
+    ada = staff("Ada", Rank.SU_CHANNEL)
+    assert ada.player is not None
+    ada.player.colour = False
+    ada.frame_columns = 200
+    server, _ = run("commands su", ada)
+    words = server.sent[0].split("Commands available:\n", 1)[1].split()
+    assert "su" in words
+    assert "lsn" in words
+    assert "connections" in words
+    assert "conns" in words
+    assert "off_duty" in words
+    assert "warn" not in words
+    assert "grab" not in words
+    boss = staff("Bea", Rank.SUPER_USER)
+    assert boss.player is not None
+    boss.player.colour = False
+    boss.frame_columns = 200
+    listed, _ = run("commands su", boss)
+    staff_words = listed.sent[0].split("Commands available:\n", 1)[1].split()
+    assert "su" in staff_words
+    assert "warn" in staff_words
+    assert "shutdown" not in staff_words
+
+
+def test_commands_su_lists_super_user_commands_while_off_duty() -> None:
+    """An off-duty super user still gets the super-user names."""
+    boss = staff("Ada", Rank.SUPER_USER)
+    assert boss.player is not None
+    boss.player.off_duty = True
+    boss.player.colour = False
+    boss.frame_columns = 200
+    server, _ = run("commands SU", boss)
+    assert len(server.sent) == 1
+    words = server.sent[0].split("Commands available:\n", 1)[1].split()
+    assert "grab" in words
+    assert "conns" in words
+    assert "say" not in words
+    assert "mfa" not in words
+    assert "You are off duty." not in server.sent[0]
+
+
+def test_commands_admin_lists_admin_commands() -> None:
+    """Admin names stay in the admin list, and ipinfo stays out while lookup is off."""
+    boss = staff("Ada", Rank.ADMIN)
+    assert boss.player is not None
+    boss.player.colour = False
+    boss.frame_columns = 200
+    server, _ = run("commands admin", boss)
+    words = server.sent[0].split("Commands available:\n", 1)[1].split()
+    assert "allow" in words
+    assert "shutdown" not in words
+    assert "grab" not in words
+    assert "ipinfo" not in words
+
+
+def test_commands_syntax_follows_the_player_rank() -> None:
+    """The syntax line names only the filters that rank may use."""
+    resident = staff("Ada", Rank.RESIDENT)
+    for line in ("commands su", "commands su a", "commands ab", "commands a please", "commands 1", "commands as"):
+        server, _ = run(line, resident)
+        assert server.sent == ["Syntax: commands [<letter>|aliases]\n"]
+    channel = staff("Ada", Rank.SU_CHANNEL)
+    server, _ = run("commands admin", channel)
+    assert server.sent == ["Syntax: commands [<letter>|aliases|su]\n"]
+    super_user = staff("Ada", Rank.SUPER_USER)
+    server, _ = run("commands admin", super_user)
+    assert server.sent == ["Syntax: commands [<letter>|aliases|su]\n"]
+    coder = staff("Ada", Rank.CODER)
+    server, _ = run("commands foo", coder)
+    assert server.sent == ["Syntax: commands [<letter>|aliases|su|admin|coder]\n"]
+    chief = staff("Ada", Rank.SUPER_ADMIN)
+    server, _ = run("commands foo", chief)
+    assert server.sent == ["Syntax: commands [<letter>|aliases|su|admin|coder]\n"]
+    admin = staff("Ada", Rank.ADMIN)
+    server, _ = run("commands coder", admin)
+    assert server.sent == ["Syntax: commands [<letter>|aliases|su|admin]\n"]
+    server, _ = run("commands foo", admin)
+    assert server.sent == ["Syntax: commands [<letter>|aliases|su|admin]\n"]
+
+
+def test_commands_coder_lists_the_channel_and_the_coder_commands() -> None:
+    """Commands coder lists the channel and the coder commands, and leaves warn and promote out."""
+    ada = staff("Ada", Rank.CODER)
+    ada.frame_columns = 240
+    server, _ = run("commands coder", ada)
+    text = server.sent[0]
+    for name in ("cu", "ce", "ct", "broadcast", "network", "reboot", "reload", "shutdown", "system"):
+        assert name in text
+    assert "warn" not in text
+    assert "promote" not in text
+
+
+def test_commands_gap_names_an_empty_coder_list() -> None:
+    """An empty coder filter says there are no Coder commands."""
+    from lupaxa.chat_server.newbie import commands_gap
+
+    assert commands_gap("coder") == "There are no Coder commands."
+
+
+def test_commands_gap_names_an_empty_role_list() -> None:
+    """An empty role filter uses the display label."""
+    from lupaxa.chat_server.newbie import commands_gap
+
+    assert commands_gap("site_admin") == "There are no Site Admin commands."
+    assert commands_gap("SITE_ADMIN") == "There are no Site Admin commands."
+
+
+def test_commands_site_admin_lists_the_granted_commands() -> None:
+    """A holder sees every command that role grants, coloured by that command's rank."""
+    from lupaxa.chat_server.colour import magenta
+    from lupaxa.chat_server.roles import Roles
+
+    ada = staff("Ada", Rank.RESIDENT)
+    assert ada.player is not None
+    ada.player.roles = int(Roles.SITE_ADMIN)
+    ada.frame_columns = 240
+    server, _ = run("commands site_admin", ada)
+    text = server.sent[0]
+    assert text.startswith("Commands available:\n")
+    for name in ("broadcast", "network", "reboot", "reload", "shutdown", "system"):
+        assert name in text
+    assert magenta("cu") not in text
+    assert "warn" not in text
+    assert magenta("shutdown") in text
+    plain = staff("Bea", Rank.RESIDENT)
+    assert plain.player is not None
+    plain.player.roles = int(Roles.SITE_ADMIN)
+    plain.player.colour = False
+    plain.frame_columns = 240
+    off, _ = run("commands SITE_ADMIN", plain)
+    assert "shutdown" in off.sent[0]
+    assert "cu" not in off.sent[0].split()
+    assert magenta("shutdown") not in off.sent[0]
+
+
+def test_commands_site_admin_works_while_off_duty() -> None:
+    """Off duty does not close the role filter."""
+    from lupaxa.chat_server.roles import Roles
+
+    ada = staff("Ada", Rank.RESIDENT)
+    assert ada.player is not None
+    ada.player.roles = int(Roles.SITE_ADMIN)
+    ada.player.off_duty = True
+    ada.frame_columns = 240
+    server, _ = run("commands site_admin", ada)
+    assert server.sent[0].startswith("Commands available:\n")
+    assert "shutdown" in server.sent[0]
+    assert "You are off duty." not in server.sent[0]
+
+
+def test_commands_site_admin_is_refused_without_the_role() -> None:
+    """A player who does not hold the role gets the syntax line, without the token."""
+    from lupaxa.chat_server.roles import Roles
+
+    resident = staff("Ada", Rank.RESIDENT)
+    server, _ = run("commands site_admin", resident)
+    assert server.sent == ["Syntax: commands [<letter>|aliases]\n"]
+    holder = staff("Bea", Rank.RESIDENT)
+    assert holder.player is not None
+    holder.player.roles = int(Roles.SITE_ADMIN)
+    held, _ = run("commands foo", holder)
+    assert held.sent == ["Syntax: commands [<letter>|aliases|site_admin]\n"]
+    coder = staff("Cyd", Rank.CODER)
+    assert coder.player is not None
+    coder.player.roles = int(Roles.SITE_ADMIN)
+    both, _ = run("commands foo", coder)
+    assert both.sent == ["Syntax: commands [<letter>|aliases|su|admin|coder|site_admin]\n"]
+
+
+def test_coder_command_names_are_magenta() -> None:
+    """A coder command name is magenta. A super-user command name stays cyan."""
+    from lupaxa.chat_server.colour import cyan, magenta
+
+    boss = staff("Ada", Rank.SUPER_ADMIN)
+    boss.frame_columns = 240
+    server, _ = run("commands", boss)
+    assert magenta("cu") in server.sent[0]
+    assert cyan("su") in server.sent[0]
+
+
+def test_commands_su_keeps_rank_colour() -> None:
+    """A filtered super-user name stays cyan, an admin name stays red, and a coder name is magenta."""
+    from lupaxa.chat_server.colour import cyan, magenta, red
+
+    boss = staff("Ada", Rank.ADMIN)
+    boss.frame_columns = 200
+    server, _ = run("commands su", boss)
+    assert cyan("grab") in server.sent[0]
+    assert cyan("su") in server.sent[0]
+    listed, _ = run("commands admin", boss)
+    assert red("allow") in listed.sent[0]
+    coder = staff("Bea", Rank.CODER)
+    coder.frame_columns = 240
+    coloured, _ = run("commands coder", coder)
+    assert magenta("shutdown") in coloured.sent[0]
+
+
+def test_commands_gap_names_the_empty_filter() -> None:
+    """Each empty filter has its own sentence, and a letter keeps its case."""
+    from lupaxa.chat_server.newbie import commands_gap
+
+    assert commands_gap("Z") == "No commands found beginning with 'Z'."
+    assert commands_gap("z") == "No commands found beginning with 'z'."
+    assert commands_gap("aliases") == "There are no aliases."
+    assert commands_gap("su") == "There are no Super User commands."
+    assert commands_gap("SU") == "There are no Super User commands."
+    assert commands_gap("admin") == "There are no Admin commands."
+    assert commands_gap("ADMIN") == "There are no Admin commands."
 
 
 def test_recap_changes_only_the_capitalisation(tmp_path: Path) -> None:
     """BoB updates the live name and the file. The file stays bob.yml."""
-    save_player(tmp_path, SavedPlayer("Bob", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    user = Player("Bob", "hall", datetime.now(timezone.utc), rank=RANK_RESIDENT)
-    bob = _Player(name="Bob", room="hall", player=user)
-    host.people = [bob]
-    process_commands(host, bob, "recap BoB")  # type: ignore[arg-type]
-    assert host.sent == ["Name set to BoB.\n"]
+    save_player(tmp_path, SavedPlayer("Bob", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    user = Player("Bob", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    bob = FakePlayer(name="Bob", room="hall", player=user)
+    server.people = [bob]
+    process_commands(server, bob, "recap BoB")  # type: ignore[arg-type]
+    assert server.sent == ["Name set to BoB.\n"]
     assert user.name == "BoB"
     assert user.lowercase_name == "bob"
-    assert host.room_lines == []
+    assert server.room_lines == []
     saved = load_saved(player_path(tmp_path, "bob"))
     assert saved is not None
     assert saved.name == "BoB"
     assert player_path(tmp_path, "bob").is_file()
-    host.sent.clear()
-    process_commands(host, bob, "recap Robert")  # type: ignore[arg-type]
-    assert host.sent == ["You can only change the capitalisation of your name.\n"]
+    server.sent.clear()
+    process_commands(server, bob, "recap Robert")  # type: ignore[arg-type]
+    assert server.sent == ["You can only change the capitalisation of your name.\n"]
     assert user.name == "BoB"
 
 
 def test_recap_cannot_rename_someone_else(tmp_path: Path) -> None:
     """Ada cannot recap Bea. A bare recap shows the syntax."""
-    host = _login_host(tmp_path)
-    ada = _newbie("Ada")
-    bea = _newbie("Bea")
-    host.people = [ada, bea]
-    process_commands(host, ada, "recap Bea")  # type: ignore[arg-type]
-    assert host.sent == ["You can only change the capitalisation of your name.\n"]
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.RESIDENT)
+    bea = newbie("Bea")
+    server.people = [ada, bea]
+    process_commands(server, ada, "recap Bea")  # type: ignore[arg-type]
+    assert server.sent == ["You can only change the capitalisation of your name.\n"]
     assert bea.player is not None
     assert bea.player.name == "Bea"
-    host.sent.clear()
-    process_commands(host, ada, "recap")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: recap <name>\n"]
+    server.sent.clear()
+    process_commands(server, ada, "recap")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: recap <name>\n"]
 
 
 def test_recap_of_the_current_spelling_succeeds() -> None:
     """Typing the spelling already in use is still a success."""
-    ada, _player = _run("recap Ada")
+    resident = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    ada, _ = run("recap Ada", resident)
     assert ada.sent == ["Name set to Ada.\n"]
 
 
-def test_recap_keeps_the_live_name_when_the_save_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_recap_keeps_the_live_name_when_the_save_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A failed save leaves the display name the player already has."""
-    save_player(tmp_path, SavedPlayer("Bob", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    user = Player("Bob", "hall", datetime.now(timezone.utc), rank=RANK_RESIDENT)
-    bob = _Player(name="Bob", room="hall", player=user)
-    host.people = [bob]
+    save_player(tmp_path, SavedPlayer("Bob", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    user = Player("Bob", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    bob = FakePlayer(name="Bob", room="hall", player=user)
+    server.people = [bob]
 
-    def _fail(directory: object, player: object) -> None:
+    def fail(directory: object, player: object) -> None:
         del directory, player
         raise ConfigError("cannot write")
 
-    monkeypatch.setattr(command_api, "save_player", _fail)
-    process_commands(host, bob, "recap BoB")  # type: ignore[arg-type]
-    assert host.sent == ["That name cannot be used right now.\n"]
+    monkeypatch.setattr(resident_api, "save_player", fail)
+    process_commands(server, bob, "recap BoB")  # type: ignore[arg-type]
+    assert server.sent == ["That name cannot be used right now.\n"]
     assert user.name == "Bob"
 
 
 def test_help_shows_an_entry_or_says_it_is_missing() -> None:
     """A name and an alias show the same paragraph. An unknown topic does not."""
-    book = HelpBook(
-        entries=(
-            HelpEntry(
-                "say",
-                ("'", '"', "`"),
-                "Speak to the other people in the room you are in.",
-            ),
-            HelpEntry("examine", ("x",), "Show a player."),
-        )
-    )
-    host = _Host(_help=book)
-    player = _Player()
-    process_commands(host, player, "help say")  # type: ignore[arg-type]
-    page = host.sent[0]
+    book = HelpBook(entries=(HelpEntry("say", ("'", '"', "`"), "Speak to the other people in the room you are in."), HelpEntry("examine", ("x",), "Show a player.")))  # fmt: skip  # noqa: E501
+    server = FakeServer(help=book)
+    player = FakePlayer()
+    process_commands(server, player, "help say")  # type: ignore[arg-type]
+    page = server.sent[0]
     assert page.startswith("\n\n")
     assert page.endswith("\n\n")
-    assert "Command : say" in page
-    assert "Syntax  : say <message>" in page
-    assert "Aliases : ' \" `" in page
-    assert host.room_lines == []
+    assert "Command    : say" in page
+    assert "Syntax     : say <message>" in page
+    assert "Aliases    : ' \" `" in page
+    assert server.room_lines == []
 
-    host = _Host(_help=book)
-    process_commands(host, _Player(), "help '")  # type: ignore[arg-type]
-    alias_page = host.sent[0]
-    assert "Command : say" in alias_page
-    assert "Syntax  : say <message>" in alias_page
-    assert "Aliases : ' \" `" in alias_page
+    server = FakeServer(help=book)
+    process_commands(server, FakePlayer(), "help '")  # type: ignore[arg-type]
+    alias_page = server.sent[0]
+    assert "Command    : say" in alias_page
+    assert "Syntax     : say <message>" in alias_page
+    assert "Aliases    : ' \" `" in alias_page
 
-    host = _Host(_help=book)
-    process_commands(host, _Player(), "help nope")  # type: ignore[arg-type]
-    assert host.sent == ["help for nope not found\n"]
-    assert host.room_lines == []
+    server = FakeServer(help=book)
+    process_commands(server, FakePlayer(), "help nope")  # type: ignore[arg-type]
+    assert server.sent == ["help for nope not found\n"]
+    assert server.room_lines == []
 
-    host = _Host(_help=book)
-    process_commands(host, _Player(), "help say please")  # type: ignore[arg-type]
-    assert host.sent == ["help for say please not found\n"]
+    server = FakeServer(help=book)
+    process_commands(server, FakePlayer(), "help say please")  # type: ignore[arg-type]
+    assert server.sent == ["help for say please not found\n"]
 
 
 def test_help_for_a_topic_that_is_not_a_command() -> None:
     """A topic with no command shows the paragraph, and an alias still opens it."""
-    book = HelpBook(
-        entries=(
-            HelpEntry("hours", ("closing",), "The office closes at six."),
-            HelpEntry("look", (), "Show this room."),
-        )
-    )
-    host = _Host(_help=book)
-    player = _Player()
-    process_commands(host, player, "help hours")  # type: ignore[arg-type]
-    page = host.sent[0]
+    book = HelpBook(entries=(HelpEntry("hours", ("closing",), "The office closes at six."), HelpEntry("look", (), "Show this room.")))
+    server = FakeServer(help=book)
+    player = FakePlayer()
+    process_commands(server, player, "help hours")  # type: ignore[arg-type]
+    page = server.sent[0]
     assert page.startswith("\n\n")
     assert page.endswith("\n\n")
     assert "The office closes at six." in page
     assert "Command:" not in page
     assert "Syntax" not in page
 
-    host = _Host(_help=book)
-    process_commands(host, _Player(), "help closing")  # type: ignore[arg-type]
-    assert "The office closes at six." in host.sent[0]
-    assert "Command:" not in host.sent[0]
+    server = FakeServer(help=book)
+    process_commands(server, FakePlayer(), "help closing")  # type: ignore[arg-type]
+    assert "The office closes at six." in server.sent[0]
+    assert "Command:" not in server.sent[0]
+
+
+def search_book() -> HelpBook:
+    """Return two visible pages and one admin page."""
+    return HelpBook(
+        entries=(
+            HelpEntry("say", (), "Speak in the room."),
+            HelpEntry("map", (), "Draw the house."),
+            HelpEntry("shutdown", (), "Stop the server."),
+        )
+    )
+
+
+def test_help_search_shows_the_one_page() -> None:
+    """One match shows that help page."""
+    resident = staff("Ada", Rank.RESIDENT)
+    assert resident.player is not None
+    resident.player.colour = False
+    server = FakeServer(help=search_book(), people=[resident])
+    process_commands(server, resident, "help search room")  # type: ignore[arg-type]
+    assert "Speak in the room." in server.sent[0]
+    assert server.sent[0].startswith("\n\n")
+
+
+def test_help_search_lists_several_pages() -> None:
+    """Several matches list one page name on each line."""
+    resident = staff("Ada", Rank.RESIDENT)
+    server = FakeServer(help=search_book(), people=[resident])
+    process_commands(server, resident, "help SEARCH the")  # type: ignore[arg-type]
+    assert server.sent == ["Help pages:\n  map\n  say\n"]
+
+
+def test_help_search_keeps_a_spaced_name_on_one_line() -> None:
+    """A page name that contains spaces stays on one line."""
+    resident = staff("Ada", Rank.RESIDENT)
+    book = HelpBook(
+        entries=(
+            HelpEntry("set plan", (), "A plan."),
+            HelpEntry("examine", (), "A plan of the house."),
+            HelpEntry("quit", (), "Leave."),
+        )
+    )
+    server = FakeServer(help=book, people=[resident])
+    process_commands(server, resident, "help search plan")  # type: ignore[arg-type]
+    assert server.sent == ["Help pages:\n  examine\n  set plan\n"]
+
+
+def test_help_search_says_when_nothing_matches() -> None:
+    """No match quotes the typed text."""
+    resident = staff("Ada", Rank.RESIDENT)
+    server = FakeServer(help=search_book(), people=[resident])
+    process_commands(server, resident, "help search Missing Thing")  # type: ignore[arg-type]
+    assert server.sent == ["No help found for 'Missing Thing'.\n"]
+
+
+def test_help_search_needs_text() -> None:
+    """Help search with no text asks for the text."""
+    resident = staff("Ada", Rank.RESIDENT)
+    server = FakeServer(help=search_book(), people=[resident])
+    process_commands(server, resident, "help search")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: help search <text>\n"]
+
+
+def test_help_search_skips_a_hidden_page() -> None:
+    """A resident does not find an admin page."""
+    resident = staff("Ada", Rank.RESIDENT)
+    server = FakeServer(help=search_book(), people=[resident])
+    process_commands(server, resident, "help search Stop")  # type: ignore[arg-type]
+    assert server.sent == ["No help found for 'Stop'.\n"]
 
 
 def test_help_hides_a_see_name_the_player_cannot_open() -> None:
     """See Also drops a topic this rank cannot open."""
-    book = HelpBook(
-        entries=(
-            HelpEntry("hours", (), "The office closes at six.", see=("reload", "look")),
-            HelpEntry("look", (), "Show this room."),
-            HelpEntry("reload", (), "Read the help file again."),
-        )
-    )
-    host = _Host(_help=book)
-    process_commands(host, _Player(), "help hours")  # type: ignore[arg-type]
-    assert "See Also: look" in host.sent[0]
-    assert "reload" not in host.sent[0]
+    book = HelpBook(entries=(HelpEntry("hours", (), "The office closes at six.", see=("reload", "look")), HelpEntry("look", (), "Show this room."), HelpEntry("reload", (), "Read the help file again.")))  # fmt: skip  # noqa: E501
+    server = FakeServer(help=book)
+    process_commands(server, FakePlayer(), "help hours")  # type: ignore[arg-type]
+    assert "See Also   : look" in server.sent[0]
+    assert "reload" not in server.sent[0]
 
 
 def test_help_look_shows_the_command_name_as_syntax() -> None:
     """Look has no syntax string, so the page shows the name."""
-    host, _player = _run("help look")
-    page = host.sent[0]
-    assert "Syntax  : look" in page
-    assert host.room_lines == []
+    server, _ = run("help look")
+    page = server.sent[0]
+    assert "Syntax     : look" in page
+    assert server.room_lines == []
+
+
+def test_help_through_process_commands_uses_the_shipped_book() -> None:
+    """Real help through process_commands shows rank, syntax, and colour from the shipped book."""
+    when = datetime.now(timezone.utc)
+    resident = FakePlayer(player=Player("Ada", "reception", when, rank=Rank.RESIDENT, colour=False))
+    server = FakeServer(help=SHIPPED_HELP, people=[resident])
+    process_commands(server, resident, "help shout")  # type: ignore[arg-type]
+    shout_page = server.sent[0]
+    assert "Permissions: Resident" in shout_page
+    assert "Syntax     : shout <message>" in shout_page
+
+    server = FakeServer(help=SHIPPED_HELP, people=[resident])
+    process_commands(server, resident, "help !")  # type: ignore[arg-type]
+    assert "Syntax     : shout <message>" in server.sent[0]
+
+    server = FakeServer(help=SHIPPED_HELP, people=[resident])
+    process_commands(server, resident, "help set plan")  # type: ignore[arg-type]
+    plan_page = server.sent[0]
+    assert "Syntax     : set plan <plan>" in plan_page
+    assert "Permissions: Resident" in plan_page
+
+    server = FakeServer(help=SHIPPED_HELP, people=[resident])
+    process_commands(server, resident, "help disclaimer")  # type: ignore[arg-type]
+    assert "Permissions" not in server.sent[0]
+
+    server = FakeServer(help=SHIPPED_HELP, people=[resident])
+    process_commands(server, resident, "help plan")  # type: ignore[arg-type]
+    assert server.sent == ["help for plan not found\n"]
+
+    coder = staff("Ada", Rank.CODER)
+    assert coder.player is not None
+    coder.player.colour = False
+    server = FakeServer(help=SHIPPED_HELP, people=[coder])
+    process_commands(server, coder, "help shutdown")  # type: ignore[arg-type]
+    assert "Permissions: Coder or Site Admin" in server.sent[0]
+    server = FakeServer(help=SHIPPED_HELP, people=[coder])
+    process_commands(server, coder, "help reload config")  # type: ignore[arg-type]
+    assert "Permissions: Coder or Site Admin" in server.sent[0]
+
+    super_user = staff("Ada", Rank.SUPER_USER)
+    assert super_user.player is not None
+    super_user.player.colour = True
+    server = FakeServer(help=SHIPPED_HELP, people=[super_user])
+    process_commands(server, super_user, "help grab")  # type: ignore[arg-type]
+    assert cyan("Super User") in server.sent[0]
 
 
 def test_prompt_follows_a_finished_command() -> None:
     """The prompt returns after success, a syntax error, and an unknown command."""
-    host = _Host(_help=_SHIPPED_HELP)
-    player = _Player()
-    process_input(host, player, "help")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: help <topic>\n", "What? > "]
+    server = FakeServer(help=SHIPPED_HELP)
+    player = FakePlayer()
+    process_input(server, player, "help")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: help <topic>\n", "What? > "]
 
-    process_input(host, player, "say")  # type: ignore[arg-type]
-    assert host.sent[-2:] == ["Syntax: say <message>\n", "What? > "]
+    process_input(server, player, "say")  # type: ignore[arg-type]
+    assert server.sent[-2:] == ["Syntax: say <message>\n", "What? > "]
 
-    process_input(host, player, "nope")  # type: ignore[arg-type]
-    assert host.sent[-2:] == ["No such command 'nope'\n", "What? > "]
+    process_input(server, player, "nope")  # type: ignore[arg-type]
+    assert server.sent[-2:] == ["No such command 'nope'\n", "What? > "]
 
 
 def test_prompt_command_replaces_the_next_prompt() -> None:
     """``prompt`` stores the text and the following prompt uses it."""
-    user = Player("Ada", "reception", datetime.now(timezone.utc), rank=RANK_RESIDENT)
-    player = _Player(player=user)
-    host = _Host()
-    process_input(host, player, "prompt Hello >")  # type: ignore[arg-type]
+    user = Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    player = FakePlayer(player=user)
+    server = FakeServer()
+    process_input(server, player, "set prompt Hello >")  # type: ignore[arg-type]
     assert user.prompt == "Hello > "
-    assert host.sent == ["Prompt set.\n", "Hello > "]
+    assert server.sent == ["Prompt set.\n", "Hello > "]
 
 
 def test_a_newbie_entered_shows_the_default_description_on_examine(tmp_path: Path) -> None:
     """A newbie who entered through login shows I am new here between the rules."""
-    host = _login_host(tmp_path)
-    ada = _Player(player=None)
-    process_input(host, ada, "Ada")  # type: ignore[arg-type]
-    process_input(host, ada, "yes")  # type: ignore[arg-type]
+    server = login_host(tmp_path)
+    ada = FakePlayer(player=None)
+    process_input(server, ada, "Ada")  # type: ignore[arg-type]
+    process_input(server, ada, "yes")  # type: ignore[arg-type]
     assert ada.player is not None
     assert ada.player.description == "I am new here"
-    bea = _newbie("Bea")
-    host.people = [ada, bea]
-    host.sent.clear()
-    process_commands(host, bea, "examine Ada")  # type: ignore[arg-type]
-    lines = host.sent[0].splitlines()
+    bea = newbie("Bea")
+    server.people = [ada, bea]
+    server.sent.clear()
+    process_commands(server, bea, "examine Ada")  # type: ignore[arg-type]
+    lines = server.sent[0].splitlines()
     assert lines[3].startswith("  I am new here")
     assert lines[2] == lines[4]
 
 
+def test_who_and_examine_mask_su_channel(tmp_path: Path) -> None:
+    """A resident sees Resident. SU Channel sees Super User Channel."""
+    save(tmp_path, "Cyd", Rank.SU_CHANNEL)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.RESIDENT)
+    bea = staff("Bea", Rank.SU_CHANNEL)
+    assert ada.player is not None
+    assert bea.player is not None
+    ada.player.colour = True
+    bea.player.colour = True
+    server.people = [ada, bea]
+    process_commands(server, ada, "who")  # type: ignore[arg-type]
+    assert "Super User Channel" not in server.sent[0]
+    bea_row = next(line for line in server.sent[0].splitlines() if "Bea" in line)
+    assert "Resident" in bea_row
+    server.sent.clear()
+    process_commands(server, ada, "examine Bea")  # type: ignore[arg-type]
+    assert "Resident" in server.sent[0]
+    assert "Super User Channel" not in server.sent[0]
+    server.sent.clear()
+    process_commands(server, bea, "examine me")  # type: ignore[arg-type]
+    assert cyan("Super User Channel") in server.sent[0]
+    server.sent.clear()
+    process_commands(server, ada, "examine Cyd")  # type: ignore[arg-type]
+    assert "Resident" in server.sent[0]
+    assert "Super User Channel" not in server.sent[0]
+    server.sent.clear()
+    process_commands(server, bea, "examine Cyd")  # type: ignore[arg-type]
+    assert cyan("Super User Channel") in server.sent[0]
+
+
 def test_description_sets_clears_and_refuses_long_text(tmp_path: Path) -> None:
     """Description stores one line, clears it, and refuses more than 80 characters."""
-    _save(tmp_path, "Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_RESIDENT)
-    host.people = [bea]
-    process_commands(host, bea, "description Hello there")  # type: ignore[arg-type]
-    assert host.sent == ["Description set.\n"]
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    server.people = [bea]
+    process_commands(server, bea, "set description Hello there")  # type: ignore[arg-type]
+    assert server.sent == ["Description set.\n"]
     path = player_path(tmp_path, "Bea")
     assert "description: Hello there" in path.read_text(encoding="utf-8")
-    host.sent.clear()
-    process_commands(host, bea, "examine me")  # type: ignore[arg-type]
-    assert "  Hello there" in host.sent[0]
-    assert "Hello there".center(72) not in host.sent[0]
-    host.sent.clear()
-    process_commands(host, bea, "description")  # type: ignore[arg-type]
-    assert host.sent == ["Description cleared.\n"]
+    server.sent.clear()
+    process_commands(server, bea, "examine me")  # type: ignore[arg-type]
+    assert "  Hello there" in server.sent[0]
+    assert "Hello there".center(72) not in server.sent[0]
+    server.sent.clear()
+    process_commands(server, bea, "set description")  # type: ignore[arg-type]
+    assert server.sent == ["Description cleared.\n"]
     assert "description" not in path.read_text(encoding="utf-8")
-    host.sent.clear()
-    process_commands(host, bea, "examine me")  # type: ignore[arg-type]
-    assert "  Hello there" not in host.sent[0]
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4), description="Saved"),
-    )
+    server.sent.clear()
+    process_commands(server, bea, "examine me")  # type: ignore[arg-type]
+    assert "  Hello there" not in server.sent[0]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), description="Saved"))
     before = path.read_text(encoding="utf-8")
-    host.sent.clear()
-    process_commands(host, bea, f"description {'x' * 81}")  # type: ignore[arg-type]
-    assert host.sent == ["A description is at most 80 characters.\n"]
+    server.sent.clear()
+    process_commands(server, bea, f"set description {'x' * 81}")  # type: ignore[arg-type]
+    assert server.sent == ["A description is at most 80 characters.\n"]
     assert path.read_text(encoding="utf-8") == before
 
 
 def test_description_preserves_internal_spaces(tmp_path: Path) -> None:
     """Description stores one stripped line without collapsing spaces."""
-    _save(tmp_path, "Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_RESIDENT)
-    host.people = [bea]
-    process_commands(host, bea, "description hello  world")  # type: ignore[arg-type]
-    assert host.sent == ["Description set.\n"]
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    server.people = [bea]
+    process_commands(server, bea, "set description hello  world")  # type: ignore[arg-type]
+    assert server.sent == ["Description set.\n"]
     assert bea.player.description == "hello  world"
     path = player_path(tmp_path, "Bea")
     assert "description: hello  world" in path.read_text(encoding="utf-8")
@@ -897,28 +1244,28 @@ def test_description_preserves_internal_spaces(tmp_path: Path) -> None:
 
 def test_description_refuses_81_chars_without_changing_live_value(tmp_path: Path) -> None:
     """An over-long description is refused and the in-memory line stays put."""
-    _save(tmp_path, "Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_RESIDENT)
-    host.people = [bea]
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    server.people = [bea]
     bea.player.description = "Still here"
-    host.sent.clear()
-    process_commands(host, bea, f"description {'x' * 81}")  # type: ignore[arg-type]
-    assert host.sent == ["A description is at most 80 characters.\n"]
+    server.sent.clear()
+    process_commands(server, bea, f"set description {'x' * 81}")  # type: ignore[arg-type]
+    assert server.sent == ["A description is at most 80 characters.\n"]
     assert bea.player.description == "Still here"
 
 
 def test_save_writes_the_live_profile(tmp_path: Path) -> None:
     """Save stores the live description and leaves status off the file."""
-    _save(tmp_path, "Ada", RANK_RESIDENT)
-    host = _Host()
-    host._roster_dir = tmp_path
-    ada = _staff("Ada", RANK_RESIDENT)
+    save(tmp_path, "Ada", Rank.RESIDENT)
+    server = FakeServer()
+    server.roster_dir = tmp_path
+    ada = staff("Ada", Rank.RESIDENT)
     assert ada.player is not None
     ada.player.description = "Hello"
     ada.player.status = "away"
     ada.player.auto_reply = "later"
-    command_save(host, ada, Command("save", command_save, False, "save"), None)
+    command_save(server, ada, Command("save", command_save, False, "save"), None)
     saved = load_saved(player_path(tmp_path, "Ada"))
     assert saved is not None
     assert saved.description == "Hello"
@@ -931,386 +1278,396 @@ def test_save_writes_the_live_profile(tmp_path: Path) -> None:
 def test_newbie_cannot_save() -> None:
     """A newbie is told save does not exist."""
     when = datetime.now(timezone.utc)
-    newbie = _Player(player=Player("Ada", "reception", when, rank="newbie"))
-    host, _player = _run("save", newbie)
-    assert host.sent == ["No such command 'save'\n"]
+    newbie = FakePlayer(player=Player("Ada", "reception", when, rank=Rank.NEWBIE))
+    server, _ = run("save", newbie)
+    assert server.sent == ["No such command 'save'\n"]
 
 
 def test_save_rejects_extra_text(tmp_path: Path) -> None:
     """Save with arguments shows the syntax line."""
-    _save(tmp_path, "Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_RESIDENT)
-    host.people = [bea]
-    process_commands(host, bea, "save now")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: save\n"]
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    server.people = [bea]
+    process_commands(server, bea, "save now")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: save\n"]
 
 
-def test_save_keeps_the_file_when_save_player_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_save_keeps_the_file_when_save_player_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A failed save sends CANNOT_NOW and leaves the file bytes alone."""
-    _save(tmp_path, "Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_RESIDENT)
-    host.people = [bea]
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    server.people = [bea]
     assert bea.player is not None
     bea.player.description = "Hello"
     path = player_path(tmp_path, "Bea")
     before = path.read_bytes()
 
-    def _fail(directory: object, player: object) -> None:
+    def fail(directory: object, player: object) -> None:
         del directory, player
         raise ConfigError("cannot write")
 
-    monkeypatch.setattr(command_api, "save_player", _fail)
-    process_commands(host, bea, "save")  # type: ignore[arg-type]
-    assert host.sent == ["That name cannot be used right now.\n"]
+    monkeypatch.setattr(resident_api, "save_player", fail)
+    process_commands(server, bea, "save")  # type: ignore[arg-type]
+    assert server.sent == ["That name cannot be used right now.\n"]
     assert path.read_bytes() == before
 
 
 def test_a_newbie_cannot_retire() -> None:
     """A newbie is told retire does not exist."""
-    host, _player = _run("retire", _newbie("Ada"))
-    assert host.sent == ["No such command 'retire'\n"]
+    server, _ = run("retire", newbie("Ada"))
+    assert server.sent == ["No such command 'retire'\n"]
 
 
 def test_retire_refuses_the_admin(tmp_path: Path) -> None:
-    """The admin is refused and is not asked to confirm."""
-    host = _login_host(tmp_path)
-    boss = _staff("admin", RANK_ADMIN)
-    host.people = [boss]
-    process_input(host, boss, "retire")  # type: ignore[arg-type]
-    assert host.sent == ["The admin cannot be removed.\n", "What? > "]
+    """The super admin is refused and is not asked to confirm."""
+    server = login_host(tmp_path)
+    boss = staff("admin", Rank.SUPER_ADMIN)
+    server.people = [boss]
+    process_input(server, boss, "retire")  # type: ignore[arg-type]
+    assert server.sent == ["The super admin cannot be removed.\n", "What? > "]
+    assert boss.auth == "name"
+
+
+def test_retire_with_a_bad_super_admin_file_sends_cannot_now(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Retire does not crash when the super admin file is invalid YAML."""
+    server = login_host(tmp_path)
+    boss = staff("admin", Rank.SUPER_ADMIN)
+    server.people = [boss]
+    player_path(tmp_path, "admin").write_text(":\n  bad yaml: [\n", encoding="utf-8")
+    process_input(server, boss, "retire")  # type: ignore[arg-type]
+    assert "Invalid YAML" in capsys.readouterr().out
+    assert any("That name cannot be used right now." in line for line in server.sent)
     assert boss.auth == "name"
 
 
 def test_retire_cancelled_with_no_or_blank(tmp_path: Path) -> None:
     """No or a blank line cancels retire and keeps the file."""
-    _save(tmp_path, "Ada", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_RESIDENT)
-    host.people = [ada]
+    save(tmp_path, "Ada", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.RESIDENT)
+    server.people = [ada]
     for answer in ("no", ""):
-        host.sent.clear()
-        process_input(host, ada, "retire")  # type: ignore[arg-type]
-        process_input(host, ada, answer)  # type: ignore[arg-type]
-        assert host.sent[-1] == "Retire cancelled.\nWhat? > "
+        server.sent.clear()
+        process_input(server, ada, "retire")  # type: ignore[arg-type]
+        process_input(server, ada, answer)  # type: ignore[arg-type]
+        assert server.sent[-1] == "Retire cancelled.\nWhat? > "
         assert ada.auth == "name"
         assert load_saved(player_path(tmp_path, "Ada")) is not None
 
 
 def test_retire_yes_asks_for_password(tmp_path: Path) -> None:
     """YES moves to the password step with no play prompt appended."""
-    _save(tmp_path, "Ada", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_RESIDENT)
-    host.people = [ada]
-    process_input(host, ada, "retire")  # type: ignore[arg-type]
-    host.sent.clear()
-    process_input(host, ada, "YES")  # type: ignore[arg-type]
-    assert host.sent == ["Password: "]
+    save(tmp_path, "Ada", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.RESIDENT)
+    server.people = [ada]
+    process_input(server, ada, "retire")  # type: ignore[arg-type]
+    server.sent.clear()
+    process_input(server, ada, "YES")  # type: ignore[arg-type]
+    assert server.sent == ["Password: "]
     assert ada.auth == "retire_password"
 
 
 def test_retire_wrong_password_returns_to_the_room(tmp_path: Path) -> None:
     """A wrong password cancels retire and leaves the file."""
-    _save(tmp_path, "Ada", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_RESIDENT)
-    host.people = [ada]
-    process_input(host, ada, "retire")  # type: ignore[arg-type]
-    process_input(host, ada, "yes")  # type: ignore[arg-type]
-    host.sent.clear()
-    process_input(host, ada, "wrong")  # type: ignore[arg-type]
-    assert host.sent == ["Wrong password.\nWhat? > "]
+    save(tmp_path, "Ada", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.RESIDENT)
+    server.people = [ada]
+    process_input(server, ada, "retire")  # type: ignore[arg-type]
+    process_input(server, ada, "yes")  # type: ignore[arg-type]
+    server.sent.clear()
+    process_input(server, ada, "wrong")  # type: ignore[arg-type]
+    assert server.sent == ["Wrong password.\nWhat? > "]
     assert ada.auth == "name"
-    assert host.dropped is False
+    assert server.dropped is False
     assert load_saved(player_path(tmp_path, "Ada")) is not None
 
 
 def test_retire_deletes_the_file_and_disconnects(tmp_path: Path) -> None:
     """The right password retires the player and tells staff."""
-    _save(tmp_path, "Ada", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_RESIDENT)
-    watcher = _staff("Bea", RANK_SUPER)
-    host.people = [ada, watcher]
-    process_input(host, ada, "retire")  # type: ignore[arg-type]
-    process_input(host, ada, "yes")  # type: ignore[arg-type]
-    host.sent.clear()
-    process_input(host, ada, "pw")  # type: ignore[arg-type]
-    assert host.sent == ["You have retired.\n"]
+    save(tmp_path, "Ada", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.RESIDENT)
+    watcher = staff("Bea", Rank.SUPER_USER)
+    server.people = [ada, watcher]
+    process_input(server, ada, "retire")  # type: ignore[arg-type]
+    process_input(server, ada, "yes")  # type: ignore[arg-type]
+    server.sent.clear()
+    process_input(server, ada, "pw")  # type: ignore[arg-type]
+    assert server.sent == ["You have retired.\n"]
     assert load_saved(player_path(tmp_path, "Ada")) is None
-    assert host.staff_lines == [paint_staff(watcher, "< SU > Ada retires.\n")]
-    assert host.dropped_clients == [ada]
-    assert host.announced == [True]
+    assert server.staff_lines == [paint_staff(watcher, "< SU > Ada retires.\n")]
+    assert server.dropped_clients == [ada]
+    assert server.announced == [True]
 
 
-def test_retire_keeps_the_file_when_delete_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_retire_keeps_the_file_when_delete_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:  # fmt: skip  # noqa: E501
     """A failed delete sends CANNOT_NOW and does not drop the player."""
-    _save(tmp_path, "Ada", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_RESIDENT)
-    host.people = [ada]
+    save(tmp_path, "Ada", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.RESIDENT)
+    server.people = [ada]
 
-    def _fail(directory: object, name: object) -> bool:
+    def fail(directory: object, name: object) -> bool:
         del directory, name
         raise ConfigError("cannot delete")
 
-    monkeypatch.setattr(password_api, "delete_player", _fail)
-    process_input(host, ada, "retire")  # type: ignore[arg-type]
-    process_input(host, ada, "yes")  # type: ignore[arg-type]
-    host.sent.clear()
-    process_input(host, ada, "pw")  # type: ignore[arg-type]
+    monkeypatch.setattr(password_api, "delete_player", fail)
+    process_input(server, ada, "retire")  # type: ignore[arg-type]
+    process_input(server, ada, "yes")  # type: ignore[arg-type]
+    server.sent.clear()
+    process_input(server, ada, "pw")  # type: ignore[arg-type]
     assert "cannot delete" in capsys.readouterr().out
-    assert host.sent == ["That name cannot be used right now.\nWhat? > "]
+    assert server.sent == ["That name cannot be used right now.\nWhat? > "]
     assert ada.auth == "name"
-    assert host.dropped is False
+    assert server.dropped is False
     assert load_saved(player_path(tmp_path, "Ada")) is not None
 
 
 def test_status_under_rank_on_connected_examine(tmp_path: Path) -> None:
     """Connected examine shows Status under User Rank; logged-out examine does not."""
-    user = Player("Ada", "hall", datetime.now(timezone.utc), rank=RANK_SUPER)
-    ada = _Player(player=user)
-    host = _Host(people=[ada])
-    process_commands(host, ada, "status busy")  # type: ignore[arg-type]
-    host.sent.clear()
-    process_commands(host, ada, "examine me")  # type: ignore[arg-type]
-    lines = host.sent[0].splitlines()
+    user = Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.SUPER_USER)
+    ada = FakePlayer(player=user)
+    server = FakeServer(people=[ada])
+    process_commands(server, ada, "set status busy")  # type: ignore[arg-type]
+    server.sent.clear()
+    process_commands(server, ada, "examine me")  # type: ignore[arg-type]
+    lines = server.sent[0].splitlines()
     rank_index = next(i for i, line in enumerate(lines) if line.startswith("  User Rank"))
     status_index = next(i for i, line in enumerate(lines) if line.startswith("  Status"))
     assert status_index == rank_index + 1
     assert "busy" in lines[status_index]
     rule_lines = [i for i, line in enumerate(lines) if line and set(line) == {"-"}]
     assert rank_index == rule_lines[1] + 1
-    host.sent.clear()
-    process_commands(host, ada, "status")  # type: ignore[arg-type]
-    host.sent.clear()
-    process_commands(host, ada, "examine me")  # type: ignore[arg-type]
-    assert "  Status" not in host.sent[0]
-    _save(tmp_path, "Adam", RANK_RESIDENT)
-    host = _login_host(tmp_path, admin="Zed")
-    process_commands(host, _Player(), "examine ad")  # type: ignore[arg-type]
-    assert "  Status" not in host.sent[0]
+    server.sent.clear()
+    process_commands(server, ada, "set status")  # type: ignore[arg-type]
+    server.sent.clear()
+    process_commands(server, ada, "examine me")  # type: ignore[arg-type]
+    assert "  Status" not in server.sent[0]
+    save(tmp_path, "Adam", Rank.RESIDENT)
+    server = login_host(tmp_path, super_admin="Zed")
+    process_commands(server, FakePlayer(), "examine ad")  # type: ignore[arg-type]
+    assert "  Status" not in server.sent[0]
+
+
+def test_examine_shows_roles_under_rank_when_one_is_set(tmp_path: Path) -> None:
+    """Connected and logged-out examine list named roles under User Rank."""
+    user = Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT, roles=int(Roles.SITE_ADMIN))
+    user.status = "busy"
+    ada = FakePlayer(player=user)
+    server = FakeServer(people=[ada])
+    process_commands(server, ada, "examine me")  # type: ignore[arg-type]
+    lines = server.sent[0].splitlines()
+    rank_index = next(i for i, line in enumerate(lines) if line.startswith("  User Rank"))
+    roles_index = next(i for i, line in enumerate(lines) if line.startswith("  Roles"))
+    status_index = next(i for i, line in enumerate(lines) if line.startswith("  Status"))
+    assert roles_index == rank_index + 1
+    assert status_index == roles_index + 1
+    assert "Site Admin" in lines[roles_index]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), roles=int(Roles.SITE_ADMIN)))
+    logged_out = login_host(tmp_path)
+    process_commands(logged_out, FakePlayer(), "examine Bea")  # type: ignore[arg-type]
+    body = logged_out.sent[0].splitlines()
+    rank_index = next(i for i, line in enumerate(body) if line.startswith("  User Rank"))
+    roles_index = next(i for i, line in enumerate(body) if line.startswith("  Roles"))
+    last_index = next(i for i, line in enumerate(body) if line.startswith("  Last from"))
+    assert roles_index == rank_index + 1
+    assert last_index == roles_index + 1
+    assert "Site Admin" in body[roles_index]
+
+
+def test_examine_omits_roles_when_none_are_set(tmp_path: Path) -> None:
+    """A player with no named role has no Roles line."""
+    user = Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    ada = FakePlayer(player=user)
+    server = FakeServer(people=[ada])
+    process_commands(server, ada, "examine me")  # type: ignore[arg-type]
+    assert "  Roles" not in server.sent[0]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    logged_out = login_host(tmp_path)
+    process_commands(logged_out, FakePlayer(), "examine Bea")  # type: ignore[arg-type]
+    assert "  Roles" not in logged_out.sent[0]
 
 
 def test_status_shows_on_examine_who_and_lsu_and_is_not_saved(tmp_path: Path) -> None:
     """Status is a session field under User Rank on examine, and on both lists."""
-    user = Player("Ada", "hall", datetime.now(timezone.utc), rank=RANK_SUPER)
-    ada = _Player(player=user)
-    host, _player = _run("status in a meeting", ada)
+    user = Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.SUPER_USER)
+    ada = FakePlayer(player=user)
+    server, _ = run("set status in a meeting", ada)
     assert user.status == "in a meeting"
-    assert host.sent[-1] == "Status set.\n"
-    host.sent.clear()
-    process_commands(host, ada, f"status {'x' * 21}")  # type: ignore[arg-type]
-    assert host.sent == ["A status is at most 20 characters.\n"]
+    assert server.sent[-1] == "Status set.\n"
+    server.sent.clear()
+    process_commands(server, ada, f"set status {'x' * 21}")  # type: ignore[arg-type]
+    assert server.sent == ["A status is at most 20 characters.\n"]
     assert user.status == "in a meeting"
-    host.sent.clear()
-    process_commands(host, ada, "status")  # type: ignore[arg-type]
+    server.sent.clear()
+    process_commands(server, ada, "set status")  # type: ignore[arg-type]
     assert user.status == ""
-    assert host.sent == ["Status cleared.\n"]
-    host.sent.clear()
-    process_commands(host, ada, "status busy")  # type: ignore[arg-type]
-    host.sent.clear()
-    process_commands(host, ada, "examine me")  # type: ignore[arg-type]
-    lines = host.sent[0].splitlines()
+    assert server.sent == ["Status cleared.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "set status busy")  # type: ignore[arg-type]
+    server.sent.clear()
+    process_commands(server, ada, "examine me")  # type: ignore[arg-type]
+    lines = server.sent[0].splitlines()
     rank_index = next(i for i, line in enumerate(lines) if line.startswith("  User Rank"))
     status_index = next(i for i, line in enumerate(lines) if line.startswith("  Status"))
     assert status_index == rank_index + 1
     assert "busy" in lines[status_index]
-    host.sent.clear()
-    process_commands(host, ada, "status")  # type: ignore[arg-type]
-    host.sent.clear()
-    process_commands(host, ada, "examine me")  # type: ignore[arg-type]
-    assert "  Status" not in host.sent[0]
-    host.sent.clear()
-    process_commands(host, ada, "status on call")  # type: ignore[arg-type]
-    host.sent.clear()
-    process_commands(host, ada, "who")  # type: ignore[arg-type]
-    who_header = host.sent[0].splitlines()[1]
+    server.sent.clear()
+    process_commands(server, ada, "set status")  # type: ignore[arg-type]
+    server.sent.clear()
+    process_commands(server, ada, "examine me")  # type: ignore[arg-type]
+    assert "  Status" not in server.sent[0]
+    server.sent.clear()
+    process_commands(server, ada, "set status on call")  # type: ignore[arg-type]
+    server.sent.clear()
+    process_commands(server, ada, "who")  # type: ignore[arg-type]
+    who_header = server.sent[0].splitlines()[1]
     who_cols = ("Name", "Rank", "Room", "Status", "Idle")
-    assert [who_header.index(name) for name in who_cols] == sorted(
-        who_header.index(name) for name in who_cols
-    )
-    host.sent.clear()
-    process_commands(host, ada, "lsu")  # type: ignore[arg-type]
-    lsu_header = host.sent[0].splitlines()[1]
-    assert [lsu_header.index(name) for name in who_cols] == sorted(
-        lsu_header.index(name) for name in who_cols
-    )
-    _save(tmp_path, "Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_RESIDENT)
-    host.people = [bea]
+    assert [who_header.index(name) for name in who_cols] == sorted(who_header.index(name) for name in who_cols)
+    server.sent.clear()
+    process_commands(server, ada, "lsu")  # type: ignore[arg-type]
+    lsu_header = server.sent[0].splitlines()[1]
+    assert [lsu_header.index(name) for name in who_cols] == sorted(lsu_header.index(name) for name in who_cols)
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    server.people = [bea]
     path = player_path(tmp_path, "Bea")
-    process_commands(host, bea, "status meeting")  # type: ignore[arg-type]
+    process_commands(server, bea, "set status meeting")  # type: ignore[arg-type]
     assert "status" not in path.read_text(encoding="utf-8")
 
 
 def test_load_profile_copies_a_saved_description(tmp_path: Path) -> None:
     """A saved player enters with the description from the file."""
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4), description="Hello"),
-    )
-    host = _login_host(tmp_path)
-    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_RESIDENT)
-    entry_api._load_profile(host, user)  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), description="Hello"))
+    server = login_host(tmp_path)
+    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    entry_api.load_profile(server, user)  # type: ignore[arg-type]
     assert user.description == "Hello"
 
 
 def test_load_profile_copies_a_saved_entermsg(tmp_path: Path) -> None:
     """A saved player enters with the enter message from the file."""
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            entermsg="crawls into the room",
-        ),
-    )
-    host = _login_host(tmp_path)
-    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_RESIDENT)
-    entry_api._load_profile(host, user)  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), entermsg="crawls into the room"))
+    server = login_host(tmp_path)
+    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    entry_api.load_profile(server, user)  # type: ignore[arg-type]
     assert user.entermsg == "crawls into the room"
 
 
 def test_promote_drops_the_default_description_or_keeps_a_custom_one(tmp_path: Path) -> None:
     """Resident promotion clears I am new here but keeps a typed description."""
-    host = _login_host(tmp_path)
-    default = _newbie("Bea")
+    server = login_host(tmp_path)
+    default = newbie("Bea")
     assert default.player is not None
     default.player.description = "I am new here"
-    ada = _staff("Ada", RANK_SUPER)
-    host.people = [default, ada]
-    process_commands(host, ada, "resident Bea")  # type: ignore[arg-type]
-    process_input(host, default, "hunter2")  # type: ignore[arg-type]
-    process_input(host, default, "hunter2")  # type: ignore[arg-type]
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [default, ada]
+    process_commands(server, ada, "resident Bea")  # type: ignore[arg-type]
+    process_input(server, default, "hunter2")  # type: ignore[arg-type]
+    process_input(server, default, "hunter2")  # type: ignore[arg-type]
     assert default.player.description == ""
     path = player_path(tmp_path, "Bea")
     assert "description" not in path.read_text(encoding="utf-8")
 
-    custom = _newbie("Cyd")
+    custom = newbie("Cyd")
     assert custom.player is not None
     custom.player.description = "Hello"
-    host.people = [custom, ada]
-    process_commands(host, ada, "resident Cyd")  # type: ignore[arg-type]
-    process_input(host, custom, "hunter2")  # type: ignore[arg-type]
-    process_input(host, custom, "hunter2")  # type: ignore[arg-type]
+    server.people = [custom, ada]
+    process_commands(server, ada, "resident Cyd")  # type: ignore[arg-type]
+    process_input(server, custom, "hunter2")  # type: ignore[arg-type]
+    process_input(server, custom, "hunter2")  # type: ignore[arg-type]
     assert "description: Hello" in player_path(tmp_path, "Cyd").read_text(encoding="utf-8")
-
-    host = _login_host(tmp_path, opened=False)
-    admin = _Player(player=None)
-    process_input(host, admin, "admin")  # type: ignore[arg-type]
-    process_input(host, admin, "secret")  # type: ignore[arg-type]
-    process_input(host, admin, "secret")  # type: ignore[arg-type]
-    assert "description" not in player_path(tmp_path, "admin").read_text(encoding="utf-8")
 
 
 def test_colour_reports_and_sets_on_and_off() -> None:
     """Bare colour reports the choice. on and off set it. ON is syntax."""
-    newbie, _player = _run("colour")
+    newbie, _ = run("colour")
     assert newbie.sent == ["Colour is on.\n"]
-    turned, player = _run("colour off")
+    turned, player = run("colour off")
     assert turned.sent == ["Colour is off.\n"]
     assert player.player is not None
     assert player.player.colour is False
-    back, player = _run("color on", player)
+    back, player = run("color on", player)
     assert back.sent == ["Colour is on.\n"]
     assert player.player is not None
     assert player.player.colour is True
-    bad, _player = _run("colour ON")
+    bad, _ = run("colour ON")
     assert bad.sent == ["Syntax: colour on|off\n"]
-    extra, _player = _run("colour off please")
+    extra, _ = run("colour off please")
     assert extra.sent == ["Syntax: colour on|off\n"]
-    glued, _player = _run("coloron")
+    glued, _ = run("coloron")
     assert glued.sent == ["No such command 'coloron'\n"]
-    helped, _player = _run("help colour")
+    helped, _ = run("help colour")
     assert "Turn colour on or off" in helped.sent[0]
-    helped, _player = _run("help color")
+    helped, _ = run("help color")
     assert "Turn colour on or off" in helped.sent[0]
 
 
 def test_colour_off_is_written_and_on_removes_the_key(tmp_path: Path) -> None:
     """A saved player keeps off in the file, and on removes that key."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_RESIDENT)
-    host.people = [bea]
-    process_commands(host, bea, "colour off")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    server.people = [bea]
+    process_commands(server, bea, "colour off")  # type: ignore[arg-type]
     path = player_path(tmp_path, "bea")
     saved = load_saved(path)
     assert saved is not None
     assert saved.colour is False
     assert "colour: false" in path.read_text(encoding="utf-8")
-    host.sent.clear()
-    process_commands(host, bea, "colour on")  # type: ignore[arg-type]
+    server.sent.clear()
+    process_commands(server, bea, "colour on")  # type: ignore[arg-type]
     saved = load_saved(path)
     assert saved is not None
     assert saved.colour is True
     assert "colour" not in path.read_text(encoding="utf-8")
 
 
-def test_a_failed_colour_write_still_changes_the_live_choice(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_failed_colour_write_still_changes_the_live_choice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The player is told the choice even when the file cannot be written."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_RESIDENT)
-    host.people = [bea]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    server.people = [bea]
 
-    def fail(*_args: object, **_kwargs: object) -> None:
+    def fail(*args: object, **kwargs: object) -> None:
         raise OSError("disk full")
 
-    monkeypatch.setattr(command_api, "save_player", fail)
-    process_commands(host, bea, "colour off")  # type: ignore[arg-type]
-    assert host.sent == ["Colour is off.\n"]
+    monkeypatch.setattr(newbie_api, "save_player", fail)
+    process_commands(server, bea, "colour off")  # type: ignore[arg-type]
+    assert server.sent == ["Colour is off.\n"]
     assert bea.player is not None
     assert bea.player.colour is False
 
 
 def test_a_newbie_colour_off_is_stored_on_resident(tmp_path: Path) -> None:
     """Becoming a resident writes the colour chosen on this visit."""
-    host = _login_host(tmp_path)
+    server = login_host(tmp_path)
     user = Player("Bea", "hall", datetime.now(timezone.utc), colour=False)
-    bea = _Player(name="Bea", room="hall", player=user)
-    host.people = [bea]
-    password_api._promote_to_resident(host, bea, "secret")  # type: ignore[arg-type]
+    bea = FakePlayer(name="Bea", room="hall", player=user)
+    server.people = [bea]
+    password_api.promote_to_resident(server, bea, "secret")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "bea"))
     assert saved is not None
-    assert saved.rank == RANK_RESIDENT
+    assert saved.rank == Rank.RESIDENT
     assert saved.colour is False
     assert "colour: false" in player_path(tmp_path, "bea").read_text(encoding="utf-8")
 
 
 def test_quit() -> None:
-    """Quit says goodbye and asks the host to drop the player."""
-    host, _player = _run("quit")
-    assert host.sent == ["Goodbye!\n"]
-    assert host.room_lines == []
-    assert host.dropped is True
+    """Quit says goodbye and asks the server to drop the player."""
+    server, _ = run("quit")
+    assert server.sent == ["Goodbye!\n"]
+    assert server.room_lines == []
+    assert server.dropped is True
 
 
-@pytest.mark.parametrize(
-    ("text", "code"),
-    [
-        ("n", "n"),
-        ("north", "n"),
-        ("west", "w"),
-        ("w", "w"),
-        ("north-west", "nw"),
-        ("north west", "nw"),
-        ("south east", "se"),
-        ("up", "up"),
-        ("down", "down"),
-    ],
-)
+@pytest.mark.parametrize(("text", "code"), [("n", "n"), ("north", "n"), ("west", "w"), ("w", "w"), ("north-west", "nw"), ("north west", "nw"), ("south east", "se"), ("up", "up"), ("down", "down"),])  # fmt: skip  # noqa: E501
 def test_parse_direction(text: str, code: str) -> None:
     """Short and long direction words share one code."""
     assert parse_direction(text) == code
@@ -1324,88 +1681,571 @@ def test_parse_direction_rejects_unknown_words() -> None:
 
 def test_go_without_a_direction() -> None:
     """Go alone explains the syntax."""
-    host, player = _run("go")
-    assert host.sent == ["Syntax: go <direction>\n"]
+    server, player = run("go")
+    assert server.sent == ["Syntax: go <direction>\n"]
     assert player.room == "reception"
 
 
 def test_go_unknown_direction() -> None:
     """An unknown remainder is quoted back."""
-    host, player = _run("go sideways")
-    assert host.sent == ["No such direction 'sideways'.\n"]
+    server, player = run("go sideways")
+    assert server.sent == ["No such direction 'sideways'.\n"]
     assert player.room == "reception"
 
 
 def test_go_collapses_whitespace() -> None:
     """North west is one direction."""
-    host, player = _run("go north   west")
+    server, player = run("go north   west")
     assert player.room == "hall"
-    assert "Ada goes north-west to Hall.\n" in host.room_lines
+    assert "Ada goes north-west to Hall.\n" in server.room_lines
 
 
 def test_go_uses_the_destination_enter_sentence() -> None:
     """People left behind hear the room being entered."""
-    host = _Host()
-    host._layout = Layout(
-        rooms={
-            "reception": Room("The desk.", 4, {"nw": "hall"}),
-            "hall": Room("A hall.", 4, {}, "opens the door and enters the hall"),
-        }
-    )
-    ada = _Player()
-    process_commands(host, ada, "go nw")  # type: ignore[arg-type]
-    assert "Ada opens the door and enters the hall.\n" in host.room_lines
-    assert "Ada goes north-west to Hall.\n" not in host.room_lines
+    server = FakeServer()
+    server.layout = Layout(rooms={"reception": Room("The desk.", 4, {"nw": "hall"}), "hall": Room("A hall.", 4, {}, "opens the door and enters the hall"),})  # fmt: skip  # noqa: E501
+    ada = FakePlayer()
+    process_commands(server, ada, "go nw")  # type: ignore[arg-type]
+    assert "Ada opens the door and enters the hall.\n" in server.room_lines
+    assert "Ada goes north-west to Hall.\n" not in server.room_lines
 
 
 def test_go_announces_the_player_enter_message() -> None:
     """The destination hears the player's sentence, not a direction."""
     user = Player("Ada", "reception", datetime.now(timezone.utc), entermsg="crawls into the room")
-    ada = _Player(player=user)
-    host = _Host(people=[ada])
-    process_commands(host, ada, "go nw")  # type: ignore[arg-type]
-    assert "Ada crawls into the room.\n" in host.room_lines
-    assert "Ada arrives from the south-east.\n" not in host.room_lines
+    ada = FakePlayer(player=user)
+    server = FakeServer(people=[ada])
+    process_commands(server, ada, "go nw")  # type: ignore[arg-type]
+    assert "Ada crawls into the room.\n" in server.room_lines
+    assert "Ada arrives from the south-east.\n" not in server.room_lines
 
 
 def test_join_says_who_they_went_to_join() -> None:
     """Join names the player, not the room sentence."""
-    bea = _Player(name="Bea", room="hall")
-    host = _Host(people=[bea])
-    host._layout = Layout(
-        rooms={
-            "reception": Room("The desk.", 4, {"nw": "hall"}),
-            "hall": Room("A hall.", 4, {}, "opens the door and enters the hall"),
-        }
-    )
-    ada = _Player()
-    process_commands(host, ada, "join Bea")  # type: ignore[arg-type]
-    assert host.room_lines[0] == "Ada goes to join Bea.\n"
+    bea = FakePlayer(name="Bea", room="hall")
+    server = FakeServer(people=[bea])
+    server.layout = Layout(rooms={"reception": Room("The desk.", 4, {"nw": "hall"}), "hall": Room("A hall.", 4, {}, "opens the door and enters the hall"),})  # fmt: skip  # noqa: E501
+    ada = FakePlayer()
+    process_commands(server, ada, "join Bea")  # type: ignore[arg-type]
+    assert server.room_lines[0] == "Ada goes to join Bea.\n"
 
 
 def test_main_uses_the_start_room_enter_sentence() -> None:
     """Main speaks the start room's sentence to the room being left."""
-    ada = _Player(room="hall")
-    host = _Host(people=[ada])
-    host._layout = Layout(
-        rooms={
-            "reception": Room("The desk.", 4, {"nw": "hall"}, "walks back to the desk"),
-            "hall": Room("A hall.", 4, {}),
-        }
-    )
-    process_commands(host, ada, "main")  # type: ignore[arg-type]
-    assert host.room_lines[0] == "Ada walks back to the desk.\n"
+    ada = FakePlayer(room="hall")
+    server = FakeServer(people=[ada])
+    server.layout = Layout(rooms={"reception": Room("The desk.", 4, {"nw": "hall"}, "walks back to the desk"), "hall": Room("A hall.", 4, {}),})  # fmt: skip  # noqa: E501
+    process_commands(server, ada, "main")  # type: ignore[arg-type]
+    assert server.room_lines[0] == "Ada walks back to the desk.\n"
 
 
 def test_map_sends_the_map() -> None:
     """Map with no remainder sends the centered map to the player only."""
-    host, player = _run("map")
-    assert host.room_lines == []
+    server, player = run("map")
+    assert server.room_lines == []
     width = frame_width(player.discovered_columns, player.frame_columns)
     colour_on = player.player is not None and player.player.colour
-    drawn = host._layout.map_text(player.room, width, colour=colour_on)
-    assert host.sent[0] == f"\n\n{center_block(drawn, width)}\n"
-    assert green("Reception") in host.sent[0]
+    drawn = server.layout.map_text(player.room, width, colour=colour_on)
+    assert server.sent[0] == f"\n\n{center_block(drawn, width)}\n"
+    assert green("Reception") in server.sent[0]
+
+
+def test_home_creates_the_room_and_tells_only_the_room_they_left(tmp_path: Path) -> None:
+    """The first home is saved, and only the room being left hears the leave line."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save(players, "Ada", Rank.RESIDENT)
+    save(players, "Bea", Rank.RESIDENT)
+    save(players, "Cyd", Rank.RESIDENT)
+    ada = staff("Ada", Rank.RESIDENT)
+    bea = FakePlayer(name="Bea", room="reception", player=Player("Bea", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    cyd = FakePlayer(name="Cyd", room="hall", player=Player("Cyd", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    server = login_host(tmp_path)
+    server.roster_dir = players
+    server.config = replace(server.config, rooms=tmp_path / "system.yml", players=players)
+    server.people = [ada, bea, cyd]
+    process_commands(server, ada, "home")  # type: ignore[arg-type]
+    assert ada.room == "ada_home"
+    assert "ada_home" in server.layout.rooms
+    assert bea.sent == ["Ada goes home.\n"]
+    assert cyd.sent == []
+    assert "Ada goes home.\n" not in ada.sent
+    assert server.sent[0] == "Your home has been created.\n"
+    assert server.sent[-1] == "You are home.\n\nNobody else is here.\n\nExits: none.\n"
+    stored = load_saved(player_path(players, "Ada"))
+    assert stored is not None
+    assert stored.home is True
+    assert stored.home_login is False
+
+    server.sent.clear()
+    process_commands(server, ada, "home")  # type: ignore[arg-type]
+    assert server.sent == ["You are already home.\n"]
+    assert bea.sent == ["Ada goes home.\n"]
+
+
+def test_home_writes_the_house_file_and_map_draws_it(tmp_path: Path) -> None:
+    """The first home writes ada.yml, and map names the room Home."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save(players, "Ada", Rank.RESIDENT)
+    ada = staff("Ada", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    server.roster_dir = players
+    server.config = replace(server.config, rooms=tmp_path / "system.yml", players=players)
+    server.people = [ada]
+    process_commands(server, ada, "home")  # type: ignore[arg-type]
+    written = (tmp_path / "ada.yml").read_text(encoding="utf-8")
+    assert "ada_home:" in written
+    assert ada.room == "ada_home"
+    assert server.sent[0] == "Your home has been created.\n"
+    server.sent.clear()
+    process_commands(server, ada, "map")  # type: ignore[arg-type]
+    assert "Home" in server.sent[-1]
+    assert "Surely you know the layout?" not in server.sent[-1]
+
+
+def test_home_login_on_writes_a_missing_house_when_home_is_set(tmp_path: Path) -> None:
+    """A missing house file is written when home is already true, and the player stays put."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save_player(players, SavedPlayer("Ada", Rank.RESIDENT, hash_password("pw", rounds=4), home=True))
+    ada = staff("Ada", Rank.RESIDENT)
+    server = login_host(players)
+    server.config = replace(server.config, rooms=tmp_path / "system.yml", players=players)
+    server.people = [ada]
+    process_commands(server, ada, "set login home")  # type: ignore[arg-type]
+    assert (tmp_path / "ada.yml").is_file()
+    assert ada.room == "reception"
+    assert server.sent == ["You will login to your home room.\n"]
+    stored = load_saved(player_path(players, "Ada"))
+    assert stored is not None
+    assert stored.home is True
+    assert stored.home_login is True
+
+
+def test_set_login_reports_and_chooses_home_or_main(tmp_path: Path) -> None:
+    """Set login reports the choice. home and main are exact. Old plan is unknown."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save(players, "Ada", Rank.RESIDENT)
+    ada = staff("Ada", Rank.RESIDENT)
+    ada.frame_columns = 120
+    server = login_host(tmp_path)
+    server.roster_dir = players
+    server.config = replace(server.config, rooms=tmp_path / "system.yml", players=players)
+    server.people = [ada]
+    process_commands(server, ada, "set login")  # type: ignore[arg-type]
+    assert server.sent == ["You will login to the main room.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "set Login")  # type: ignore[arg-type]
+    assert server.sent == ["You will login to the main room.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "set login home")  # type: ignore[arg-type]
+    assert server.sent == ["Your home has been created. You will login to your home room.\n"]
+    assert ada.room == "reception"
+    server.sent.clear()
+    process_commands(server, ada, "set login")  # type: ignore[arg-type]
+    assert server.sent == ["You will login to your home room.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "set login main")  # type: ignore[arg-type]
+    assert server.sent == ["You will login to the main room.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "set login Home")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: set login home|main\n"]
+    server.sent.clear()
+    process_commands(server, ada, "set login home now")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: set login home|main\n"]
+    server.sent.clear()
+    process_commands(server, ada, "plan later")  # type: ignore[arg-type]
+    assert server.sent == ["No such command 'plan'\n"]
+    server.sent.clear()
+    process_commands(server, ada, "set plan")  # type: ignore[arg-type]
+    assert server.sent == ["Plan cleared.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "set Prompt")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: set prompt <prompt>\n"]
+    server.sent.clear()
+    process_commands(server, ada, "set commands")  # type: ignore[arg-type]
+    assert server.sent == ["Subcommands available:\nauto_reply commands description entermsg login loginmsg logoutmsg plan prompt status\n"]
+    server.sent.clear()
+    process_commands(server, ada, "home login")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: home\n"]
+
+
+def test_home_refuses_a_house_path_that_is_the_office(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Home refuses a house path that is the office file and leaves the player where they are."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save(players, "System", Rank.RESIDENT)
+    office = tmp_path / "rooms" / "system.yml"
+    office.parent.mkdir()
+    text = "reception:\n  description: The desk.\n  max_occupancy: 2\n  exits: {}\n"
+    office.write_text(text, encoding="utf-8")
+    system = staff("System", Rank.RESIDENT)
+    server = login_host(players)
+    server.config = replace(server.config, rooms=office, help=tmp_path / "help.yml", players=players)
+    server.layout = load_layout(office).with_void()
+    server.people = [system]
+    process_commands(server, system, "home")  # type: ignore[arg-type]
+    assert capsys.readouterr().out == ""
+    assert server.sent == ["Cannot read your home.\n"]
+    assert system.room == "reception"
+    assert office.read_text(encoding="utf-8") == text
+    stored = load_saved(player_path(players, "System"))
+    assert stored is not None
+    assert stored.home is False
+
+
+def test_home_login_reports_and_sets_the_next_fresh_login(tmp_path: Path) -> None:
+    """Login on creates a missing home and does not move the player."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save(players, "Ada", Rank.RESIDENT)
+    ada = staff("Ada", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    server.roster_dir = players
+    server.config = replace(server.config, rooms=tmp_path / "system.yml", players=players)
+    server.people = [ada]
+    process_commands(server, ada, "set login")  # type: ignore[arg-type]
+    assert server.sent == ["You will login to the main room.\n"]
+    assert ada.room == "reception"
+
+    server.sent.clear()
+    process_commands(server, ada, "set login home")  # type: ignore[arg-type]
+    assert server.sent == ["Your home has been created. You will login to your home room.\n"]
+    assert ada.room == "reception"
+    stored = load_saved(player_path(players, "Ada"))
+    assert stored is not None
+    assert stored.home is True
+    assert stored.home_login is True
+
+    server.sent.clear()
+    process_commands(server, ada, "set login home")  # type: ignore[arg-type]
+    assert server.sent == ["You will login to your home room.\n"]
+
+    server.sent.clear()
+    process_commands(server, ada, "set login main")  # type: ignore[arg-type]
+    assert server.sent == ["You will login to the main room.\n"]
+    stored = load_saved(player_path(players, "Ada"))
+    assert stored is not None
+    assert stored.home is True
+    assert stored.home_login is False
+
+    server.sent.clear()
+    process_commands(server, ada, "home sideways")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: home\n"]
+
+
+def test_a_fresh_login_starts_at_home_when_the_flag_is_on(tmp_path: Path) -> None:
+    """home_login puts a new session in the home. Reconnect stays where it was."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save_player(players, SavedPlayer("Ada", Rank.RESIDENT, hash_password("pw", rounds=4), home=True, home_login=True))
+    server = login_host(tmp_path)
+    server.roster_dir = players
+    server.config = replace(server.config, rooms=tmp_path / "system.yml", players=players)
+    write_default_house(server.config.rooms, "Ada")
+    bea = staff("Bea", Rank.RESIDENT)
+    server.people = [bea]
+    ada = FakePlayer(player=None)
+    enter(server, ada, "Ada", Rank.RESIDENT)  # type: ignore[arg-type]
+    assert ada.player is not None
+    assert ada.player.room == "ada_home"
+    assert "ada_home" in server.layout.rooms
+    assert any(line.startswith("You are home.") for line in ada.sent)
+    assert "Ada has connected.\n" not in bea.sent
+
+    live = staff("Bea", Rank.RESIDENT)
+    live.room = "hall"
+    assert live.player is not None
+    live.player.room = "hall"
+    save_player(players, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), home=True, home_login=True))
+    server.people = [live]
+    newcomer = FakePlayer(player=None)
+    held = load_saved(player_path(players, "Bea"))
+    assert held is not None
+    enter_fresh(server, newcomer, held)  # type: ignore[arg-type]
+    assert live.player.room == "hall"
+
+
+def test_login_demotes_an_unknown_rank_and_tells_site_admins(tmp_path: Path) -> None:
+    """A file word of super becomes resident, and both notices go out."""
+    players = tmp_path / "players"
+    players.mkdir()
+    path = player_path(players, "Bea")
+    path.write_text("name: Bea\nlowercase_name: bea\nrank: super\npassword: x\nroles: 1\n", encoding="utf-8")
+    save_player(players, SavedPlayer("Ada", Rank.RESIDENT, hash_password("pw", rounds=4), roles=int(Roles.SITE_ADMIN)))
+    server = login_host(tmp_path, super_admin=None)
+    server.roster_dir = players
+    server.config = replace(server.config, players=players)
+    ada = staff("Ada", Rank.RESIDENT)
+    ada.player.roles = int(Roles.SITE_ADMIN)
+    cyd = staff("Cyd", Rank.RESIDENT)
+    bea = FakePlayer(player=None)
+    server.people = [ada, cyd, bea]
+    enter(server, bea, "Bea", Rank.RESIDENT)  # type: ignore[arg-type]
+    loaded = load_saved(path)
+    assert loaded is not None
+    assert loaded.rank is Rank.RESIDENT
+    assert loaded.unknown_rank is None
+    assert loaded.roles == 1
+    assert "rank: resident\n" in path.read_text(encoding="utf-8")
+    personal = "You logged in with an unknown rank 'super' and have been auto-demoted to 'resident'.\n"
+    issue = "[ Issue Located ] Bea logged in with an unknown rank 'super' and has been auto-demoted to 'resident'.\n"
+    assert personal in bea.sent
+    assert issue in bea.sent
+    assert bea.sent.index(personal) < bea.sent.index(issue)
+    assert issue in ada.sent
+    assert personal not in ada.sent
+    assert issue not in cyd.sent
+    assert personal not in cyd.sent
+
+
+def test_reconnect_demotes_an_unknown_rank(tmp_path: Path) -> None:
+    """Reconnect rewrites an unknown rank and does not repeat the startup warnings."""
+    players = tmp_path / "players"
+    players.mkdir()
+    path = player_path(players, "Bea")
+    path.write_text("name: Bea\nlowercase_name: bea\nrank: super\npassword: x\nroles: 1\n", encoding="utf-8")
+    save_player(players, SavedPlayer("Ada", Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
+    save_player(players, SavedPlayer("Cyd", Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
+    held = load_saved(path)
+    assert held is not None
+    assert held.rank is Rank.RESIDENT
+    assert held.unknown_rank == "super"
+    server = login_host(tmp_path, super_admin=None)
+    server.roster_dir = players
+    server.config = replace(server.config, players=players, obsolete_hot=("admin",))
+    live = staff("Bea", Rank.SUPER_USER)
+    live.room = "hall"
+    assert live.player is not None
+    live.player.room = "hall"
+    live.player.roles = int(Roles.SITE_ADMIN)
+    dee = staff("Dee", Rank.RESIDENT)
+    dee.room = "hall"
+    assert dee.player is not None
+    dee.player.room = "hall"
+    server.people = [live, dee]
+    newcomer = FakePlayer(player=None)
+    enter_fresh(server, newcomer, held)  # type: ignore[arg-type]
+    loaded = load_saved(path)
+    assert loaded is not None
+    assert loaded.rank is Rank.RESIDENT
+    assert loaded.unknown_rank is None
+    assert loaded.roles == 1
+    assert "rank: resident\n" in path.read_text(encoding="utf-8")
+    assert server.replaced == [live]
+    assert live.player.rank is Rank.RESIDENT
+    assert live.player.room == "hall"
+    brief = "A hall.\n\nNobody else is here.\n\nExits: none.\n"
+    personal = "You logged in with an unknown rank 'super' and have been auto-demoted to 'resident'.\n"
+    issue = "[ Issue Located ] Bea logged in with an unknown rank 'super' and has been auto-demoted to 'resident'.\n"
+    prompt = "What? > "
+    assert live.sent.index(brief) < live.sent.index(personal) < live.sent.index(issue) < live.sent.index(prompt)
+    output = "".join([*server.sent, *server.room_lines, *server.staff_lines, *server.admin_lines])
+    assert "There are multi super-admins" not in output
+    assert "Obsolete keys found" not in output
+    assert personal not in dee.sent
+    assert issue not in dee.sent
+
+
+def test_a_failed_demotion_write_sends_no_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The file stays unknown, and nobody is told, when the rewrite fails."""
+    players = tmp_path / "players"
+    players.mkdir()
+    path = player_path(players, "Bea")
+    path.write_text("name: Bea\nlowercase_name: bea\nrank: super\npassword: x\n", encoding="utf-8")
+    server = login_host(tmp_path, super_admin=None)
+    server.roster_dir = players
+    server.config = replace(server.config, players=players)
+
+    def fail_save(directory: Path, player: SavedPlayer) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr("lupaxa.chat_server.entry.save_player", fail_save)
+    bea = FakePlayer(player=None)
+    enter(server, bea, "Bea", Rank.RESIDENT)  # type: ignore[arg-type]
+    assert "rank: super\n" in path.read_text(encoding="utf-8")
+    assert not any("auto-demoted" in line for line in bea.sent)
+    assert bea.player is not None
+    assert bea.player.rank is Rank.RESIDENT
+
+
+def test_login_issues_reach_only_the_site_admin_who_entered(tmp_path: Path) -> None:
+    """A resident and a site admin who is already inside do not hear the entering site admin's copy."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save_player(players, SavedPlayer("Ada", Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
+    save_player(players, SavedPlayer("Bea", Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
+    save_player(players, SavedPlayer("Cyd", Rank.RESIDENT, hash_password("pw", rounds=4), roles=int(Roles.SITE_ADMIN)))
+    server = login_host(tmp_path, super_admin=None)
+    server.roster_dir = players
+    server.config = replace(server.config, players=players, obsolete_hot=("admin", "colour"))
+    dee = staff("Dee", Rank.RESIDENT)
+    assert dee.player is not None
+    dee.player.roles = int(Roles.SITE_ADMIN)
+    resident = staff("Eve", Rank.RESIDENT)
+    server.people = [dee, resident]
+    cyd = FakePlayer(player=None)
+    enter(server, cyd, "Cyd", Rank.RESIDENT)  # type: ignore[arg-type]
+    keys = "[ Issue Located ] Obsolete keys found in hot.yml: admin & colour. Please remove them.\n"
+    admins = "[ Issue Located ] There are multi super-admins 'Ada & Bea' - this needs to be resolved before the next restart.\n"
+    assert keys in cyd.sent
+    assert admins in cyd.sent
+    assert keys not in dee.sent
+    assert admins not in dee.sent
+    assert keys not in resident.sent
+    assert admins not in resident.sent
+
+
+def test_a_site_admin_hears_issues_when_login_places_them(tmp_path: Path) -> None:
+    """The site-admin role hears each startup problem once, on the first room placement."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save_player(players, SavedPlayer("Ada", Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
+    save_player(players, SavedPlayer("Bea", Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
+    save_player(players, SavedPlayer("Cyd", Rank.RESIDENT, hash_password("pw", rounds=4), roles=int(Roles.SITE_ADMIN)))
+    server = login_host(tmp_path, super_admin=None)
+    server.roster_dir = players
+    server.config = replace(server.config, players=players, obsolete_hot=("admin",))
+    cyd = FakePlayer(player=None)
+    enter(server, cyd, "Cyd", Rank.RESIDENT)  # type: ignore[arg-type]
+    issues = [line for line in cyd.sent if line.startswith("[ Issue Located ]")]
+    assert issues == [
+        "[ Issue Located ] There are multi super-admins 'Ada & Bea' - this needs to be resolved before the next restart.\n",
+        "[ Issue Located ] Obsolete keys found in hot.yml: admin. Please remove them.\n",
+    ]
+    assert cyd.player is not None
+    assert cyd.player.roles == int(Roles.SITE_ADMIN)
+    assert cyd.player.room == "reception"
+    cyd.name = cyd.player.name
+    cyd.room = cyd.player.room
+    server.people = [cyd]
+    cyd.sent.clear()
+    process_commands(server, cyd, "go nw")  # type: ignore[arg-type]
+    assert cyd.room == "hall"
+    assert [line for line in cyd.sent if line.startswith("[ Issue Located ]")] == []
+
+
+def test_a_site_admin_login_survives_a_malformed_roster_file(tmp_path: Path) -> None:
+    """A bad player file does not stop login; the obsolete-key line is still sent."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save_player(players, SavedPlayer("Ada", Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
+    save_player(players, SavedPlayer("Bea", Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
+    save_player(players, SavedPlayer("Cyd", Rank.RESIDENT, hash_password("pw", rounds=4), roles=int(Roles.SITE_ADMIN)))
+    (players / "cora.yml").write_text("- not a mapping\n", encoding="utf-8")
+    server = login_host(tmp_path, super_admin=None)
+    server.roster_dir = players
+    server.config = replace(server.config, players=players, obsolete_hot=("admin",))
+    cyd = FakePlayer(player=None)
+    enter(server, cyd, "Cyd", Rank.RESIDENT)  # type: ignore[arg-type]
+    assert cyd.player is not None
+    assert cyd.player.roles == int(Roles.SITE_ADMIN)
+    issues = [line for line in cyd.sent if line.startswith("[ Issue Located ]")]
+    assert issues == [
+        "[ Issue Located ] Obsolete keys found in hot.yml: admin. Please remove them.\n",
+    ]
+
+
+def test_a_rank_admin_without_the_site_admin_role_hears_no_issues(tmp_path: Path) -> None:
+    """Rank Admin with roles omitted hears neither startup problem."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save_player(players, SavedPlayer("Ada", Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
+    save_player(players, SavedPlayer("Bea", Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
+    save_player(players, SavedPlayer("Cyd", Rank.ADMIN, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path, super_admin=None)
+    server.roster_dir = players
+    server.config = replace(server.config, players=players, obsolete_hot=("admin",))
+    cyd = FakePlayer(player=None)
+    enter(server, cyd, "Cyd", Rank.ADMIN)  # type: ignore[arg-type]
+    assert cyd.player is not None
+    assert cyd.player.roles == 0
+    assert [line for line in cyd.sent if line.startswith("[ Issue Located ]")] == []
+
+
+def test_an_obsolete_hot_key_uses_the_hot_file_name(tmp_path: Path) -> None:
+    """The issue line names hot.yml for a leftover key stored on the hot side."""
+    from lupaxa.chat_server.entry import issue_lines
+
+    server = FakeServer()
+    server.roster_dir = tmp_path
+    server.config = replace(server.config, hot_path=Path("hot.yml"), obsolete_hot=("admin",), obsolete_cold=())
+    assert issue_lines(server) == ("[ Issue Located ] Obsolete keys found in hot.yml: admin. Please remove them.\n",)  # type: ignore[arg-type]
+
+
+def test_map_at_home_draws_the_house() -> None:
+    """Map in a home draws the room named Home."""
+    ada = staff("Ada", Rank.RESIDENT)
+    ada.room = "ada_home"
+    server = FakeServer(people=[ada])
+    server.layout = server.layout.with_house("Ada", {house_room_id("Ada"): Room("You are home.", 1, {})})
+    process_commands(server, ada, "map")  # type: ignore[arg-type]
+    assert "Home" in server.sent[-1]
+    process_commands(server, ada, "map please")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Syntax: map\n"
+
+
+def test_a_newbie_has_no_home_command() -> None:
+    """Home is resident and above."""
+    server, _ = run("home")
+    assert server.sent == ["No such command 'home'\n"]
+
+
+def test_main_from_home_uses_the_start_room_line() -> None:
+    """Main from home is the same move it is from any other room."""
+    ada = staff("Ada", Rank.RESIDENT)
+    ada.room = "ada_home"
+    assert ada.player is not None
+    ada.player.room = "ada_home"
+    bea = FakePlayer(name="Bea", room="ada_home", player=Player("Bea", "ada_home", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    server = FakeServer(people=[ada, bea])
+    server.layout = server.layout.with_house("Ada", {house_room_id("Ada"): Room("You are home.", 1, {})})
+    process_commands(server, ada, "main")  # type: ignore[arg-type]
+    assert ada.room == "reception"
+    assert any("The desk." in line for line in ada.sent)
+    assert "Ada goes to Reception.\n" in bea.sent
+
+
+def test_who_shows_home() -> None:
+    """A resident at home is listed as Home."""
+    ada = staff("Ada", Rank.RESIDENT)
+    ada.room = "ada_home"
+    assert ada.player is not None
+    ada.player.room = "ada_home"
+    server = FakeServer(people=[ada])
+    server.layout = server.layout.with_house("Ada", {house_room_id("Ada"): Room("You are home.", 1, {})})
+    process_commands(server, ada, "who")  # type: ignore[arg-type]
+    assert any("Home" in line and "Reception" not in line for line in server.sent)
+
+
+def test_go_from_home_has_no_exit() -> None:
+    """A home has no exits."""
+    ada = staff("Ada", Rank.RESIDENT)
+    ada.room = "ada_home"
+    server = FakeServer(people=[ada])
+    server.layout = server.layout.with_house("Ada", {house_room_id("Ada"): Room("You are home.", 1, {})})
+    process_commands(server, ada, "go n")  # type: ignore[arg-type]
+    assert server.sent == ["You cannot go north.\n"]
+    assert ada.room == "ada_home"
+
+
+def test_shout_reaches_a_home_and_say_stays_in_the_office() -> None:
+    """Room speech stays put. A shout still arrives."""
+    ada = staff("Ada", Rank.RESIDENT)
+    ada.room = "ada_home"
+    assert ada.player is not None
+    ada.player.room = "ada_home"
+    ada.player.colour = False
+    bea = FakePlayer(name="Bea", room="reception", player=Player("Bea", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT, colour=False))
+    server = FakeServer(people=[ada, bea])
+    server.layout = server.layout.with_house("Ada", {house_room_id("Ada"): Room("You are home.", 1, {})})
+    process_commands(server, bea, "say hello")  # type: ignore[arg-type]
+    assert not any("hello" in line for line in ada.sent)
+    ada.sent.clear()
+    process_commands(server, bea, "shout hello")  # type: ignore[arg-type]
+    assert "! Bea shouts 'hello'\n" in ada.sent
 
 
 def test_center_block_uses_the_widest_line() -> None:
@@ -1416,342 +2256,584 @@ def test_center_block_uses_the_widest_line() -> None:
 
 def test_map_centers_on_the_manual_width() -> None:
     """A chosen term width is the width the map is centered in."""
-    player = _Player(discovered_columns=40, frame_columns=60)
-    host, player = _run("map", player)
+    player = FakePlayer(discovered_columns=40, frame_columns=60)
+    server, player = run("map", player)
     width = frame_width(player.discovered_columns, player.frame_columns)
     colour_on = player.player is not None and player.player.colour
-    drawn = host._layout.map_text(player.room, width, colour=colour_on)
-    assert host.sent[0] == f"\n\n{center_block(drawn, width)}\n"
+    drawn = server.layout.map_text(player.room, width, colour=colour_on)
+    assert server.sent[0] == f"\n\n{center_block(drawn, width)}\n"
 
 
 def test_question_mark_is_help() -> None:
-    """Bare help and bare ? reply Syntax: help <topic>. ? say and ?say show the say page."""
-    listed, _player = _run("help")
+    """Bare help replies Syntax: help <topic>. Bare ? replies Syntax: ?<topic>. ? say and ?say show the say page."""
+    listed, _ = run("help")
     assert listed.sent == ["Syntax: help <topic>\n"]
-    asked, _player = _run("?")
-    assert asked.sent == ["Syntax: help <topic>\n"]
-    topic, _player = _run("? say")
+    asked, _ = run("?")
+    assert asked.sent == ["Syntax: ?<topic>\n"]
+    topic, _ = run("? say")
     topic_page = topic.sent[0]
-    assert "Command : say" in topic_page
-    assert "Syntax  : say <message>" in topic_page
-    stuck, _player = _run("?say")
+    assert "Command    : say" in topic_page
+    assert "Syntax     : say <message>" in topic_page
+    stuck, _ = run("?say")
     stuck_page = stuck.sent[0]
-    assert "Command : say" in stuck_page
-    assert "Syntax  : say <message>" in stuck_page
+    assert "Command    : say" in stuck_page
+    assert "Syntax     : say <message>" in stuck_page
 
 
 def test_map_leaves_the_current_room_plain_when_colour_is_off() -> None:
     """Colour off keeps the room name, without a green code."""
-    player = _Player(
-        player=Player("Ada", "reception", datetime.now(timezone.utc), colour=False),
-    )
-    host, _player = _run("map", player)
-    assert "Reception" in host.sent[0]
-    assert green("Reception") not in host.sent[0]
+    player = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), colour=False))
+    server, _ = run("map", player)
+    assert "Reception" in server.sent[0]
+    assert green("Reception") not in server.sent[0]
 
 
 def test_map_rejects_extra_text() -> None:
     """Map does not take a remainder."""
-    host, _player = _run("map please")
-    assert host.sent == ["Syntax: map\n"]
+    server, _ = run("map please")
+    assert server.sent == ["Syntax: map\n"]
 
 
 def test_newbie_cannot_shout() -> None:
     """A newbie is told shout does not exist. A resident still shouts."""
     when = datetime.now(timezone.utc)
-    newbie = _Player(player=Player("Ada", "reception", when, rank="newbie"))
-    host, _player = _run("shout hi", newbie)
-    assert host.sent == ["No such command 'shout'\n"]
-    assert host.all_lines == []
+    newbie = FakePlayer(player=Player("Ada", "reception", when, rank=Rank.NEWBIE))
+    server, _ = run("shout hi", newbie)
+    assert server.sent == ["No such command 'shout'\n"]
+    assert server.all_lines == []
 
-    host, _player = _run("!hi", newbie)
-    assert host.sent == ["No such command '!'\n"]
-    assert host.all_lines == []
+    server, _ = run("!hi", newbie)
+    assert server.sent == ["No such command '!'\n"]
+    assert server.all_lines == []
 
-    host, _player = _run("shout", newbie)
-    assert host.sent == ["No such command 'shout'\n"]
-    host, _player = _run("!", newbie)
-    assert host.sent == ["No such command '!'\n"]
+    server, _ = run("shout", newbie)
+    assert server.sent == ["No such command 'shout'\n"]
+    server, _ = run("!", newbie)
+    assert server.sent == ["No such command '!'\n"]
 
-    resident = _Player(player=Player("Ada", "reception", when, rank=RANK_RESIDENT))
-    host, _player = _run("shout hi", resident)
-    assert host.sent == ["You shout 'hi'\n"]
-    assert host.all_lines == [yellow("! Ada shouts 'hi'") + "\n"]
+    resident = FakePlayer(player=Player("Ada", "reception", when, rank=Rank.RESIDENT))
+    server, _ = run("shout hi", resident)
+    assert server.sent == ["You shout 'hi'\n"]
+    assert server.all_lines == [yellow("! Ada shouts 'hi'") + "\n"]
 
-    newbie_words = command_words(RANK_NEWBIE).split()
+    newbie_words = command_words(Rank.NEWBIE).split()
     assert "shout" not in newbie_words
     assert "!" not in newbie_words
-    resident_words = command_words(RANK_RESIDENT).split()
+    resident_words = command_words(Rank.RESIDENT).split()
     assert "shout" in resident_words
     assert "!" in resident_words
 
 
 def test_help_hides_shout_from_a_newbie() -> None:
     """Help for a command above the player's rank is the same as a missing topic."""
-    book = HelpBook(
-        entries=(
-            HelpEntry("say", ("'",), "Speak."),
-            HelpEntry("shout", ("!",), "Shout to everyone."),
-        )
-    )
+    book = HelpBook(entries=(HelpEntry("say", ("'",), "Speak."), HelpEntry("shout", ("!",), "Shout to everyone.")))
     when = datetime.now(timezone.utc)
-    newbie = _Player(player=Player("Ada", "reception", when, rank="newbie"))
-    host = _Host(_help=book)
-    process_commands(host, newbie, "help shout")  # type: ignore[arg-type]
-    assert host.sent == ["help for shout not found\n"]
+    newbie = FakePlayer(player=Player("Ada", "reception", when, rank=Rank.NEWBIE))
+    server = FakeServer(help=book)
+    process_commands(server, newbie, "help shout")  # type: ignore[arg-type]
+    assert server.sent == ["help for shout not found\n"]
 
-    host = _Host(_help=book)
-    process_commands(host, newbie, "help !")  # type: ignore[arg-type]
-    assert host.sent == ["help for ! not found\n"]
+    server = FakeServer(help=book)
+    process_commands(server, newbie, "help !")  # type: ignore[arg-type]
+    assert server.sent == ["help for ! not found\n"]
 
-    host = _Host(_help=book)
-    process_commands(host, newbie, "help")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: help <topic>\n"]
+    server = FakeServer(help=book)
+    process_commands(server, newbie, "help")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: help <topic>\n"]
 
-    resident = _Player(player=Player("Ada", "reception", when, rank=RANK_RESIDENT))
-    host = _Host(_help=book)
-    process_commands(host, resident, "help shout")  # type: ignore[arg-type]
-    shout_page = host.sent[0]
-    assert "Command : shout" in shout_page
-    assert "Syntax  : shout <message>" in shout_page
-    assert "Aliases : !" in shout_page
+    resident = FakePlayer(player=Player("Ada", "reception", when, rank=Rank.RESIDENT))
+    server = FakeServer(help=book)
+    process_commands(server, resident, "help shout")  # type: ignore[arg-type]
+    shout_page = server.sent[0]
+    assert "Command    : shout" in shout_page
+    assert "Syntax     : shout <message>" in shout_page
+    assert "Aliases    : !" in shout_page
 
-    host = _Host(_help=book)
-    process_commands(host, resident, "help")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: help <topic>\n"]
+    server = FakeServer(help=book)
+    process_commands(server, resident, "help")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: help <topic>\n"]
 
 
 def test_shout_reaches_everyone_and_alias_needs_no_space() -> None:
     """Shout is not limited to the current room. ``!`` needs no space."""
-    resident = _Player(
-        player=Player("Ada", "reception", datetime.now(timezone.utc), rank=RANK_RESIDENT)
-    )
-    host, _player = _run("shout hello there", resident)
-    assert host.sent == ["You shout 'hello there'\n"]
-    assert host.room_lines == []
-    assert host.all_lines == [yellow("! Ada shouts 'hello there'") + "\n"]
+    resident = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    server, _ = run("shout hello there", resident)
+    assert server.sent == ["You shout 'hello there'\n"]
+    assert server.room_lines == []
+    assert server.all_lines == [yellow("! Ada shouts 'hello there'") + "\n"]
 
-    host, _player = _run("!hello", resident)
-    assert host.sent == ["You shout 'hello'\n"]
-    assert host.all_lines == [yellow("! Ada shouts 'hello'") + "\n"]
+    server, _ = run("!hello", resident)
+    assert server.sent == ["You shout 'hello'\n"]
+    assert server.all_lines == [yellow("! Ada shouts 'hello'") + "\n"]
 
-    host, _player = _run("!", resident)
-    assert host.sent == ["Syntax: shout <message>\n"]
-    assert host.all_lines == []
+    server, _ = run("!", resident)
+    assert server.sent == ["Syntax: !<message>\n"]
+    assert server.all_lines == []
+
+
+def test_tell_to_two_people_uses_a_chain() -> None:
+    """Two recipients get a chain prefix, and you replaces the reader's name."""
+    ada = FakePlayer()
+    bea = FakePlayer(name="Bea", room="hall")
+    cyd = FakePlayer(name="Cyd", room="hall")
+    server = FakeServer(people=[ada, bea, cyd])
+    process_commands(server, ada, "tell Bea, Cyd hello")  # type: ignore[arg-type]
+    assert ada.sent == ["(1) You tell Bea & Cyd 'hello'\n"]
+    assert bea.sent == [green("(1) > Ada tells you & Cyd 'hello'") + "\n"]
+    assert cyd.sent == [green("(1) > Ada tells Bea & you 'hello'") + "\n"]
+    assert server.room_lines == []
+    assert len(server.chains) == 1
+
+
+def test_chains_lists_only_your_chains_with_aligned_idle() -> None:
+    """Idle clocks share a column, and a dash rule sits above and below."""
+    ada = FakePlayer()
+    bea = FakePlayer(name="Bea", room="hall")
+    cyd = FakePlayer(name="Cyd", room="hall")
+    dee = FakePlayer(name="Dee", room="hall")
+    server = FakeServer(people=[ada, bea, cyd, dee])
+    process_commands(server, ada, "tell Bea, Cyd hello")  # type: ignore[arg-type]
+    process_commands(server, ada, "tell Bea, Cyd, Dee hello")  # type: ignore[arg-type]
+    server.chains[1].last_message_at = datetime.now(timezone.utc) - timedelta(seconds=724)
+    ada.sent.clear()
+    process_commands(server, ada, "chains")  # type: ignore[arg-type]
+    text = ada.sent[0]
+    lines = text.split("\n")
+    assert lines[0] == "-" * 72
+    assert lines[1].startswith("Chain 1: ")
+    assert lines[1].rstrip().endswith(green("[ Active ]"))
+    assert "Ada, Bea & Cyd" in lines[1]
+    assert lines[2].startswith("Chain 2: ")
+    assert lines[2].rstrip().endswith(yellow("[00:12:04]"))
+    assert lines[3] == "-" * 72
+    assert plain_len(lines[1]) == plain_len(lines[2])
+    bea.sent.clear()
+    process_commands(server, bea, "chains")  # type: ignore[arg-type]
+    assert "Chain 1:" in bea.sent[0]
+    loner = FakePlayer(name="Zoe", room="hall")
+    server.people.append(loner)
+    process_commands(server, loner, "chains")  # type: ignore[arg-type]
+    assert loner.sent == ["You are not on a chain.\n"]
+
+
+def test_chains_with_extra_text_is_syntax() -> None:
+    """A word that is not leave, remove, or delete is a syntax error."""
+    server, ada = run("chains please")
+    assert server.sent == ["Syntax: chains [leave <id> [reason]|remove <id> <name> [reason]|delete <id> [reason]]\n"]
+    assert ada is not None
+
+
+def test_chains_leave_tells_the_others() -> None:
+    """Leaving a chain of four tells the people who remain."""
+    ada = FakePlayer()
+    bea = FakePlayer(name="Bea", room="hall")
+    cyd = FakePlayer(name="Cyd", room="hall")
+    dee = FakePlayer(name="Dee", room="hall")
+    server = FakeServer(people=[ada, bea, cyd, dee])
+    process_commands(server, ada, "tell Bea, Cyd, Dee hello")  # type: ignore[arg-type]
+    for person in (ada, bea, cyd, dee):
+        person.sent.clear()
+    process_commands(server, dee, "chains leave 1 dinner")  # type: ignore[arg-type]
+    assert dee.sent == ["You have left chain 1.\n"]
+    assert ada.sent == ["(1) Dee has left the chain. dinner\n"]
+    assert len(server.chains) == 1
+
+
+def test_chains_remove_closes_when_two_remain() -> None:
+    """Removing someone from a chain of three closes it."""
+    ada = FakePlayer()
+    bea = FakePlayer(name="Bea", room="hall")
+    cyd = FakePlayer(name="Cyd", room="hall")
+    server = FakeServer(people=[ada, bea, cyd])
+    process_commands(server, ada, "tell Bea, Cyd hello")  # type: ignore[arg-type]
+    for person in (ada, bea, cyd):
+        person.sent.clear()
+    process_commands(server, ada, "chains remove 1 Bea")  # type: ignore[arg-type]
+    line = "(1) Chain closed because Ada removed Bea from the chain.\n"
+    assert ada.sent == [line]
+    assert bea.sent == [line]
+    assert cyd.sent == [line]
+    assert server.chains == []
+
+
+def test_chains_delete_tells_everyone() -> None:
+    """Delete removes the chain and tells every member."""
+    ada = FakePlayer()
+    bea = FakePlayer(name="Bea", room="hall")
+    cyd = FakePlayer(name="Cyd", room="hall")
+    server = FakeServer(people=[ada, bea, cyd])
+    process_commands(server, ada, "tell Bea, Cyd hello")  # type: ignore[arg-type]
+    for person in (ada, bea, cyd):
+        person.sent.clear()
+    process_commands(server, ada, "chains delete 1 done")  # type: ignore[arg-type]
+    line = "(1) Ada deleted the chain. done\n"
+    assert ada.sent == [line]
+    assert bea.sent == [line]
+    assert server.chains == []
+
+
+def test_tell_chain_reaches_the_same_people() -> None:
+    """A later tell to the chain id reaches the other members."""
+    ada = FakePlayer()
+    bea = FakePlayer(name="Bea", room="hall")
+    cyd = FakePlayer(name="Cyd", room="hall")
+    server = FakeServer(people=[ada, bea, cyd])
+    process_commands(server, ada, "tell Bea,Cyd hello")  # type: ignore[arg-type]
+    ada.sent.clear()
+    bea.sent.clear()
+    cyd.sent.clear()
+    process_commands(server, bea, "tell 1 yes")  # type: ignore[arg-type]
+    assert bea.sent == ["(1) You tell Ada & Cyd 'yes'\n"]
+    assert ada.sent == [green("(1) > Bea tells you & Cyd 'yes'") + "\n"]
+    assert cyd.sent == [green("(1) > Bea tells Ada & you 'yes'") + "\n"]
+
+
+def test_remote_and_rthink_use_the_same_chain_names() -> None:
+    """Remote and rthink keep their words and add the chain prefix."""
+    ada = FakePlayer()
+    bea = FakePlayer(name="Bea", room="hall")
+    cyd = FakePlayer(name="Cyd", room="hall")
+    bea.player.auto_reply = "later"
+    server = FakeServer(people=[ada, bea, cyd])
+    process_commands(server, ada, "remote Bea, Cyd smiles")  # type: ignore[arg-type]
+    assert ada.sent[0] == "(1) You emote: Ada smiles to Bea & Cyd\n"
+    assert bea.sent[0] == green("(1) > Ada smiles to you & Cyd") + "\n"
+    assert "[ Auto Reply from Bea ] later\n" in ada.sent
+    assert cyd.sent == [green("(1) > Ada smiles to Bea & you") + "\n"]
+    ada.sent.clear()
+    bea.sent.clear()
+    cyd.sent.clear()
+    process_commands(server, ada, "rthink 1 hmm")  # type: ignore[arg-type]
+    assert ada.sent == [
+        "(1) You think . o O ( hmm ) to Bea & Cyd\n",
+        "[ Auto Reply from Bea ] later\n",
+    ]
+    assert bea.sent[0] == green("(1) > Ada thinks . o O ( hmm ) to you & Cyd") + "\n"
+    assert cyd.sent == [green("(1) > Ada thinks . o O ( hmm ) to Bea & you") + "\n"]
 
 
 def test_tell_reaches_a_named_player_in_any_room() -> None:
     """Tell finds a player by name. A missing or roomless player is not found."""
-    bea = _Player(name="Bea", room="hall")
-    host = _Host(people=[bea])
-    process_commands(host, _Player(), "tell Bea hello there")  # type: ignore[arg-type]
-    assert host.sent == [
+    bea = FakePlayer(name="Bea", room="hall")
+    server = FakeServer(people=[bea])
+    process_commands(server, FakePlayer(), "tell Bea hello there")  # type: ignore[arg-type]
+    assert server.sent == [
         "You tell Bea 'hello there'\n",
         green("> Ada tells you 'hello there'") + "\n",
     ]
-    assert host.room_lines == []
-    assert host.all_lines == []
+    assert server.room_lines == []
+    assert server.all_lines == []
 
-    missing, _player = _run("tell Bea hello")
+    missing, _ = run("tell Bea hello")
     assert missing.sent == ["Player Bea not found.\n"]
 
-    waiting = _Player(name="Bea", room=None)
-    host = _Host(people=[waiting])
-    process_commands(host, _Player(), "tell Bea hello")  # type: ignore[arg-type]
-    assert host.sent == ["Player Bea not found.\n"]
+    waiting = FakePlayer(name="Bea", room=None)
+    server = FakeServer(people=[waiting])
+    process_commands(server, FakePlayer(), "tell Bea hello")  # type: ignore[arg-type]
+    assert server.sent == ["Player Bea not found.\n"]
 
-    bare, _player = _run("tell Bea")
+    bare, _ = run("tell Bea")
     assert bare.sent == ["Syntax: tell <name> <message>\n"]
 
-    host = _Host(people=[bea])
-    process_commands(host, _Player(), ".Bea hello")  # type: ignore[arg-type]
-    assert host.sent == [
+    server = FakeServer(people=[bea])
+    process_commands(server, FakePlayer(), ".Bea hello")  # type: ignore[arg-type]
+    assert server.sent == [
         "You tell Bea 'hello'\n",
         green("> Ada tells you 'hello'") + "\n",
     ]
-    host.sent.clear()
-    process_commands(host, _Player(), "> Bea hello")  # type: ignore[arg-type]
-    assert host.sent == [
+    server.sent.clear()
+    process_commands(server, FakePlayer(), "> Bea hello")  # type: ignore[arg-type]
+    assert server.sent == [
         "You tell Bea 'hello'\n",
         green("> Ada tells you 'hello'") + "\n",
     ]
-    dotted, _player = _run(".")
-    assert dotted.sent == ["Syntax: tell <name> <message>\n"]
+    dotted, _ = run(".")
+    assert dotted.sent == ["Syntax: .<name> <message>\n"]
+
+
+def test_rthink_thinks_to_one_named_player() -> None:
+    """Rthink uses the think words and reaches one player, the way remote does."""
+    bea = FakePlayer(name="Bea", room="hall")
+    bea.player.auto_reply = "later"
+    server = FakeServer(people=[bea])
+    process_commands(server, FakePlayer(), "rthink Bea hmm")  # type: ignore[arg-type]
+    assert server.sent == [
+        "You think . o O ( hmm ) to Bea\n",
+        green("> Ada thinks . o O ( hmm ) to you") + "\n",
+        "[ Auto Reply from Bea ] later\n",
+    ]
+    assert server.room_lines == []
+
+    missing, _ = run("rthink Bea hmm")
+    assert missing.sent == ["Player Bea not found.\n"]
+
+    bare, _ = run("rthink Bea")
+    assert bare.sent == ["Syntax: rthink <name> <message>\n"]
+
+    server = FakeServer()
+    ada = FakePlayer()
+    server.people = [ada]
+    process_commands(server, ada, "rthink Ada hmm")  # type: ignore[arg-type]
+    assert ada.sent == ["Talking to yourself is the first sign of madness.\n"]
 
 
 def test_remote_emotes_to_one_named_player() -> None:
     """Remote emotes to one player. A comma and < are the same command."""
-    bea = _Player(name="Bea", room="hall")
-    host = _Host(people=[bea])
-    process_commands(host, _Player(), "remote Bea smiles")  # type: ignore[arg-type]
-    assert host.sent == [
+    bea = FakePlayer(name="Bea", room="hall")
+    server = FakeServer(people=[bea])
+    process_commands(server, FakePlayer(), "remote Bea smiles")  # type: ignore[arg-type]
+    assert server.sent == [
         "You emote: Ada smiles to Bea\n",
         green("> Ada smiles to you") + "\n",
     ]
-    assert host.room_lines == []
-    assert host.all_lines == []
+    assert server.room_lines == []
+    assert server.all_lines == []
 
-    missing, _player = _run("remote Bea smiles")
+    missing, _ = run("remote Bea smiles")
     assert missing.sent == ["Player Bea not found.\n"]
 
-    bare, _player = _run("remote Bea")
+    bare, _ = run("remote Bea")
     assert bare.sent == ["Syntax: remote <name> <message>\n"]
 
-    host = _Host(people=[bea])
-    process_commands(host, _Player(), ",Bea smiles")  # type: ignore[arg-type]
-    assert host.sent == [
+    server = FakeServer(people=[bea])
+    process_commands(server, FakePlayer(), ",Bea smiles")  # type: ignore[arg-type]
+    assert server.sent == [
         "You emote: Ada smiles to Bea\n",
         green("> Ada smiles to you") + "\n",
     ]
-    host.sent.clear()
-    process_commands(host, _Player(), "< Bea smiles")  # type: ignore[arg-type]
-    assert host.sent == [
+    server.sent.clear()
+    process_commands(server, FakePlayer(), "< Bea smiles")  # type: ignore[arg-type]
+    assert server.sent == [
         "You emote: Ada smiles to Bea\n",
         green("> Ada smiles to you") + "\n",
     ]
-    comma, _player = _run(",")
-    assert comma.sent == ["Syntax: remote <name> <message>\n"]
+    comma, _ = run(",")
+    assert comma.sent == ["Syntax: ,<name> <message>\n"]
 
 
 def test_tell_to_yourself_is_refused() -> None:
     """A tell to the speaker is not delivered and has no auto-reply."""
-    host = _Host()
-    ada = _Player()
+    server = FakeServer()
+    ada = FakePlayer()
     ada.player.auto_reply = "later"
-    host.people = [ada]
-    command_tell(host, ada, Command("tell", command_tell, False, "tell <name> <message>"), "Ada hi")
+    server.people = [ada]
+    command_tell(server, ada, Command("tell", command_tell, False, "tell <name> <message>"), "Ada hi")
     assert ada.sent == ["Talking to yourself is the first sign of madness.\n"]
 
 
 def test_remote_alias_to_yourself_is_refused() -> None:
     """A remote alias uses the same sentence."""
-    host = _Host()
-    ada = _Player()
-    host.people = [ada]
-    command_remote(
-        host, ada, Command("<", command_remote, True, "remote <name> <message>"), "ada waves"
-    )
+    server = FakeServer()
+    ada = FakePlayer()
+    server.people = [ada]
+    command_remote(server, ada, Command("<", command_remote, True, "remote <name> <message>"), "ada waves")
     assert ada.sent == ["Talking to yourself is the first sign of madness.\n"]
 
 
 def test_auto_reply_comes_back_to_the_sender(tmp_path: Path) -> None:
     """Tell and remote still arrive, and the sender gets the reply."""
-    bea_user = Player("Bea", "hall", datetime.now(timezone.utc))
+    bea_user = Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
     bea_user.auto_reply = "In a meeting"
-    bea = _Player(name="Bea", player=bea_user)
-    ada = _Player()
-    host = _Host(people=[ada, bea])
-    process_commands(host, ada, "tell Bea hello")  # type: ignore[arg-type]
-    assert any(line == "[ Auto Reply ] In a meeting\n" for line in host.sent)
+    bea = FakePlayer(name="Bea", player=bea_user)
+    ada = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    server = FakeServer(people=[ada, bea])
+    process_commands(server, ada, "tell Bea hello")  # type: ignore[arg-type]
+    assert any(line == "[ Auto Reply from Bea ] In a meeting\n" for line in server.sent)
     assert bea.sent[-1].endswith("tells you 'hello'\n") or "tells you 'hello'" in "".join(bea.sent)
 
-    host.sent.clear()
+    server.sent.clear()
     ada.sent.clear()
     bea.sent.clear()
-    process_commands(host, ada, "remote Bea smiles")  # type: ignore[arg-type]
-    assert any(line == "[ Auto Reply ] In a meeting\n" for line in host.sent)
+    process_commands(server, ada, "remote Bea smiles")  # type: ignore[arg-type]
+    assert any(line == "[ Auto Reply from Bea ] In a meeting\n" for line in server.sent)
     assert green("> Ada smiles to you") + "\n" in bea.sent
 
-    host.sent.clear()
+    server.sent.clear()
     ada.sent.clear()
     bea.sent.clear()
-    process_commands(host, ada, "auto_reply busy")  # type: ignore[arg-type]
-    assert host.sent == ["Auto-reply set.\n"]
+    process_commands(server, ada, "set auto_reply busy")  # type: ignore[arg-type]
+    assert server.sent == ["Auto-reply set.\n"]
     assert ada.player is not None
     assert ada.player.auto_reply == "busy"
 
-    host.sent.clear()
+    server.sent.clear()
     ada.sent.clear()
     bea.sent.clear()
     bea_user.auto_reply = ""
-    process_commands(host, ada, "auto_reply")  # type: ignore[arg-type]
-    assert host.sent == ["Auto-reply cleared.\n"]
+    process_commands(server, ada, "set auto_reply")  # type: ignore[arg-type]
+    assert server.sent == ["Auto-reply cleared.\n"]
     assert ada.player is not None
     assert ada.player.auto_reply == ""
 
-    host.sent.clear()
+    server.sent.clear()
     ada.sent.clear()
     bea.sent.clear()
     bea_user.auto_reply = "Away"
-    process_commands(host, bea, "auto_reply")  # type: ignore[arg-type]
+    process_commands(server, bea, "set auto_reply")  # type: ignore[arg-type]
     assert bea_user.auto_reply == ""
-    process_commands(host, ada, "tell Bea ping")  # type: ignore[arg-type]
-    assert not any(line.startswith("[ Auto Reply ]") for line in host.sent)
+    process_commands(server, ada, "tell Bea ping")  # type: ignore[arg-type]
+    assert not any(line.startswith("[ Auto Reply ]") for line in server.sent)
 
-    _save(tmp_path, "Ada", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_RESIDENT)
-    host.people = [ada]
+    save(tmp_path, "Ada", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.RESIDENT)
+    server.people = [ada]
     path = player_path(tmp_path, "Ada")
-    process_commands(host, ada, "auto_reply out")  # type: ignore[arg-type]
+    process_commands(server, ada, "set auto_reply out")  # type: ignore[arg-type]
     assert "auto_reply" not in path.read_text(encoding="utf-8")
 
-    host.sent.clear()
+    server.sent.clear()
     ada.sent.clear()
     ada.player.auto_reply = "Echo"
-    host.people = [ada]
-    process_commands(host, ada, "tell Ada hello")  # type: ignore[arg-type]
-    assert not any(line.startswith("[ Auto Reply ]") for line in host.sent)
+    server.people = [ada]
+    process_commands(server, ada, "tell Ada hello")  # type: ignore[arg-type]
+    assert not any(line.startswith("[ Auto Reply ]") for line in server.sent)
 
 
 def test_a_received_tell_and_remote_are_green() -> None:
     """The recipient's line is green. The sender's copy is plain."""
-    bea = _Player(name="Bea", room="hall")
-    host = _Host(people=[bea])
-    process_commands(host, _Player(), "tell Bea hello")  # type: ignore[arg-type]
-    assert host.sent == [
+    bea = FakePlayer(name="Bea", room="hall")
+    server = FakeServer(people=[bea])
+    process_commands(server, FakePlayer(), "tell Bea hello")  # type: ignore[arg-type]
+    assert server.sent == [
         "You tell Bea 'hello'\n",
         green("> Ada tells you 'hello'") + "\n",
     ]
-    host.sent.clear()
-    process_commands(host, _Player(), "remote Bea smiles")  # type: ignore[arg-type]
-    assert host.sent == [
+    server.sent.clear()
+    process_commands(server, FakePlayer(), "remote Bea smiles")  # type: ignore[arg-type]
+    assert server.sent == [
         "You emote: Ada smiles to Bea\n",
         green("> Ada smiles to you") + "\n",
     ]
     assert bea.player is not None
     bea.player.colour = False
-    host.sent.clear()
-    process_commands(host, _Player(), "tell Bea hello")  # type: ignore[arg-type]
-    assert host.sent == ["You tell Bea 'hello'\n", "> Ada tells you 'hello'\n"]
+    server.sent.clear()
+    process_commands(server, FakePlayer(), "tell Bea hello")  # type: ignore[arg-type]
+    assert server.sent == ["You tell Bea 'hello'\n", "> Ada tells you 'hello'\n"]
 
 
 def test_room_and_shout_prefixes_respect_colour_off() -> None:
     """Prefixed room and shout lines stay plain when the recipient's colour is off."""
     when = datetime.now(timezone.utc)
-    bea = _Player(name="Bea", room="reception")
+    bea = FakePlayer(name="Bea", room="reception")
     bea.player.colour = False
-    host = _Host(people=[bea])
-    process_commands(host, _Player(), "say hello")  # type: ignore[arg-type]
-    assert host.room_lines == ["- Ada says 'hello'\n"]
-    host.room_lines.clear()
-    process_commands(host, _Player(), ":waves")  # type: ignore[arg-type]
-    assert host.room_lines == ["- Ada waves\n"]
-    resident = _Player(player=Player("Ada", "reception", when, rank=RANK_RESIDENT))
-    host = _Host(people=[bea, resident])
-    process_commands(host, resident, "shout hi")  # type: ignore[arg-type]
-    assert host.all_lines == ["! Ada shouts 'hi'\n"]
+    server = FakeServer(people=[bea])
+    process_commands(server, FakePlayer(), "say hello")  # type: ignore[arg-type]
+    assert server.room_lines == ["- Ada says 'hello'\n"]
+    server.room_lines.clear()
+    process_commands(server, FakePlayer(), ":waves")  # type: ignore[arg-type]
+    assert server.room_lines == ["- Ada waves\n"]
+    resident = FakePlayer(player=Player("Ada", "reception", when, rank=Rank.RESIDENT))
+    server = FakeServer(people=[bea, resident])
+    process_commands(server, resident, "shout hi")  # type: ignore[arg-type]
+    assert server.all_lines == ["! Ada shouts 'hi'\n"]
 
 
 def test_paint_staff_colours_when_colour_is_on() -> None:
     """Staff lines are cyan when colour is on and plain when it is off."""
     when = datetime.now(timezone.utc)
-    on = _Player(player=Player("Ada", "hall", when, rank=RANK_SUPER))
-    off = _Player(player=Player("Bea", "hall", when, rank=RANK_SUPER))
+    on = FakePlayer(player=Player("Ada", "hall", when, rank=Rank.SUPER_USER))
+    off = FakePlayer(player=Player("Bea", "hall", when, rank=Rank.SUPER_USER))
     off.player.colour = False
     line = "< SU > Ada says 'hello'\n"
     assert paint_staff(on, line) == cyan("< SU > Ada says 'hello'") + "\n"
     assert paint_staff(off, line) == line
 
 
+def test_testcard_shows_every_foreground_and_background() -> None:
+    """Testcard paints each colour and stays on this screen."""
+    from lupaxa.chat_server import colour
+
+    foreground = (colour.black, colour.red, colour.green, colour.yellow, colour.blue, colour.magenta, colour.cyan, colour.white, colour.light_black, colour.light_red, colour.light_green, colour.light_yellow, colour.light_blue, colour.light_magenta, colour.light_cyan, colour.light_white)  # fmt: skip  # noqa: E501
+    background = (colour.on_black, colour.on_red, colour.on_green, colour.on_yellow, colour.on_blue, colour.on_magenta, colour.on_cyan, colour.on_white, colour.on_light_black, colour.on_light_red, colour.on_light_green, colour.on_light_yellow, colour.on_light_blue, colour.on_light_magenta, colour.on_light_cyan, colour.on_light_white)  # fmt: skip  # noqa: E501
+    server, _ = run("testcard")
+    page = colour.testcard()
+    lines = page.splitlines()
+    assert server.sent == [page]
+    assert server.room_lines == []
+    assert lines[0].startswith("+")
+    assert lines[-1] == lines[0]
+    assert len({plain_len(line) for line in lines}) == 1
+    inner = lines[1:-1]
+    assert inner[0].startswith("|")
+    assert "Foreground" in inner[0]
+    assert "Background" in inner[0]
+    assert len(inner) == len(foreground) + 1
+    for ink, paper, line in zip(foreground, background, inner[1:], strict=True):
+        assert ink("sample") in line
+        assert paper(" sample ") in line
+        assert line.index(ink("sample")) < line.index(paper(" sample "))
+    extra, _ = run("testcard please")
+    assert extra.sent == ["Syntax: testcard\n"]
+
+
+def test_cls_clears_the_screen() -> None:
+    """Cls clears only this screen and leaves the cursor on this row."""
+    from colorama.ansi import clear_screen
+
+    server, _ = run("cls")
+    assert server.sent == [clear_screen() + "\r"]
+    assert server.room_lines == []
+    extra, _ = run("cls please")
+    assert extra.sent == ["Syntax: cls\n"]
+
+
+def test_colour_helpers_cover_the_colorama_palette() -> None:
+    """Every foreground, background, and effect wraps with its colorama code."""
+    from colorama import Back, Fore, Style
+    from colorama.ansi import BEL, code_to_chars
+
+    from lupaxa.chat_server import colour
+
+    painted = (
+        (colour.black, Fore.BLACK),
+        (colour.red, Fore.RED),
+        (colour.green, Fore.GREEN),
+        (colour.yellow, Fore.YELLOW),
+        (colour.blue, Fore.BLUE),
+        (colour.magenta, Fore.MAGENTA),
+        (colour.cyan, Fore.CYAN),
+        (colour.white, Fore.WHITE),
+        (colour.light_black, Fore.LIGHTBLACK_EX),
+        (colour.light_red, Fore.LIGHTRED_EX),
+        (colour.light_green, Fore.LIGHTGREEN_EX),
+        (colour.light_yellow, Fore.LIGHTYELLOW_EX),
+        (colour.light_blue, Fore.LIGHTBLUE_EX),
+        (colour.light_magenta, Fore.LIGHTMAGENTA_EX),
+        (colour.light_cyan, Fore.LIGHTCYAN_EX),
+        (colour.light_white, Fore.LIGHTWHITE_EX),
+        (colour.on_black, Back.BLACK),
+        (colour.on_red, Back.RED),
+        (colour.on_green, Back.GREEN),
+        (colour.on_yellow, Back.YELLOW),
+        (colour.on_blue, Back.BLUE),
+        (colour.on_magenta, Back.MAGENTA),
+        (colour.on_cyan, Back.CYAN),
+        (colour.on_white, Back.WHITE),
+        (colour.on_light_black, Back.LIGHTBLACK_EX),
+        (colour.on_light_red, Back.LIGHTRED_EX),
+        (colour.on_light_green, Back.LIGHTGREEN_EX),
+        (colour.on_light_yellow, Back.LIGHTYELLOW_EX),
+        (colour.on_light_blue, Back.LIGHTBLUE_EX),
+        (colour.on_light_magenta, Back.LIGHTMAGENTA_EX),
+        (colour.on_light_cyan, Back.LIGHTCYAN_EX),
+        (colour.on_light_white, Back.LIGHTWHITE_EX),
+        (colour.dim, Style.DIM),
+        (colour.normal, Style.NORMAL),
+        (colour.flash, code_to_chars(5)),
+    )
+    for paint_text, code in painted:
+        assert paint_text("Hi") == f"{code}Hi{Style.RESET_ALL}"
+        assert plain_len(paint_text("Hi")) == 2
+    assert colour.bright("Hi") == f"{Style.BRIGHT}{Fore.WHITE}Hi{Style.RESET_ALL}"
+    assert colour.bell("Hi") == f"Hi{BEL}"
+
+
 def test_paint_admin_is_red_when_colour_is_on() -> None:
     """Admin channel lines are red with colour on and plain with colour off."""
-    from lupaxa.chat_server.channel import paint_admin
-    from lupaxa.chat_server.colour import red
-
     line = "[ Admin ] Ada says 'hello'\n"
-    on = _staff("Ada", RANK_ADMIN)
-    off = _staff("Bea", RANK_ADMIN)
+    on = staff("Ada", Rank.ADMIN)
+    off = staff("Bea", Rank.ADMIN)
     assert off.player is not None
     off.player.colour = False
     assert paint_admin(on, line) == red(line.rstrip("\n")) + "\n"
@@ -1760,13 +2842,13 @@ def test_paint_admin_is_red_when_colour_is_on() -> None:
 
 def test_broadcast_admin_reaches_only_admins() -> None:
     """A super user and a resident do not receive the admin channel."""
-    from lupaxa.chat_server.channel import broadcast_admin, paint_admin
+    from lupaxa.chat_server.broadcast import broadcast_admin
 
-    ada = _staff("Ada", RANK_ADMIN)
-    sue = _staff("Sue", RANK_SUPER)
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _Host(people=[ada, sue, bea])
-    broadcast_admin(host, "[ Admin ] hello\n")  # type: ignore[arg-type]
+    ada = staff("Ada", Rank.ADMIN)
+    sue = staff("Sue", Rank.SUPER_USER)
+    bea = staff("Bea", Rank.RESIDENT)
+    server = FakeServer(people=[ada, sue, bea])
+    broadcast_admin(server, "[ Admin ] hello\n")  # type: ignore[arg-type]
     assert ada.sent == [paint_admin(ada, "[ Admin ] hello\n")]
     assert sue.sent == []
     assert bea.sent == []
@@ -1775,10 +2857,7 @@ def test_broadcast_admin_reaches_only_admins() -> None:
 def test_multiple_matches_uses_ampersand_before_the_last_name() -> None:
     """Two names use &. More names use commas, and & before the last."""
     assert multiple_matches_message(["Admin", "Adam"]) == "multiple Matches: Adam & Admin\n"
-    assert (
-        multiple_matches_message(["Adept", "Adam", "Admin"])
-        == "multiple Matches: Adam, Adept & Admin\n"
-    )
+    assert multiple_matches_message(["Adept", "Adam", "Admin"]) == "multiple Matches: Adam, Adept & Admin\n"
 
 
 def test_match_name_prefers_an_exact_name_over_a_prefix() -> None:
@@ -1793,66 +2872,96 @@ def test_match_name_prefers_an_exact_name_over_a_prefix() -> None:
 
 def test_tell_uses_one_partial_name_and_refuses_several() -> None:
     """Tell ad reaches Adam. Tell a names both Adam and Admin."""
-    adam = _Player(name="Adam", room="hall")
-    host = _Host(people=[adam])
-    process_commands(host, _Player(), "tell ad hello")  # type: ignore[arg-type]
-    assert host.sent == [
+    adam = FakePlayer(name="Adam", room="hall")
+    server = FakeServer(people=[adam])
+    process_commands(server, FakePlayer(), "tell ad hello")  # type: ignore[arg-type]
+    assert server.sent == [
         "You tell Adam 'hello'\n",
         green("> Ada tells you 'hello'") + "\n",
     ]
 
-    admin = _Player(name="Admin", room="hall")
-    host = _Host(people=[adam, admin])
-    process_commands(host, _Player(), "tell a hello")  # type: ignore[arg-type]
-    assert host.sent == ["multiple Matches: Adam & Admin\n"]
+    admin = FakePlayer(name="Admin", room="hall")
+    server = FakeServer(people=[adam, admin])
+    process_commands(server, FakePlayer(), "tell a hello")  # type: ignore[arg-type]
+    assert server.sent == ["multiple Matches: Adam & Admin\n"]
 
 
 def test_examine_partial_finds_one_logged_out_player(tmp_path: Path) -> None:
     """A unique prefix of a saved name examines that logged-out player."""
-    _save(tmp_path, "Adam", RANK_RESIDENT)
-    host = _login_host(tmp_path, admin="Zed")
-    process_commands(host, _Player(), "examine ad")  # type: ignore[arg-type]
-    assert host.sent[0].splitlines()[1].strip() == "Adam"
-    assert "Player ad not found." not in host.sent[0]
+    save(tmp_path, "Adam", Rank.RESIDENT)
+    server = login_host(tmp_path, super_admin="Zed")
+    process_commands(server, FakePlayer(), "examine ad")  # type: ignore[arg-type]
+    assert server.sent[0].splitlines()[1].strip() == "Adam"
+    assert "Player ad not found." not in server.sent[0]
 
 
 def test_examine_refuses_several_partial_names(tmp_path: Path) -> None:
     """Online and logged-out prefixes are one list."""
-    _save(tmp_path, "Admin", RANK_RESIDENT)
-    adam = _Player(name="Adam", room="hall")
-    host = _login_host(tmp_path, admin="Zed")
-    host.people = [adam]
-    process_commands(host, _Player(), "examine a")  # type: ignore[arg-type]
-    assert host.sent == ["multiple Matches: Adam & Admin\n"]
+    save(tmp_path, "Admin", Rank.RESIDENT)
+    adam = FakePlayer(name="Adam", room="hall")
+    server = login_host(tmp_path, super_admin="Zed")
+    server.people = [adam]
+    process_commands(server, FakePlayer(), "examine a")  # type: ignore[arg-type]
+    assert server.sent == ["multiple Matches: Adam & Admin\n"]
 
 
 def test_permanent_commands_do_not_accept_a_prefix(tmp_path: Path) -> None:
     """Resident, promote, demote, disconnect, and nuke need the whole name."""
-    _save(tmp_path, "Adam", RANK_RESIDENT)
-    adam = _newbie("Adam")
-    host = _login_host(tmp_path)
-    host.people = [adam]
-    super_user = _staff("Ada", RANK_SUPER)
-    process_commands(host, super_user, "resident Ad")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Player Ad not found.\n"
-    process_commands(host, super_user, "disconnect Ad rude")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Player Ad not found.\n"
-    assert host.dropped_clients == []
-    process_commands(host, super_user, "nuke Ad gone")  # type: ignore[arg-type]
+    save(tmp_path, "Adam", Rank.RESIDENT)
+    adam = newbie("Adam")
+    server = login_host(tmp_path)
+    server.people = [adam]
+    super_user = staff("Ada", Rank.SUPER_USER)
+    process_commands(server, super_user, "resident Ad")  # type: ignore[arg-type]
+    assert server.sent[-1] == "No such player 'Ad'.\n"
+    process_commands(server, super_user, "disconnect Ad rude")  # type: ignore[arg-type]
+    assert server.sent[-1] == "No such player 'Ad'.\n"
+    assert server.dropped_clients == []
+    process_commands(server, super_user, "nuke Ad gone")  # type: ignore[arg-type]
     assert load_saved(player_path(tmp_path, "Adam")) is not None
-    admin = _staff("Boss", RANK_ADMIN)
-    process_commands(host, admin, "promote Ad")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Player Ad not found.\n"
-    process_commands(host, admin, "demote Ad")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Player Ad not found.\n"
+    admin = staff("Boss", Rank.ADMIN)
+    process_commands(server, admin, "promote Ad")  # type: ignore[arg-type]
+    assert server.sent[-1] == "No such player 'Ad'.\n"
+    process_commands(server, admin, "demote Ad")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Player Ad not found.\n"
 
 
-def test_idle_clock_is_blank_until_eleven_seconds() -> None:
-    """Ten seconds is blank. Eleven seconds is a clock. Hours are not clipped."""
-    assert idle_clock(10) == ""
-    assert idle_clock(11) == "00:00:11"
-    assert idle_clock(3723) == "01:02:03"
-    assert idle_clock(100 * 3600) == "100:00:00"
+def test_idle_clock_is_active_until_five_minutes() -> None:
+    """Under five minutes is Active. The clock starts at five minutes."""
+    assert idle_clock(0) == "[ Active ]"
+    assert idle_clock(299) == "[ Active ]"
+    assert idle_clock(300) == "[00:05:00]"
+    assert idle_clock(1799) == "[00:29:59]"
+    assert idle_clock(1800) == "[00:30:00]"
+    assert idle_clock(3599) == "[00:59:59]"
+    assert idle_clock(3600) == "[--:--:--]"
+    assert idle_clock(100 * 3600) == "[--:--:--]"
+
+
+def test_idle_cell_uses_green_yellow_and_red() -> None:
+    """Active is green, five to thirty minutes is yellow, then red, then light black."""
+    from lupaxa.chat_server.colour import green, light_black, paint_idle, red, yellow
+
+    assert paint_idle(299, True) == green("[ Active ]")
+    assert paint_idle(300, True) == yellow("[00:05:00]")
+    assert paint_idle(1799, True) == yellow("[00:29:59]")
+    assert paint_idle(1800, True) == red("[00:30:00]")
+    assert paint_idle(3599, True) == red("[00:59:59]")
+    assert paint_idle(3600, True) == light_black("[--:--:--]")
+    assert paint_idle(300, False) == "[00:05:00]"
+    assert paint_idle(3600, False) == "[--:--:--]"
+
+
+def test_super_admin_rank_is_light_blue() -> None:
+    """A promoted admin stays red. The config Super Admin is light blue."""
+    from lupaxa.chat_server.colour import light_blue
+    from lupaxa.chat_server.utilities import shown_rank_cell
+
+    assert shown_rank(Rank.ADMIN, True) == red("Admin")
+    assert shown_rank(Rank.SUPER_ADMIN, True) == light_blue("Super Admin")
+    assert shown_rank(Rank.SUPER_ADMIN, False) == "Super Admin"
+    assert shown_rank_cell(Rank.ADMIN, True) == red("[ Admin ]")
+    assert shown_rank_cell(Rank.SUPER_ADMIN, True) == light_blue("( Super Admin )")
 
 
 def test_frame_width_uses_manual_then_discovered_then_eighty() -> None:
@@ -1864,85 +2973,132 @@ def test_frame_width_uses_manual_then_discovered_then_eighty() -> None:
     assert frame_width(None, 70) == 70
 
 
-def test_time_frame_is_the_eighty_column_picture(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Time prints the clock and the uptime, padded to the frame width."""
+def test_cpu_phrase_keeps_the_fractional_second() -> None:
+    """CPU time uses words and keeps a fractional second."""
+    assert cpu_phrase(0) == "0 seconds"
+    assert cpu_phrase(-1) == "0 seconds"
+    assert cpu_phrase(1) == "1 second"
+    assert cpu_phrase(34) == "34 seconds"
+    assert cpu_phrase(34.1) == "34.1 seconds"
+    assert cpu_phrase(59.96) == "1 minute"
+    assert cpu_phrase(180) == "3 minutes"
+    assert cpu_phrase(182.4) == "3 minutes, 2.4 seconds"
+    assert cpu_phrase(3600) == "1 hour"
+    assert cpu_phrase(3602.4) == "1 hour, 2.4 seconds"
+    assert cpu_phrase(3661.5) == "1 hour, 1 minute, 1.5 seconds"
+    assert cpu_phrase(86400) == "1 day"
+    assert cpu_phrase(90061.5) == "1 day, 1 hour, 1 minute, 1.5 seconds"
+
+
+def test_time_frame_is_the_boot_box(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Time prints the clock, the boot time, and the uptime in a snug box."""
     fixed = datetime(2026, 10, 12, 13, 45, 3, tzinfo=timezone.utc)
 
-    class _Clock(datetime):
+    class Clock(datetime):
         @classmethod
         def now(cls, tz: tzinfo | None = None) -> datetime:
             return fixed
 
-    monkeypatch.setattr("lupaxa.chat_server.commands.datetime", _Clock)
-    host = _Host()
-    host.started_at = fixed - timedelta(hours=2, minutes=5)
-    player = _Player(discovered_columns=80, frame_columns=None)
-    process_commands(host, player, "time")  # type: ignore[arg-type]
-    expected = """--------------------------------------------------------------------------------
-  Current time : Monday 12th October 2026, 13:45:03 UTC                         
-  Uptime       : 2 hours, 5 minutes                                             
---------------------------------------------------------------------------------
+    monkeypatch.setattr("lupaxa.chat_server.newbie.datetime", Clock)
+    server = FakeServer()
+    server.started_at = fixed - timedelta(hours=2, minutes=5)
+    player = FakePlayer(discovered_columns=80, frame_columns=None)
+    process_commands(server, player, "time")  # type: ignore[arg-type]
+    expected = """\
++-------------------------------------------------------+
+| Current time : Monday 12th October 2026, 13:45:03 UTC |
+| Booted at    : Monday 12th October 2026, 11:40:03 UTC |
+| Uptime       : 2 hours, 5 minutes                     |
++-------------------------------------------------------+
 """
-    assert host.sent == [expected]
-    assert all(len(line) == 80 for line in expected.splitlines())
-    host.sent.clear()
-    process_commands(host, player, "time please")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: time\n"]
+    assert server.sent == [expected]
+    wide = FakePlayer(discovered_columns=200, frame_columns=120)
+    server.sent.clear()
+    process_commands(server, wide, "time")  # type: ignore[arg-type]
+    assert server.sent == [expected]
+    server.sent.clear()
+    process_commands(server, player, "time please")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: time\n"]
 
 
-def test_time_frame_grows_to_the_longest_line() -> None:
-    """A narrow frame widens to the current-time line."""
-    text = time_frame(
-        "Monday 12th October 2026, 13:45:03 UTC",
-        "2 hours, 5 minutes",
-        40,
-    )
-    assert len(text.splitlines()[0]) == 55
+def test_time_frame_shows_rebooted_at_only_after_a_reboot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rebooted at appears under Booted at, and only when a reboot has happened."""
+    fixed = datetime(2026, 10, 12, 13, 45, 3, tzinfo=timezone.utc)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            return fixed
+
+    monkeypatch.setattr("lupaxa.chat_server.newbie.datetime", Clock)
+    server = FakeServer()
+    server.started_at = fixed - timedelta(hours=2, minutes=5)
+    server.rebooted_at = datetime(2026, 10, 12, 12, 10, 3, tzinfo=timezone.utc)
+    player = FakePlayer()
+    process_commands(server, player, "time")  # type: ignore[arg-type]
+    expected = """\
++-------------------------------------------------------+
+| Current time : Monday 12th October 2026, 13:45:03 UTC |
+| Booted at    : Monday 12th October 2026, 11:40:03 UTC |
+| Rebooted at  : Monday 12th October 2026, 12:10:03 UTC |
+| Uptime       : 2 hours, 5 minutes                     |
++-------------------------------------------------------+
+"""
+    assert server.sent == [expected]
+
+
+def test_time_frame_widens_for_a_longer_value() -> None:
+    """The box follows the longest row and does not wrap the clock."""
+    clock = "Monday 12th October 2026, 13:45:03 UTC"
+    short = time_frame(clock, "Monday 12th October 2026, 11:40:03 UTC", "2 hours, 5 minutes")
+    long = time_frame(clock, "Monday 12th October 2026, 11:40:03 UTC", "2 hours, 5 minutes, and more words here")
+    assert len(long.splitlines()[0]) > len(short.splitlines()[0])
+    assert clock in long.splitlines()[1]
 
 
 def test_term_width_sets_and_clears_a_manual_width() -> None:
     """A manual width is kept, refused outside 60 and the ceiling, and cleared by auto."""
-    ada = _Player(discovered_columns=100, discovered_rows=24, frame_columns=None)
-    host = _Host(people=[ada])
-    process_commands(host, ada, "term_width")  # type: ignore[arg-type]
-    assert host.sent == ["  Terminal Size  : 100x24 (100x24 discovered)\n"]
-    host.sent.clear()
-    process_commands(host, ada, "term_width 70")  # type: ignore[arg-type]
+    ada = FakePlayer(discovered_columns=100, discovered_rows=24, frame_columns=None)
+    server = FakeServer(people=[ada])
+    process_commands(server, ada, "term_width")  # type: ignore[arg-type]
+    assert server.sent == ["  Terminal Size  : 100x24 (100x24 discovered)\n"]
+    server.sent.clear()
+    process_commands(server, ada, "term_width 70")  # type: ignore[arg-type]
     assert ada.frame_columns == 70
-    assert host.sent == ["Width set to 70.\n"]
-    host.sent.clear()
-    process_commands(host, ada, "term_width 59")  # type: ignore[arg-type]
+    assert server.sent == ["Width set to 70.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "term_width 59")  # type: ignore[arg-type]
     assert ada.frame_columns == 70
-    assert host.sent == ["Width must be at least 60.\n"]
-    host.sent.clear()
-    process_commands(host, ada, "term_width 101")  # type: ignore[arg-type]
-    assert host.sent == ["Width cannot be wider than 100.\n"]
-    host.sent.clear()
-    process_commands(host, ada, "term_width auto")  # type: ignore[arg-type]
+    assert server.sent == ["Width must be at least 60.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "term_width 101")  # type: ignore[arg-type]
+    assert server.sent == ["Width cannot be wider than 100.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "term_width auto")  # type: ignore[arg-type]
     assert ada.frame_columns is None
-    assert host.sent == ["Width set to automatic.\n"]
-    host.sent.clear()
-    process_commands(host, ada, "term_width please")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: term_width <width>|auto\n"]
-    host.sent.clear()
-    process_commands(host, ada, "term_width ²")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: term_width <width>|auto\n"]
-    pending_host = _Host()
-    bare = _Player(discovered_columns=None, discovered_rows=None, frame_columns=None)
-    process_commands(pending_host, bare, "term_width")  # type: ignore[arg-type]
-    assert pending_host.sent == ["  Terminal Size  : 80  (Pending)\n"]
+    assert server.sent == ["Width set to automatic.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "term_width please")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: term_width <width>|auto\n"]
+    server.sent.clear()
+    process_commands(server, ada, "term_width ²")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: term_width <width>|auto\n"]
+    pending_server = FakeServer()
+    bare = FakePlayer(discovered_columns=None, discovered_rows=None, frame_columns=None)
+    process_commands(pending_server, bare, "term_width")  # type: ignore[arg-type]
+    assert pending_server.sent == ["  Terminal Size  : 80  (Pending)\n"]
 
 
 def test_term_width_is_not_saved_and_a_narrow_window_rejects_numbers(tmp_path: Path) -> None:
     """The manual width is not a player-file field. Below 60 only auto works."""
-    save_player(tmp_path, SavedPlayer("Ada", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    user = Player("Ada", "reception", datetime.now(timezone.utc), rank=RANK_RESIDENT)
-    ada = _Player(name="Ada", player=user, discovered_columns=40, discovered_rows=12)
-    host.people = [ada]
-    process_commands(host, ada, "term_width 60")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Ada", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    user = Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    ada = FakePlayer(name="Ada", player=user, discovered_columns=40, discovered_rows=12)
+    server.people = [ada]
+    process_commands(server, ada, "term_width 60")  # type: ignore[arg-type]
     assert ada.frame_columns is None
-    assert host.sent == ["Width cannot be wider than 40.\n"]
+    assert server.sent == ["Width cannot be wider than 40.\n"]
     text = (tmp_path / "ada.yml").read_text(encoding="utf-8")
     assert "frame_columns" not in text
     assert "term_width" not in text
@@ -1959,202 +3115,211 @@ def test_who_lists_players_rooms_and_idle() -> None:
     """Who lists name, room, and idle, and skips someone who is not in a room."""
     when = datetime.now(timezone.utc)
     ada_user = Player("Ada", "reception", when, idle_seconds=10)
-    bea_user = Player("Bea", "hall", when, idle_seconds=120)
-    host = _Host(
-        people=[
-            _Player(name="Bea", room="hall", player=bea_user),
-            _Player(name="Ada", room="reception", player=ada_user),
-            _Player(name="Cyd", room=None),
-        ]
-    )
-    asker = _Player()
+    bea_user = Player("Bea", "hall", when, idle_seconds=300)
+    server = FakeServer(people=[FakePlayer(name="Bea", room="hall", player=bea_user), FakePlayer(name="Ada", room="reception", player=ada_user), FakePlayer(name="Cyd", room=None),])  # fmt: skip  # noqa: E501
+    asker = FakePlayer()
     assert asker.discovered_columns == 72
-    process_commands(host, asker, "who")  # type: ignore[arg-type]
-    text = host.sent[0]
+    process_commands(server, asker, "who")  # type: ignore[arg-type]
+    text = server.sent[0]
     lines = text.splitlines()
     assert lines[0] == "-" * 72
     assert lines[-1] == "-" * 72
     assert "Connected:" not in text
-    assert "00:02:00" in text
+    assert "[00:05:00]" in text
     assert "00:00:10" not in text
+    assert "[ Active ]" in text
 
-    host = _Host(people=[_Player(name="Cyd", room=None)])
-    process_commands(host, _Player(), "who")  # type: ignore[arg-type]
-    assert host.sent == [" -=> There is currently no one connected\n"]
+    server = FakeServer(people=[FakePlayer(name="Cyd", room=None)])
+    process_commands(server, FakePlayer(), "who")  # type: ignore[arg-type]
+    assert server.sent == [" -=> There is currently no one connected\n"]
 
-    extra, _player = _run("who please")
+    extra, _ = run("who please")
     assert extra.sent == ["Syntax: who\n"]
 
 
 def test_who_lists_a_player_who_is_alone() -> None:
     """A player in a room is listed, including when they are the only one."""
     when = datetime.now(timezone.utc)
-    ada = _Player(
-        name="Ada",
-        room="reception",
-        player=Player("Ada", "reception", when),
-    )
-    host = _Host(people=[ada])
-    process_commands(host, ada, "who")  # type: ignore[arg-type]
-    assert "Ada" in host.sent[0]
-    assert host.sent[0] != " -=> There is currently no one connected\n"
+    ada = FakePlayer(name="Ada", room="reception", player=Player("Ada", "reception", when))
+    server = FakeServer(people=[ada])
+    process_commands(server, ada, "who")  # type: ignore[arg-type]
+    assert "Ada" in server.sent[0]
+    assert server.sent[0] != " -=> There is currently no one connected\n"
 
 
 def test_w_lists_the_same_players_as_who() -> None:
     """W is who. wplease is not. w please is the who syntax."""
-    ada = _Player()
-    bea = _Player(name="Bea", room="hall", player=Player("Bea", "hall", datetime.now(timezone.utc)))
-    host = _Host(people=[ada, bea])
-    process_commands(host, ada, "who")  # type: ignore[arg-type]
-    who_text = host.sent[0]
-    host.sent.clear()
-    process_commands(host, ada, "w")  # type: ignore[arg-type]
-    assert host.sent == [who_text]
-    host.sent.clear()
-    process_commands(host, ada, "wplease")  # type: ignore[arg-type]
-    assert host.sent == ["No such command 'wplease'\n"]
-    host.sent.clear()
-    process_commands(host, ada, "w please")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: who\n"]
+    ada = FakePlayer()
+    bea = FakePlayer(name="Bea", room="hall", player=Player("Bea", "hall", datetime.now(timezone.utc)))
+    server = FakeServer(people=[ada, bea])
+    process_commands(server, ada, "who")  # type: ignore[arg-type]
+    who_text = server.sent[0]
+    server.sent.clear()
+    process_commands(server, ada, "w")  # type: ignore[arg-type]
+    assert server.sent == [who_text]
+    server.sent.clear()
+    process_commands(server, ada, "wplease")  # type: ignore[arg-type]
+    assert server.sent == ["No such command 'wplease'\n"]
+    server.sent.clear()
+    process_commands(server, ada, "w please")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: w\n"]
 
 
 def test_enter_at_the_play_prompt_does_not_clear_idle() -> None:
     """An empty line shows the prompt again and leaves idle alone."""
     user = Player("Ada", "hall", datetime.now(timezone.utc), idle_seconds=40)
-    ada = _Player(player=user)
-    host = _Host(people=[ada])
-    process_input(host, ada, "")  # type: ignore[arg-type]
+    ada = FakePlayer(player=user)
+    server = FakeServer(people=[ada])
+    process_input(server, ada, "")  # type: ignore[arg-type]
     assert user.idle_seconds == 40
-    assert host.sent == ["What? > "]
-    assert "No such command" not in "".join(host.sent)
+    assert server.sent == ["What? > "]
+    assert "No such command" not in "".join(server.sent)
 
 
 def test_confirm_password_starts_after_a_blank_line(tmp_path: Path) -> None:
     """The confirm prompt is preceded by a blank line."""
     assert confirm_password_prompt() == "\n\nConfirm password: "
-    host = _login_host(tmp_path, opened=False)
-    local = _Player(player=None, address="127.0.0.1")
-    process_input(host, local, "admin")  # type: ignore[arg-type]
-    process_input(host, local, "secret")  # type: ignore[arg-type]
-    assert host.sent[-1] == "\n\nConfirm password: "
 
 
 def test_look_repeats_the_room_brief() -> None:
     """Look shows the room brief and does not tell the room anyone arrived."""
-    ada = _Player()
-    bea = _Player(name="Bea", room="reception")
-    host = _Host(people=[ada, bea])
-    process_commands(host, ada, "look")  # type: ignore[arg-type]
-    assert host.sent == [host._layout.brief("reception", [])]
-    assert host.room_lines == []
+    ada = FakePlayer()
+    bea = FakePlayer(name="Bea", room="reception")
+    server = FakeServer(people=[ada, bea])
+    process_commands(server, ada, "look")  # type: ignore[arg-type]
+    assert server.sent == [server.layout.brief("reception", [])]
+    assert server.room_lines == []
 
-    extra, _player = _run("look please")
+    extra, _ = run("look please")
     assert extra.sent == ["Syntax: look\n"]
+    server.sent.clear()
+    process_commands(server, ada, "l")  # type: ignore[arg-type]
+    assert server.sent == [server.layout.brief("reception", [])]
+    glued, _ = run("lplease")
+    assert glued.sent == ["No such command 'lplease'\n"]
 
-    newbie_words = command_words(RANK_NEWBIE).split()
+    newbie_words = command_words(Rank.NEWBIE).split()
     assert "look" in newbie_words
+    assert "l" in newbie_words
+
+
+def test_join_refuses_someone_elses_home() -> None:
+    """A joiner stays put and is told they are not permitted."""
+    ada = staff("Ada", Rank.RESIDENT)
+    ada.room = "ada_home"
+    assert ada.player is not None
+    ada.player.room = "ada_home"
+    bea = FakePlayer(name="Bea", room="hall", player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    server = FakeServer(people=[ada, bea])
+    server.layout = server.layout.with_house("Ada", {house_room_id("Ada"): Room("You are home.", 1, {})})
+    process_commands(server, bea, "join Ada")  # type: ignore[arg-type]
+    assert bea.room == "hall"
+    assert server.sent == ["You are not permitted to Ada's home.\n"]
+    assert ada.sent == []
+
+    server.sent.clear()
+    process_commands(server, ada, "join Ada")  # type: ignore[arg-type]
+    assert ada.room == "ada_home"
+    assert server.sent == ["You are already in Home.\n"]
 
 
 def test_join_moves_to_that_players_room() -> None:
     """Join follows a player when the destination has space."""
-    bea = _Player(name="Bea", room="hall")
-    host = _Host(people=[bea])
-    ada = _Player()
-    process_commands(host, ada, "join Bea")  # type: ignore[arg-type]
+    bea = FakePlayer(name="Bea", room="hall")
+    server = FakeServer(people=[bea])
+    ada = FakePlayer()
+    process_commands(server, ada, "join Bea")  # type: ignore[arg-type]
     assert ada.room == "hall"
-    assert host.room_lines == ["Ada goes to join Bea.\n", "Ada arrives.\n"]
-    assert host.sent[0] == host._layout.brief("hall", [])
+    assert server.room_lines == ["Ada goes to join Bea.\n", "Ada arrives.\n"]
+    assert server.sent[0] == server.layout.brief("hall", [])
 
-    stay = _Host(people=[_Player(name="Bea", room="reception")])
-    ada = _Player()
+    stay = FakeServer(people=[FakePlayer(name="Bea", room="reception")])
+    ada = FakePlayer()
     process_commands(stay, ada, "join Bea")  # type: ignore[arg-type]
     assert ada.room == "reception"
     assert stay.sent == ["You are already in Reception.\n"]
     assert stay.room_lines == []
 
-    full = _Host(people=[bea], occupied=4)
-    stuck = _Player()
+    full = FakeServer(people=[bea], occupied=4)
+    stuck = FakePlayer()
     process_commands(full, stuck, "join Bea")  # type: ignore[arg-type]
     assert stuck.room == "reception"
     assert full.sent == ["Hall is full.\n"]
     assert full.room_lines == []
 
-    missing, player = _run("join Nobody")
+    missing, player = run("join Nobody")
     assert missing.sent == ["Player Nobody not found.\n"]
     assert player.room == "reception"
 
 
 def test_join_uses_one_partial_name_and_refuses_several() -> None:
     """Join be follows Bea. Join b names both Bea and Ben."""
-    bea = _Player(name="Bea", room="hall")
-    host = _Host(people=[bea])
-    ada = _Player()
-    process_commands(host, ada, "join be")  # type: ignore[arg-type]
+    bea = FakePlayer(name="Bea", room="hall")
+    server = FakeServer(people=[bea])
+    ada = FakePlayer()
+    process_commands(server, ada, "join be")  # type: ignore[arg-type]
     assert ada.room == "hall"
 
-    ben = _Player(name="Ben", room="hall")
-    host = _Host(people=[bea, ben])
-    ada = _Player()
-    process_commands(host, ada, "join b")  # type: ignore[arg-type]
-    assert host.sent == ["multiple Matches: Bea & Ben\n"]
+    ben = FakePlayer(name="Ben", room="hall")
+    server = FakeServer(people=[bea, ben])
+    ada = FakePlayer()
+    process_commands(server, ada, "join b")  # type: ignore[arg-type]
+    assert server.sent == ["multiple Matches: Bea & Ben\n"]
     assert ada.room == "reception"
 
 
 def test_main_moves_to_the_start_room() -> None:
     """Main announces the leave and the arrive, then shows the room."""
-    ada = _Player(room="hall")
-    host = _Host(people=[ada])
-    process_commands(host, ada, "main")  # type: ignore[arg-type]
+    ada = FakePlayer(room="hall")
+    server = FakeServer(people=[ada])
+    process_commands(server, ada, "main")  # type: ignore[arg-type]
     assert ada.room == "reception"
-    assert host.room_lines == ["Ada goes to Reception.\n", "Ada arrives.\n"]
-    assert host.sent[0] == host._layout.brief("reception", [])
+    assert server.room_lines == ["Ada goes to Reception.\n", "Ada arrives.\n"]
+    assert server.sent[0] == server.layout.brief("reception", [])
 
 
 def test_main_does_nothing_when_already_there() -> None:
     """Main sends nothing when the player is already in the start room."""
-    host, ada = _run("main")
+    server, ada = run("main")
     assert ada.room == "reception"
-    assert host.sent == []
-    assert host.room_lines == []
+    assert server.sent == []
+    assert server.room_lines == []
 
 
 def test_main_stays_when_the_start_room_is_full() -> None:
     """A full start room keeps the player where they are."""
-    ada = _Player(room="hall")
-    host = _Host(people=[ada], occupied=4)
-    process_commands(host, ada, "main")  # type: ignore[arg-type]
+    ada = FakePlayer(room="hall")
+    server = FakeServer(people=[ada], occupied=4)
+    process_commands(server, ada, "main")  # type: ignore[arg-type]
     assert ada.room == "hall"
-    assert host.sent == ["Reception is full.\n"]
-    assert host.room_lines == []
+    assert server.sent == ["Reception is full.\n"]
+    assert server.room_lines == []
 
 
 def test_main_with_extra_text_shows_the_syntax() -> None:
     """Extra text does not move the player."""
-    host, player = _run("main please")
-    assert host.sent == ["Syntax: main\n"]
+    server, player = run("main please")
+    assert server.sent == ["Syntax: main\n"]
     assert player.room == "reception"
 
 
 def test_main_uses_the_start_room_display_name() -> None:
     """The leave line uses the display name of config.start."""
-    layout = Layout(
-        rooms={
-            "lounge": Room("A lounge.", 4, {}),
-            "the_bar": Room("A bar.", 4, {}),
-        }
-    )
-    ada = _Player(room="lounge")
-    host = _Host(people=[ada], _layout=layout)
-    host._config = replace(host._config, start="the_bar")
-    process_commands(host, ada, "main")  # type: ignore[arg-type]
+    layout = Layout(rooms={"lounge": Room("A lounge.", 4, {}), "the_bar": Room("A bar.", 4, {})})
+    ada = FakePlayer(room="lounge")
+    server = FakeServer(people=[ada], layout=layout)
+    server.config = replace(server.config, start="the_bar")
+    process_commands(server, ada, "main")  # type: ignore[arg-type]
     assert ada.room == "the_bar"
-    assert host.room_lines == ["Ada goes to The Bar.\n", "Ada arrives.\n"]
+    assert server.room_lines == ["Ada goes to The Bar.\n", "Ada arrives.\n"]
 
 
-class _ClosedHost(_Host):
-    """A host whose send fails, so the arrive line must not be sent."""
+class ClosedServer(FakeServer):
+    """A server whose send fails, so the arrive line must not be sent."""
 
-    def send(self, client: _Player, text: str) -> bool:
+    def send(self, client: FakePlayer, text: str) -> bool:
+        if output_hidden(client):
+            return True
         self.sent.append(text)
         client.sent.append(text)
         return False
@@ -2162,51 +3327,62 @@ class _ClosedHost(_Host):
 
 def test_main_skips_the_arrive_line_when_the_brief_fails() -> None:
     """A failed description does not announce the arrival."""
-    ada = _Player(room="hall")
-    host = _ClosedHost(people=[ada])
-    process_commands(host, ada, "main")  # type: ignore[arg-type]
+    ada = FakePlayer(room="hall")
+    server = ClosedServer(people=[ada])
+    process_commands(server, ada, "main")  # type: ignore[arg-type]
     assert ada.room == "reception"
-    assert host.room_lines == ["Ada goes to Reception.\n"]
+    assert server.room_lines == ["Ada goes to Reception.\n"]
 
 
 def test_examine_idle_of_ten_seconds_is_not_idle(tmp_path: Path) -> None:
-    """Ten seconds is not idle. Eleven seconds uses the duration words."""
-    host = _login_host(tmp_path)
+    """Ten seconds is not idle. Eleven seconds uses the duration words.
+
+    Examining yourself is already zero, because typing cleared idle first.
+    """
+    server = login_host(tmp_path)
     user = Player("Bea", "hall", datetime.now(timezone.utc), idle_seconds=10)
-    bea = _Player(name="Bea", room="hall", player=user, discovered_columns=72)
-    host.people = [bea]
-    process_commands(host, bea, "examine me")  # type: ignore[arg-type]
-    assert "Not idle at all" in host.sent[0]
-    assert "Idle for" in host.sent[0]
-    assert host.sent[0].splitlines()[0] == "-" * 72
+    bea = FakePlayer(name="Bea", room="hall", player=user, discovered_columns=72)
+    ada_user = Player("Ada", "hall", datetime.now(timezone.utc), idle_seconds=40)
+    ada = FakePlayer(name="Ada", room="hall", player=ada_user, discovered_columns=72)
+    server.people = [ada, bea]
+    process_commands(server, ada, "examine Bea")  # type: ignore[arg-type]
+    assert "Not idle at all" in server.sent[0]
+    assert "Idle for" in server.sent[0]
+    assert server.sent[0].splitlines()[0] == "-" * 72
+    assert user.idle_seconds == 10
+    assert ada_user.idle_seconds == 0
     user.idle_seconds = 11
-    host.sent.clear()
-    process_commands(host, bea, "examine me")  # type: ignore[arg-type]
-    assert "Not idle at all" not in host.sent[0]
-    assert duration_phrase(11) in host.sent[0]
+    server.sent.clear()
+    process_commands(server, ada, "examine Bea")  # type: ignore[arg-type]
+    assert "Not idle at all" not in server.sent[0]
+    assert duration_phrase(11) in server.sent[0]
+    ada_user.idle_seconds = 40
+    server.sent.clear()
+    process_commands(server, ada, "examine me")  # type: ignore[arg-type]
+    assert "Not idle at all" in server.sent[0]
+    assert ada_user.idle_seconds == 0
 
 
-def test_examine_shows_name_room_and_time() -> None:
+def test_examine_shows_ssh_when_the_socket_is_ssh() -> None:
+    """Connected via is ssh on an SSH socket and telnet otherwise."""
+    when = datetime.now(timezone.utc)
+    user = Player("Bea", "hall", when)
+    bea = FakePlayer(name="Bea", room="hall", player=user, ssh=True)
+    server = FakeServer(people=[bea])
+    process_commands(server, FakePlayer(), "examine Bea")  # type: ignore[arg-type]
+    assert "Connected via" not in server.sent[0]
+    assert "[via ssh]" in server.sent[0]
+    bea.ssh = False
+    server.sent.clear()
+    process_commands(server, FakePlayer(), "examine Bea")  # type: ignore[arg-type]
+    assert "[via telnet]" in server.sent[0]
     """Examine names a player. ``x`` needs a space, and a missing player is not found."""
     when = datetime.now(timezone.utc) - timedelta(minutes=10)
-    bea = _Player(
-        name="Bea",
-        room="hall",
-        player=Player("Bea", "hall", when, connected_seconds=7200),
-    )
-    host = _Host(people=[bea])
-    process_commands(host, _Player(), "examine Bea")  # type: ignore[arg-type]
-    body = examine_frame(
-        "Bea",
-        (
-            ("User Rank", shown_rank(RANK_NEWBIE, True)),
-            ("Logged in for", "10 minutes"),
-            ("Total Login", "2 hours"),
-            ("Idle for", "Not idle at all"),
-        ),
-        72,
-    )
-    assert host.sent == [body]
+    bea = FakePlayer(name="Bea", room="hall", player=Player("Bea", "hall", when, connected_seconds=7200))
+    server = FakeServer(people=[bea])
+    process_commands(server, FakePlayer(), "examine Bea")  # type: ignore[arg-type]
+    body = examine_frame("Bea", (("User Rank", shown_rank(Rank.NEWBIE, True)), ("Logged in from", LOCAL_FROM), ("Logged in for", "10 minutes"), ("Total Login", "2 hours"), ("Idle for", "Not idle at all"), *ROOM_SENTENCES), 72)  # fmt: skip  # noqa: E501
+    assert server.sent == [body]
     assert "User Rank" in body
     assert "Logged in for" in body
     assert "10 minutes" in body
@@ -2214,19 +3390,19 @@ def test_examine_shows_name_room_and_time() -> None:
     assert "2 hours" in body
     assert "Not idle at all" in body
     assert "Location:" not in body
-    assert "Logged in from" not in body
+    assert "[via telnet]" in body
 
-    host = _Host(people=[bea])
-    process_commands(host, _Player(), "x Bea")  # type: ignore[arg-type]
-    assert host.sent == [body]
+    server = FakeServer(people=[bea])
+    process_commands(server, FakePlayer(), "x Bea")  # type: ignore[arg-type]
+    assert server.sent == [body]
 
-    glued, _player = _run("xBea")
+    glued, _ = run("xBea")
     assert glued.sent == ["No such command 'xBea'\n"]
 
-    bare, _player = _run("x")
-    assert bare.sent == ["Syntax: examine <name>\n"]
+    bare, _ = run("x")
+    assert bare.sent == ["Syntax: x <name>\n"]
 
-    missing, _player = _run("examine Nobody")
+    missing, _ = run("examine Nobody")
     assert missing.sent == ["Player Nobody not found.\n"]
 
 
@@ -2236,10 +3412,10 @@ def test_examine_text_is_the_seventy_two_column_profile() -> None:
 
     when = datetime.now(timezone.utc) - timedelta(minutes=10)
     user = Player("Bea", "hall", when, connected_seconds=7200, idle_seconds=0)
-    bea = _Player(name="Bea", room="hall", player=user, discovered_columns=72)
-    host = _Host(people=[bea])
-    process_commands(host, bea, "examine me")  # type: ignore[arg-type]
-    text = host.sent[0]
+    bea = FakePlayer(name="Bea", room="hall", player=user, discovered_columns=72)
+    server = FakeServer(people=[bea])
+    process_commands(server, bea, "examine me")  # type: ignore[arg-type]
+    text = server.sent[0]
     assert text.splitlines()[0] == "-" * 72
     assert text.splitlines()[-1] == "-" * 72
     assert green("Newbie") in text
@@ -2255,136 +3431,80 @@ def test_examine_hides_the_terminal_line_from_other_players(tmp_path: Path) -> N
     """Another player, and a logged-out examine, do not show the terminal line."""
     when = datetime.now(timezone.utc)
     bea_user = Player("Bea", "hall", when)
-    ada = _Player(discovered_columns=80, discovered_rows=24)
-    bea = _Player(name="Bea", room="hall", player=bea_user)
-    host = _Host(people=[ada, bea])
-    process_commands(host, ada, "examine Bea")  # type: ignore[arg-type]
-    assert "Terminal Size" not in host.sent[0]
+    ada = FakePlayer(discovered_columns=80, discovered_rows=24)
+    bea = FakePlayer(name="Bea", room="hall", player=bea_user)
+    server = FakeServer(people=[ada, bea])
+    process_commands(server, ada, "examine Bea")  # type: ignore[arg-type]
+    assert "Terminal Size" not in server.sent[0]
 
     left = datetime.now(timezone.utc) - timedelta(hours=2)
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            logged_out_at=left,
-        ),
-    )
-    host = _login_host(tmp_path)
-    process_commands(host, _viewer(RANK_RESIDENT), "examine Bea")  # type: ignore[arg-type]
-    assert "Terminal Size" not in host.sent[0]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), logged_out_at=left))
+    server = login_host(tmp_path)
+    process_commands(server, viewer(Rank.RESIDENT), "examine Bea")  # type: ignore[arg-type]
+    assert "Terminal Size" not in server.sent[0]
 
-    pending = _Player(
-        name="Bea",
-        room="hall",
-        player=Player("Bea", "hall", when),
-        discovered_columns=None,
-        discovered_rows=None,
-        frame_columns=None,
-    )
-    host = _Host(people=[pending])
-    process_commands(host, pending, "examine me")  # type: ignore[arg-type]
-    assert "80  (Pending)" in host.sent[0]
+    pending = FakePlayer(name="Bea", room="hall", player=Player("Bea", "hall", when), discovered_columns=None, discovered_rows=None, frame_columns=None)  # fmt: skip  # noqa: E501
+    server = FakeServer(people=[pending])
+    process_commands(server, pending, "examine me")  # type: ignore[arg-type]
+    assert "80  (Pending)" in server.sent[0]
 
 
 def test_examine_me_is_the_typist() -> None:
     """me, Me, and ME show the typist, and staff see their own address."""
     when = datetime.now(timezone.utc) - timedelta(minutes=10)
     user = Player("Ada", "reception", when, connected_seconds=7200)
-    ada = _Player(name="Ada", room="reception", player=user, address="10.0.0.5")
-    host = _Host(people=[ada])
-    body = examine_frame(
-        "Ada",
-        (
-            ("User Rank", shown_rank(RANK_NEWBIE, True)),
-            ("Logged in for", "10 minutes"),
-            ("Total Login", "2 hours"),
-            ("Idle for", "Not idle at all"),
-            ("Terminal Size", "72x24 (72x24 discovered)"),
-        ),
-        72,
-    )
+    ada = FakePlayer(name="Ada", room="reception", player=user, address="10.0.0.5")
+    server = FakeServer(people=[ada])
+    body = examine_frame("Ada", (("User Rank", shown_rank(Rank.NEWBIE, True)), ("Logged in from", "10.0.0.5 (10.0.0.5) [via telnet]"), ("Logged in for", "10 minutes"), ("Total Login", "2 hours"), ("Idle for", "Not idle at all"), ("Terminal Size", "72x24 (72x24 discovered)"), *ROOM_SENTENCES), 72)  # fmt: skip  # noqa: E501
     for word in ("me", "Me", "ME"):
-        host.sent.clear()
-        process_commands(host, ada, f"examine {word}")  # type: ignore[arg-type]
-        assert host.sent == [body]
-    host.sent.clear()
-    process_commands(host, ada, "x me")  # type: ignore[arg-type]
-    assert host.sent == [body]
+        server.sent.clear()
+        process_commands(server, ada, f"examine {word}")  # type: ignore[arg-type]
+        assert server.sent == [body]
+    server.sent.clear()
+    process_commands(server, ada, "x me")  # type: ignore[arg-type]
+    assert server.sent == [body]
     assert "Ada".center(63) in body
     assert "Not idle at all" in body
     assert "Location:" not in body
 
-    sue = _staff("Sue", RANK_SUPER)
+    sue = staff("Sue", Rank.SUPER_USER)
     sue.address = "10.0.0.9"
-    host.people.append(sue)
-    host.sent.clear()
-    process_commands(host, sue, "examine ME")  # type: ignore[arg-type]
-    assert host.sent == [
-        examine_frame(
-            "Sue",
-            (
-                ("User Rank", shown_rank(RANK_SUPER, True)),
-                ("Logged in from", "10.0.0.9"),
-                ("Logged in for", "0 seconds"),
-                ("Total Login", "0 seconds"),
-                ("Idle for", "Not idle at all"),
-                ("Terminal Size", "72x24 (72x24 discovered)"),
-            ),
-            72,
-        )
-    ]
+    sue.hostname = "sue.example"
+    server.people.append(sue)
+    server.sent.clear()
+    process_commands(server, sue, "examine ME")  # type: ignore[arg-type]
+    assert server.sent == [examine_frame("Sue", (("User Rank", shown_rank(Rank.SUPER_USER, True)), ("Logged in from", "sue.example (10.0.0.9) [via telnet]"), ("Logged in for", "0 seconds"), ("Total Login", "0 seconds"), ("Idle for", "Not idle at all"), ("Terminal Size", "72x24 (72x24 discovered)"), *ROOM_SENTENCES), 72)]  # fmt: skip  # noqa: E501
 
 
 def test_examine_finds_a_connected_newbie_by_exact_name(tmp_path: Path) -> None:
     """Find a connected newbie by the lowercase key."""
-    host = _login_host(tmp_path)
-    cyd = _newbie("Cyd")
-    host.people = [cyd]
-    body = examine_frame(
-        "Cyd",
-        (
-            ("User Rank", shown_rank(RANK_NEWBIE, True)),
-            ("Logged in for", "0 seconds"),
-            ("Total Login", "0 seconds"),
-            ("Idle for", "Not idle at all"),
-            ("Terminal Size", "72x24 (72x24 discovered)"),
-        ),
-        72,
-    )
-    process_commands(host, cyd, "examine Cyd")  # type: ignore[arg-type]
-    assert host.sent == [body]
+    server = login_host(tmp_path)
+    cyd = newbie("Cyd")
+    server.people = [cyd]
+    body = examine_frame("Cyd", (("User Rank", shown_rank(Rank.NEWBIE, True)), ("Logged in from", LOCAL_FROM), ("Logged in for", "0 seconds"), ("Total Login", "0 seconds"), ("Idle for", "Not idle at all"), ("Terminal Size", "72x24 (72x24 discovered)"), *ROOM_SENTENCES), 72)  # fmt: skip  # noqa: E501
+    process_commands(server, cyd, "examine Cyd")  # type: ignore[arg-type]
+    assert server.sent == [body]
     assert "Cyd" in body
     assert "User Rank" in body
     assert "Newbie" in body
     assert load_saved(player_path(tmp_path, "Cyd")) is None
-    host.sent.clear()
-    process_commands(host, cyd, "examine cyd")  # type: ignore[arg-type]
-    assert host.sent == [body]
-    assert "Player cyd not found." not in host.sent[0]
+    server.sent.clear()
+    process_commands(server, cyd, "examine cyd")  # type: ignore[arg-type]
+    assert server.sent == [body]
+    assert "Player cyd not found." not in server.sent[0]
 
 
 def test_examine_lowercase_saved_name_uses_the_in_room_block(tmp_path: Path) -> None:
     """A saved player who is here gets the in-room block, not the logout block."""
-    _save(tmp_path, "Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
     when = datetime.now(timezone.utc) - timedelta(minutes=10)
     user = Player("Bea", "hall", when, connected_seconds=7200)
-    bea = _Player(name="Bea", room="hall", player=user)
-    host.people = [bea, _newbie("Ada")]
-    process_commands(host, _newbie("Ada"), "examine bea")  # type: ignore[arg-type]
-    body = examine_frame(
-        "Bea",
-        (
-            ("User Rank", shown_rank(RANK_NEWBIE, True)),
-            ("Logged in for", "10 minutes"),
-            ("Total Login", "2 hours"),
-            ("Idle for", "Not idle at all"),
-        ),
-        72,
-    )
-    assert host.sent == [body]
+    bea = FakePlayer(name="Bea", room="hall", player=user)
+    server.people = [bea, newbie("Ada")]
+    process_commands(server, newbie("Ada"), "examine bea")  # type: ignore[arg-type]
+    body = examine_frame("Bea", (("User Rank", shown_rank(Rank.NEWBIE, True)), ("Logged in from", LOCAL_FROM), ("Logged in for", "10 minutes"), ("Total Login", "2 hours"), ("Idle for", "Not idle at all"), *ROOM_SENTENCES), 72)  # fmt: skip  # noqa: E501
+    assert server.sent == [body]
     assert "Bea" in body
     assert "10 minutes" in body
     assert "2 hours" in body
@@ -2396,25 +3516,26 @@ def test_examine_lowercase_saved_name_uses_the_in_room_block(tmp_path: Path) -> 
 def test_alarm_sets_seconds_and_idle_lists_players() -> None:
     """Alarm stores minutes as seconds and resets the asker's idle."""
     when = datetime.now(timezone.utc)
-    ada_user = Player("Ada", "reception", when, idle_seconds=40)
+    ada_user = Player("Ada", "reception", when, idle_seconds=40, rank=Rank.RESIDENT)
     bea_user = Player("Bea", "hall", when, idle_seconds=125)
-    ada = _Player(name="Ada", room="reception", player=ada_user)
-    host = _Host(people=[ada, _Player(name="Bea", room="hall", player=bea_user)])
-    process_commands(host, ada, "alarm 2")  # type: ignore[arg-type]
+    ada = FakePlayer(name="Ada", room="reception", player=ada_user)
+    server = FakeServer(people=[ada, FakePlayer(name="Bea", room="hall", player=bea_user)])
+    process_commands(server, ada, "alarm 2")  # type: ignore[arg-type]
     assert ada_user.alarm_seconds == 120
     assert ada_user.idle_seconds == 0
-    assert host.sent == ["Alarm set for 2 minutes.\n"]
+    assert server.sent == ["Alarm set for 2 minutes.\n"]
 
-    bad, _player = _run("alarm later")
+    resident = FakePlayer(player=Player("Ada", "reception", when, rank=Rank.RESIDENT))
+    bad, _ = run("alarm later", resident)
     assert bad.sent == ["Syntax: alarm <minutes>\n"]
-    bad_sup, _player = _run("alarm ²")
+    bad_sup, _ = run("alarm ²", resident)
     assert bad_sup.sent == ["Syntax: alarm <minutes>\n"]
 
 
 def test_idle_is_unknown() -> None:
     """Idle is not a command."""
-    host, _player = _run("idle")
-    assert host.sent == ["No such command 'idle'\n"]
+    server, _ = run("idle")
+    assert server.sent == ["No such command 'idle'\n"]
 
 
 def test_consume_seconds_keeps_the_fraction() -> None:
@@ -2429,63 +3550,52 @@ def test_consume_seconds_keeps_the_fraction() -> None:
 
 def test_commands_include_go_and_map() -> None:
     """The command list names the new words, with aliases before names."""
-    host, _player = _run("commands")
-    words = host.sent[0].split()
+    server, _ = run("commands")
+    words = server.sent[0].split()
     assert words.index("`") < words.index("commands")
     assert "go" in words
     assert "map" in words
 
 
-def _login_host(tmp_path: Path, admin: str = "admin", *, opened: bool = True) -> _Host:
-    if opened and load_saved(player_path(tmp_path, admin)) is None:
-        save_player(
-            tmp_path,
-            SavedPlayer(admin, RANK_SUPER_ADMIN, hash_password("pw", rounds=4)),
-        )
-    config = Config(
-        port=1,
-        rooms=Path("rooms.yml"),
-        start="reception",
-        help=Path("help.yml"),
-        players=tmp_path,
-        admin=admin,
-        mfa_enabled=False,
-    )
-    host = _Host(_config=config, _roster_dir=tmp_path)
-    host._help = HelpBook(
-        entries=(HelpEntry("disclaimer", (), "Be kind."),),
-    )
-    return host
+def login_host(tmp_path: Path, super_admin: str | None = "admin", *, opened: bool = True) -> FakeServer:
+    """Build a fake server with an optional saved super admin."""
+    if not opened:
+        super_admin = None
+    if super_admin is not None and load_saved(player_path(tmp_path, super_admin)) is None:
+        save_player(tmp_path, SavedPlayer(super_admin, Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
+    config = Config(port=1, rooms=Path("rooms.yml"), start="reception", help=Path("help.yml"), players=tmp_path, mfa_enabled=False)  # fmt: skip  # noqa: E501
+    server = FakeServer(config=config, roster_dir=tmp_path)
+    server.help = HelpBook(entries=(HelpEntry("disclaimer", (), "Be kind."),))
+    return server
 
 
-def _mfa_login_host(tmp_path: Path, admin: str = "admin", *, opened: bool = True) -> _Host:
-    host = _login_host(tmp_path, admin, opened=opened)
-    host._mfa_enabled = True
-    host._config = replace(host._config, mfa_enabled=True)
-    return host
+def mfa_login_host(tmp_path: Path, super_admin: str | None = "admin", *, opened: bool = True) -> FakeServer:
+    """Build a fake server with MFA enabled and an optional saved super admin."""
+    server = login_host(tmp_path, super_admin, opened=opened)
+    server.mfa_enabled = True
+    server.config = replace(server.config, mfa_enabled=True)
+    return server
 
 
-def _register_mfa_command() -> None:
-    from lupaxa.chat_server.commands_list import COMMANDS, ensure_commands
+def register_mfa_command() -> None:
+    from lupaxa.chat_server.commands import ensure_commands
+    from lupaxa.chat_server.globals import COMMANDS
     from lupaxa.chat_server.mfa import register_mfa
 
     ensure_commands()
     register_mfa(COMMANDS)
 
 
-def _mfa_command_host(tmp_path: Path, admin: str = "admin", *, opened: bool = True) -> _Host:
-    host = _mfa_login_host(tmp_path, admin, opened=opened)
-    _register_mfa_command()
-    return host
+def mfa_command_host(tmp_path: Path, super_admin: str | None = "admin", *, opened: bool = True) -> FakeServer:
+    server = mfa_login_host(tmp_path, super_admin, opened=opened)
+    register_mfa_command()
+    return server
 
 
-_MFA_REMOVED_WARNING = (
-    "Your MFA has been removed. Set it up again before you log out. "
-    "The next login will make you set it up before you can enter."
-)
+MFA_REMOVED_WARNING = ("Your MFA has been removed. Set it up again before you log out. The next login will make you set it up before you can enter.")  # fmt: skip  # noqa: E501
 
 
-def _assert_sealed_mfa_secret(saved: SavedPlayer, password: str, plain_secret: str) -> None:
+def assert_sealed_mfa_secret(saved: SavedPlayer, password: str, plain_secret: str) -> None:
     """Assert the file seal opens with ``password`` to ``plain_secret``."""
     from lupaxa.chat_server.mfa_seal import open_mfa_secret
 
@@ -2496,7 +3606,7 @@ def _assert_sealed_mfa_secret(saved: SavedPlayer, password: str, plain_secret: s
     assert open_mfa_secret(password, saved.mfa_secret) == plain_secret
 
 
-def _totp_code(secret: str, *, now: int = 1_700_000_000) -> str:
+def totp_code(secret: str, *, now: int = 1_700_000_000) -> str:
     import base64
     import hmac
     import struct
@@ -2510,47 +3620,32 @@ def _totp_code(secret: str, *, now: int = 1_700_000_000) -> str:
     return f"{binary % 1_000_000:06d}"
 
 
-def test_mfa_login_asks_for_a_code_after_the_password(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_mfa_login_asks_for_a_code_after_the_password(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A saved secret sends Code after the password, then enters on a match."""
     totp_seed = TOTP_TEST_SEED
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            mfa_secret=totp_seed,
-        ),
-    )
-    host = _mfa_login_host(tmp_path)
-    player = _Player(player=None)
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_secret=totp_seed))
+    server = mfa_login_host(tmp_path)
+    player = FakePlayer(player=None)
     monkeypatch.setattr("lupaxa.chat_server.password.time.time", lambda: 1_700_000_000.0)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
     assert player.player is None
     assert player.auth == "code"
-    assert host.sent[-1] == "Code: "
-    process_input(host, player, _totp_code(totp_seed))  # type: ignore[arg-type]
+    assert server.sent[-1] == "Code: "
+    process_input(server, player, totp_code(totp_seed))  # type: ignore[arg-type]
     assert player.player is not None
     assert player.player.name == "Bea"
 
 
-def test_a_plaintext_secret_still_logs_in_and_is_sealed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_plaintext_secret_still_logs_in_and_is_sealed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """An old base32 secret matches a code and is stored sealed."""
     totp_seed = TOTP_TEST_SEED
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4), mfa_secret=totp_seed),
-    )
-    host = _mfa_login_host(tmp_path)
-    player = _Player(player=None)
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_secret=totp_seed))
+    server = mfa_login_host(tmp_path)
+    player = FakePlayer(player=None)
     monkeypatch.setattr("lupaxa.chat_server.password.time.time", lambda: 1_700_000_000.0)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.mfa_secret is not None
@@ -2559,7 +3654,7 @@ def test_a_plaintext_secret_still_logs_in_and_is_sealed(
     assert saved.mfa_on is True
     assert player.auth == "code"
     assert player.player is None
-    process_input(host, player, _totp_code(totp_seed))  # type: ignore[arg-type]
+    process_input(server, player, totp_code(totp_seed))  # type: ignore[arg-type]
     assert player.player is not None
     assert player.pending_password == ""
     assert player.pending_mfa_secret == ""
@@ -2574,17 +3669,14 @@ def test_a_plaintext_secret_still_logs_in_and_is_sealed(
 def test_mfa_off_still_seals_a_plaintext_secret(tmp_path: Path) -> None:
     """A turned-off server seals the secret and does not ask for a code."""
     totp_seed = TOTP_TEST_SEED
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4), mfa_secret=totp_seed),
-    )
-    host = _mfa_login_host(tmp_path)
-    host._mfa_enabled = False
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_secret=totp_seed))
+    server = mfa_login_host(tmp_path)
+    server.mfa_enabled = False
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
     assert player.player is not None
-    assert "Code:" not in "".join(host.sent)
+    assert "Code:" not in "".join(server.sent)
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.mfa_secret is not None
@@ -2594,15 +3686,12 @@ def test_mfa_off_still_seals_a_plaintext_secret(tmp_path: Path) -> None:
 
 def test_login_says_mfa_was_removed_when_the_flag_remains(tmp_path: Path) -> None:
     """A deleted secret is obvious when the file still shows MFA was on."""
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4), mfa_on=True),
-    )
-    host = _mfa_login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
-    assert "Your MFA has been removed.\n" in host.sent
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_on=True))
+    server = mfa_login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
+    assert "Your MFA has been removed.\n" in server.sent
     assert player.player is not None
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
@@ -2611,15 +3700,12 @@ def test_login_says_mfa_was_removed_when_the_flag_remains(tmp_path: Path) -> Non
 
 def test_staff_with_the_flag_are_told_and_must_set_mfa_up(tmp_path: Path) -> None:
     """A wiped secret still blocks staff when the file shows MFA was on."""
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_SUPER, hash_password("pw", rounds=4), mfa_on=True),
-    )
-    host = _mfa_login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
-    assert "Your MFA has been removed.\n" in host.sent
+    save_player(tmp_path, SavedPlayer("Bea", Rank.SUPER_USER, hash_password("pw", rounds=4), mfa_on=True))
+    server = mfa_login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
+    assert "Your MFA has been removed.\n" in server.sent
     assert player.auth == "mfa_enroll"
     assert player.player is None
     saved = load_saved(player_path(tmp_path, "Bea"))
@@ -2627,26 +3713,62 @@ def test_staff_with_the_flag_are_told_and_must_set_mfa_up(tmp_path: Path) -> Non
     assert saved.mfa_on is True
 
 
+def test_su_channel_must_enrol_when_mfa_is_on(tmp_path: Path) -> None:
+    """MFA on and no secret sends SU Channel to enrolment. A resident enters."""
+    save_player(tmp_path, SavedPlayer("Ada", Rank.SU_CHANNEL, hash_password("pw", rounds=4)))
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = mfa_login_host(tmp_path)
+    ada = FakePlayer(player=None)
+    process_input(server, ada, "Ada")  # type: ignore[arg-type]
+    process_input(server, ada, "pw")  # type: ignore[arg-type]
+    assert ada.auth == "mfa_enroll"
+    assert ada.player is None
+    bea = FakePlayer(player=None)
+    process_input(server, bea, "Bea")  # type: ignore[arg-type]
+    process_input(server, bea, "pw")  # type: ignore[arg-type]
+    assert bea.player is not None
+    assert bea.auth != "mfa_enroll"
+
+
+def test_su_channel_sees_the_closed_talker_line(tmp_path: Path) -> None:
+    """Login and reconnect show the closed line to SU Channel, not to a resident."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save_player(players, SavedPlayer("Ada", Rank.SU_CHANNEL, hash_password("pw", rounds=4)))
+    save_player(players, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path, super_admin=None)
+    server.roster_dir = players
+    server.config = replace(server.config, players=players)
+    server.allow_residents = False
+    ada = FakePlayer(player=None)
+    enter(server, ada, "Ada", Rank.SU_CHANNEL)  # type: ignore[arg-type]
+    assert "[ Status ] The talker is closed to newbies and residents.\n" in ada.sent
+    bea = FakePlayer(player=None)
+    enter(server, bea, "Bea", Rank.RESIDENT)  # type: ignore[arg-type]
+    assert "[ Status ] The talker is closed to newbies and residents.\n" not in bea.sent
+    live = staff("Ada", Rank.SU_CHANNEL)
+    live.room = "hall"
+    assert live.player is not None
+    live.player.room = "hall"
+    server.people = [live]
+    held = load_saved(player_path(players, "Ada"))
+    assert held is not None
+    newcomer = FakePlayer(player=None)
+    enter_fresh(server, newcomer, held)  # type: ignore[arg-type]
+    assert "[ Status ] The talker is closed to newbies and residents.\n" in live.sent
+
+
 def test_staff_unreadable_seal_kept_until_setup_finishes(tmp_path: Path) -> None:
     """Staff keep a seal that will not open until enrolment saves."""
     from lupaxa.chat_server.mfa_seal import seal_mfa_secret
 
     sealed = seal_mfa_secret("other", TOTP_TEST_SEED)
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_SUPER,
-            hash_password("pw", rounds=4),
-            mfa_secret=sealed,
-            mfa_on=True,
-        ),
-    )
-    host = _mfa_login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
-    assert "Your MFA has been removed.\n" in host.sent
+    save_player(tmp_path, SavedPlayer("Bea", Rank.SUPER_USER, hash_password("pw", rounds=4), mfa_secret=sealed, mfa_on=True))
+    server = mfa_login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
+    assert "Your MFA has been removed.\n" in server.sent
     assert player.auth == "mfa_enroll"
     assert player.player is None
     saved = load_saved(player_path(tmp_path, "Bea"))
@@ -2657,12 +3779,12 @@ def test_staff_unreadable_seal_kept_until_setup_finishes(tmp_path: Path) -> None
 
 def test_staff_without_the_flag_set_up_with_no_removal_line(tmp_path: Path) -> None:
     """The first forced setup does not say MFA was removed."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_SUPER, hash_password("pw", rounds=4)))
-    host = _mfa_login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
-    assert "Your MFA has been removed.\n" not in host.sent
+    save_player(tmp_path, SavedPlayer("Bea", Rank.SUPER_USER, hash_password("pw", rounds=4)))
+    server = mfa_login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
+    assert "Your MFA has been removed.\n" not in server.sent
     assert player.auth == "mfa_enroll"
 
 
@@ -2671,23 +3793,14 @@ def test_mfa_off_leaves_an_unreadable_secret_in_place(tmp_path: Path) -> None:
     from lupaxa.chat_server.mfa_seal import seal_mfa_secret
 
     sealed = seal_mfa_secret("other", TOTP_TEST_SEED)
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            mfa_secret=sealed,
-            mfa_on=True,
-        ),
-    )
-    host = _mfa_login_host(tmp_path)
-    host._mfa_enabled = False
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_secret=sealed, mfa_on=True))
+    server = mfa_login_host(tmp_path)
+    server.mfa_enabled = False
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
     assert player.player is not None
-    assert "Your MFA has been removed.\n" not in host.sent
+    assert "Your MFA has been removed.\n" not in server.sent
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.mfa_secret == sealed
@@ -2698,21 +3811,12 @@ def test_unreadable_secret_removed_when_mfa_flag_is_off(tmp_path: Path) -> None:
     from lupaxa.chat_server.mfa_seal import seal_mfa_secret
 
     sealed = seal_mfa_secret("other", TOTP_TEST_SEED)
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            mfa_secret=sealed,
-            mfa_on=False,
-        ),
-    )
-    host = _mfa_login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
-    assert "Your MFA has been removed.\n" in host.sent
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_secret=sealed, mfa_on=False))
+    server = mfa_login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
+    assert "Your MFA has been removed.\n" in server.sent
     assert player.player is not None
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
@@ -2724,21 +3828,12 @@ def test_an_unreadable_secret_tells_a_resident_and_is_deleted(tmp_path: Path) ->
     """A seal that will not open is removed after the resident is told."""
     from lupaxa.chat_server.mfa_seal import seal_mfa_secret
 
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            mfa_secret=seal_mfa_secret("other", TOTP_TEST_SEED),
-            mfa_on=True,
-        ),
-    )
-    host = _mfa_login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
-    assert "Your MFA has been removed.\n" in host.sent
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_secret=seal_mfa_secret("other", TOTP_TEST_SEED), mfa_on=True))  # fmt: skip  # noqa: E501
+    server = mfa_login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
+    assert "Your MFA has been removed.\n" in server.sent
     assert player.player is not None
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
@@ -2749,203 +3844,173 @@ def test_an_unreadable_secret_tells_a_resident_and_is_deleted(tmp_path: Path) ->
 def test_mfa_login_drops_after_three_wrong_codes(tmp_path: Path) -> None:
     """Three wrong codes on one login drop the connection."""
     totp_seed = TOTP_TEST_SEED
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            mfa_secret=totp_seed,
-        ),
-    )
-    host = _mfa_login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
-    process_input(host, player, "000000")  # type: ignore[arg-type]
-    assert host.sent[-2:] == ["Wrong code.\n", "Code: "]
-    process_input(host, player, "000001")  # type: ignore[arg-type]
-    process_input(host, player, "000002")  # type: ignore[arg-type]
-    assert host.dropped is True
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_secret=totp_seed))
+    server = mfa_login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
+    process_input(server, player, "000000")  # type: ignore[arg-type]
+    assert server.sent[-2:] == ["Wrong code.\n", "Code: "]
+    process_input(server, player, "000001")  # type: ignore[arg-type]
+    process_input(server, player, "000002")  # type: ignore[arg-type]
+    assert server.dropped is True
     assert player.player is None
 
 
-def test_mfa_enrolment_does_not_restore_a_nuked_player(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_mfa_enrolment_does_not_restore_a_nuked_player(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A code after nuke does not recreate the file or enter the room."""
-    save_player(tmp_path, SavedPlayer("Cyd", RANK_SUPER, hash_password("pw", rounds=4)))
-    host = _mfa_login_host(tmp_path)
-    boss = _staff("Boss", RANK_ADMIN)
-    host.people = [boss]
-    player = _Player(player=None)
+    save_player(tmp_path, SavedPlayer("Cyd", Rank.SUPER_USER, hash_password("pw", rounds=4)))
+    server = mfa_login_host(tmp_path)
+    boss = staff("Boss", Rank.ADMIN)
+    server.people = [boss]
+    player = FakePlayer(player=None)
     monkeypatch.setattr("lupaxa.chat_server.password.time.time", lambda: 1_700_000_000.0)
-    process_input(host, player, "Cyd")  # type: ignore[arg-type]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
+    process_input(server, player, "Cyd")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
     assert player.auth == "mfa_enroll"
     secret = player.pending_mfa_secret
     delete_player(tmp_path, "Cyd")
-    code = _totp_code(secret)
-    process_input(host, player, code)  # type: ignore[arg-type]
+    code = totp_code(secret)
+    process_input(server, player, code)  # type: ignore[arg-type]
     assert player.player is None
     assert load_saved(player_path(tmp_path, "Cyd")) is None
-    assert host.sent[-1] == NAME_PROMPT
+    assert server.sent[-1] == NAME_PROMPT
 
 
-def test_mfa_super_user_enrols_on_first_login(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_mfa_super_user_enrols_on_first_login(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A super user with no secret sees the secret, then saves it on a match."""
-    save_player(tmp_path, SavedPlayer("Cyd", RANK_SUPER, hash_password("pw", rounds=4)))
-    host = _mfa_login_host(tmp_path)
-    player = _Player(player=None)
+    save_player(tmp_path, SavedPlayer("Cyd", Rank.SUPER_USER, hash_password("pw", rounds=4)))
+    server = mfa_login_host(tmp_path)
+    player = FakePlayer(player=None)
     monkeypatch.setattr("lupaxa.chat_server.password.time.time", lambda: 1_700_000_000.0)
-    process_input(host, player, "Cyd")  # type: ignore[arg-type]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
+    process_input(server, player, "Cyd")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
     assert player.player is None
     assert player.auth == "mfa_enroll"
-    body = "".join(host.sent)
+    body = "".join(server.sent)
     assert player.pending_mfa_secret in body
     assert "Code:" in body
     secret = player.pending_mfa_secret
-    code = _totp_code(secret)
-    process_input(host, player, code)  # type: ignore[arg-type]
+    code = totp_code(secret)
+    process_input(server, player, code)  # type: ignore[arg-type]
     assert player.player is not None
     saved = load_saved(player_path(tmp_path, "Cyd"))
     assert saved is not None
-    _assert_sealed_mfa_secret(saved, "pw", secret)
+    assert_sealed_mfa_secret(saved, "pw", secret)
 
 
-def test_mfa_super_admin_first_login_waits_for_enrolment(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The config account file appears only after the enrolment code matches."""
-    host = _mfa_login_host(tmp_path, opened=False)
-    player = _Player(player=None)
+def test_mfa_super_admin_first_login_waits_for_enrolment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """MFA is sealed on the saved file only after the enrolment code matches."""
+    save_player(tmp_path, SavedPlayer("Zed", Rank.SUPER_ADMIN, hash_password("secret", rounds=4)))
+    server = mfa_login_host(tmp_path, super_admin=None)
+    player = FakePlayer(player=None)
     monkeypatch.setattr("lupaxa.chat_server.password.time.time", lambda: 1_700_000_000.0)
-    process_input(host, player, "admin")  # type: ignore[arg-type]
-    process_input(host, player, "secret")  # type: ignore[arg-type]
-    process_input(host, player, "secret")  # type: ignore[arg-type]
-    assert load_saved(player_path(tmp_path, "admin")) is None
+    process_input(server, player, "Zed")  # type: ignore[arg-type]
+    process_input(server, player, "secret")  # type: ignore[arg-type]
+    saved = load_saved(player_path(tmp_path, "Zed"))
+    assert saved is not None
+    assert saved.mfa_secret is None
     assert player.auth == "mfa_enroll"
     secret = player.pending_mfa_secret
-    code = _totp_code(secret)
-    process_input(host, player, code)  # type: ignore[arg-type]
+    code = totp_code(secret)
+    process_input(server, player, code)  # type: ignore[arg-type]
     assert player.player is not None
-    saved = load_saved(player_path(tmp_path, "admin"))
+    saved = load_saved(player_path(tmp_path, "Zed"))
     assert saved is not None
-    _assert_sealed_mfa_secret(saved, "secret", secret)
+    assert_sealed_mfa_secret(saved, "secret", secret)
 
 
 def test_mfa_resident_without_secret_enters_on_password_alone(tmp_path: Path) -> None:
     """A resident with no mfa_secret still enters when MFA is on."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _mfa_login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = mfa_login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
     assert player.player is not None
     assert player.auth == "name"
-    assert "Code:" not in "".join(host.sent)
+    assert "Code:" not in "".join(server.sent)
 
 
 def test_mfa_closed_talker_skips_the_code_for_residents(tmp_path: Path) -> None:
     """A resident is refused after the password when residents are closed."""
     totp_seed = TOTP_TEST_SEED
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            mfa_secret=totp_seed,
-        ),
-    )
-    host = _mfa_login_host(tmp_path)
-    host._allow_residents = False
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
-    assert "Code:" not in "".join(host.sent)
-    assert host.dropped is True
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_secret=totp_seed))
+    server = mfa_login_host(tmp_path)
+    server.allow_residents = False
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
+    assert "Code:" not in "".join(server.sent)
+    assert server.dropped is True
 
 
 def test_mfa_reconnect_waits_for_the_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A second socket does not replace the live player until the code matches."""
     totp_seed = TOTP_TEST_SEED
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            mfa_secret=totp_seed,
-        ),
-    )
-    host = _mfa_login_host(tmp_path)
-    live = _Player(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_RESIDENT))
-    host.people = [live]
-    newcomer = _Player(player=None, address="10.0.0.5")
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_secret=totp_seed))
+    server = mfa_login_host(tmp_path)
+    live = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    server.people = [live]
+    newcomer = FakePlayer(player=None, address="10.0.0.5")
     monkeypatch.setattr("lupaxa.chat_server.password.time.time", lambda: 1_700_000_000.0)
-    process_input(host, newcomer, "Bea")  # type: ignore[arg-type]
-    process_input(host, newcomer, "pw")  # type: ignore[arg-type]
-    assert host.replaced == []
+    process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
+    process_input(server, newcomer, "pw")  # type: ignore[arg-type]
+    assert server.replaced == []
     assert newcomer.auth == "code"
-    process_input(host, newcomer, _totp_code(totp_seed))  # type: ignore[arg-type]
-    assert host.replaced == [live]
+    process_input(server, newcomer, totp_code(totp_seed))  # type: ignore[arg-type]
+    assert server.replaced == [live]
 
 
 def test_mfa_command_syntax_when_bare(tmp_path: Path) -> None:
     """Bare mfa prints the syntax line."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _mfa_command_host(tmp_path)
-    process_commands(host, bea, "mfa")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: mfa setup|mfa remove|mfa remove <name>\n"]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    bea = staff("Bea", Rank.RESIDENT)
+    server = mfa_command_host(tmp_path)
+    process_commands(server, bea, "mfa")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: mfa setup|mfa remove|mfa remove <name>\n"]
 
 
-def test_mfa_setup_asks_password_then_saves_secret_on_code(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_mfa_setup_asks_password_then_saves_secret_on_code(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Setup stores the secret only after password and a matching code."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _mfa_command_host(tmp_path)
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    bea = staff("Bea", Rank.RESIDENT)
+    server = mfa_command_host(tmp_path)
     monkeypatch.setattr("lupaxa.chat_server.mfa.time.time", lambda: 1_700_000_000.0)
-    process_commands(host, bea, "mfa setup")  # type: ignore[arg-type]
-    assert host.sent == ["Current password: "]
+    process_commands(server, bea, "mfa setup")  # type: ignore[arg-type]
+    assert server.sent == ["Current password: "]
     assert bea.auth == "mfa_pw"
-    process_input(host, bea, "pw")  # type: ignore[arg-type]
+    process_input(server, bea, "pw")  # type: ignore[arg-type]
     assert load_saved(player_path(tmp_path, "Bea")).mfa_secret is None  # type: ignore[union-attr]
     secret = bea.pending_mfa_secret
-    assert secret in "".join(host.sent)
+    assert secret in "".join(server.sent)
     assert bea.auth == "mfa_show"
-    process_input(host, bea, _totp_code(secret))  # type: ignore[arg-type]
+    process_input(server, bea, totp_code(secret))  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
-    _assert_sealed_mfa_secret(saved, "pw", secret)
+    assert_sealed_mfa_secret(saved, "pw", secret)
     assert bea.auth == "name"
 
 
 def test_mfa_setup_wrong_password_returns_to_room(tmp_path: Path) -> None:
     """A wrong setup password sends one line and does not ask again."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _mfa_command_host(tmp_path)
-    process_commands(host, bea, "mfa setup")  # type: ignore[arg-type]
-    process_input(host, bea, "no")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Wrong password.\nWhat? > "
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    bea = staff("Bea", Rank.RESIDENT)
+    server = mfa_command_host(tmp_path)
+    process_commands(server, bea, "mfa setup")  # type: ignore[arg-type]
+    process_input(server, bea, "no")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Wrong password.\nWhat? > "
     assert bea.auth == "name"
 
 
 def test_mfa_setup_quit_at_password_returns_to_room(tmp_path: Path) -> None:
     """Quit at the setup password prompt returns to the room without saving."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _mfa_command_host(tmp_path)
-    process_commands(host, bea, "mfa setup")  # type: ignore[arg-type]
-    process_input(host, bea, "quit")  # type: ignore[arg-type]
-    assert host.sent[-1] == "What? > "
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    bea = staff("Bea", Rank.RESIDENT)
+    server = mfa_command_host(tmp_path)
+    process_commands(server, bea, "mfa setup")  # type: ignore[arg-type]
+    process_input(server, bea, "quit")  # type: ignore[arg-type]
+    assert server.sent[-1] == "What? > "
     assert bea.auth == "name"
     assert bea.player is not None
     saved = load_saved(player_path(tmp_path, "Bea"))
@@ -2955,147 +4020,108 @@ def test_mfa_setup_quit_at_password_returns_to_room(tmp_path: Path) -> None:
 
 def test_mfa_setup_when_secret_exists(tmp_path: Path) -> None:
     """Setup is refused when MFA is already on."""
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            mfa_secret=TOTP_TEST_SEED,
-        ),
-    )
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _mfa_command_host(tmp_path)
-    process_commands(host, bea, "mfa setup")  # type: ignore[arg-type]
-    assert host.sent == ["MFA is already on.\n"]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_secret=TOTP_TEST_SEED))
+    bea = staff("Bea", Rank.RESIDENT)
+    server = mfa_command_host(tmp_path)
+    process_commands(server, bea, "mfa setup")  # type: ignore[arg-type]
+    assert server.sent == ["MFA is already on.\n"]
 
 
-def test_mfa_remove_self_clears_secret_for_resident(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_mfa_remove_self_clears_secret_for_resident(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Self-remove asks for password and code, then clears the file."""
     totp_seed = TOTP_TEST_SEED
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            mfa_secret=totp_seed,
-        ),
-    )
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _mfa_command_host(tmp_path)
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_secret=totp_seed))
+    bea = staff("Bea", Rank.RESIDENT)
+    server = mfa_command_host(tmp_path)
     monkeypatch.setattr("lupaxa.chat_server.mfa.time.time", lambda: 1_700_000_000.0)
-    process_commands(host, bea, "mfa remove")  # type: ignore[arg-type]
-    assert host.sent == ["Current password: "]
-    process_input(host, bea, "pw")  # type: ignore[arg-type]
+    process_commands(server, bea, "mfa remove")  # type: ignore[arg-type]
+    assert server.sent == ["Current password: "]
+    process_input(server, bea, "pw")  # type: ignore[arg-type]
     assert bea.auth == "mfa_remove_code"
-    process_input(host, bea, _totp_code(totp_seed))  # type: ignore[arg-type]
-    assert host.sent[-1] == "Your MFA has been removed.\nWhat? > "
+    process_input(server, bea, totp_code(totp_seed))  # type: ignore[arg-type]
+    assert server.sent[-1] == "Your MFA has been removed.\nWhat? > "
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.mfa_secret is None
     assert saved.mfa_on is False
 
 
-def test_mfa_remove_self_then_setup_same_window(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_mfa_remove_self_then_setup_same_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """After self-remove, setup accepts the new secret's code in the same timestep."""
     totp_seed = TOTP_TEST_SEED
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            mfa_secret=totp_seed,
-        ),
-    )
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _mfa_command_host(tmp_path)
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_secret=totp_seed))
+    bea = staff("Bea", Rank.RESIDENT)
+    server = mfa_command_host(tmp_path)
     monkeypatch.setattr("lupaxa.chat_server.mfa.time.time", lambda: 1_700_000_000.0)
-    process_commands(host, bea, "mfa remove")  # type: ignore[arg-type]
-    process_input(host, bea, "pw")  # type: ignore[arg-type]
-    process_input(host, bea, _totp_code(totp_seed))  # type: ignore[arg-type]
+    process_commands(server, bea, "mfa remove")  # type: ignore[arg-type]
+    process_input(server, bea, "pw")  # type: ignore[arg-type]
+    process_input(server, bea, totp_code(totp_seed))  # type: ignore[arg-type]
     assert bea.player is not None
-    process_commands(host, bea, "mfa setup")  # type: ignore[arg-type]
-    process_input(host, bea, "pw")  # type: ignore[arg-type]
+    process_commands(server, bea, "mfa setup")  # type: ignore[arg-type]
+    process_input(server, bea, "pw")  # type: ignore[arg-type]
     new_secret = bea.pending_mfa_secret
-    process_input(host, bea, _totp_code(new_secret))  # type: ignore[arg-type]
+    process_input(server, bea, totp_code(new_secret))  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
-    _assert_sealed_mfa_secret(saved, "pw", new_secret)
+    assert_sealed_mfa_secret(saved, "pw", new_secret)
     assert bea.player is not None
     assert bea.auth == "name"
 
 
-def test_mfa_remove_self_super_user_sees_warning_and_reenrols_on_login(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_mfa_remove_self_super_user_sees_warning_and_reenrols_on_login(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A super user who clears MFA is warned and must enrol again on the next login."""
     totp_seed = TOTP_TEST_SEED
-    save_player(
-        tmp_path,
-        SavedPlayer("Cyd", RANK_SUPER, hash_password("pw", rounds=4), mfa_secret=totp_seed),
-    )
-    cyd = _staff("Cyd", RANK_SUPER)
-    host = _mfa_command_host(tmp_path)
+    save_player(tmp_path, SavedPlayer("Cyd", Rank.SUPER_USER, hash_password("pw", rounds=4), mfa_secret=totp_seed))
+    cyd = staff("Cyd", Rank.SUPER_USER)
+    server = mfa_command_host(tmp_path)
     monkeypatch.setattr("lupaxa.chat_server.mfa.time.time", lambda: 1_700_000_000.0)
-    process_commands(host, cyd, "mfa remove")  # type: ignore[arg-type]
-    process_input(host, cyd, "pw")  # type: ignore[arg-type]
-    process_input(host, cyd, _totp_code(totp_seed))  # type: ignore[arg-type]
-    assert _MFA_REMOVED_WARNING in host.sent[-1]
+    process_commands(server, cyd, "mfa remove")  # type: ignore[arg-type]
+    process_input(server, cyd, "pw")  # type: ignore[arg-type]
+    process_input(server, cyd, totp_code(totp_seed))  # type: ignore[arg-type]
+    assert MFA_REMOVED_WARNING in server.sent[-1]
     assert cyd.player is not None
-    newcomer = _Player(player=None)
-    process_input(host, newcomer, "Cyd")  # type: ignore[arg-type]
-    process_input(host, newcomer, "pw")  # type: ignore[arg-type]
+    newcomer = FakePlayer(player=None)
+    process_input(server, newcomer, "Cyd")  # type: ignore[arg-type]
+    process_input(server, newcomer, "pw")  # type: ignore[arg-type]
     assert newcomer.auth == "mfa_enroll"
 
 
 def test_mfa_remove_other_asks_sure_and_clears_on_yes(tmp_path: Path) -> None:
     """An admin clears another player's MFA after yes and announces on the admin channel."""
     totp_seed = TOTP_TEST_SEED
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_SUPER, hash_password("pw", rounds=4), mfa_secret=totp_seed),
-    )
-    save_player(tmp_path, SavedPlayer("Boss", RANK_ADMIN, hash_password("pw", rounds=4)))
-    save_player(tmp_path, SavedPlayer("Ada", RANK_ADMIN, hash_password("pw", rounds=4)))
-    boss = _staff("Boss", RANK_ADMIN)
-    ada = _staff("Ada", RANK_ADMIN)
-    bea = _staff("Bea", RANK_SUPER)
-    host = _mfa_command_host(tmp_path)
-    host.people = [boss, ada, bea]
-    process_commands(host, boss, "mfa remove Bea")  # type: ignore[arg-type]
-    assert host.sent == ["Are you sure you want to remove MFA for Bea?\n"]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.SUPER_USER, hash_password("pw", rounds=4), mfa_secret=totp_seed))
+    save_player(tmp_path, SavedPlayer("Boss", Rank.ADMIN, hash_password("pw", rounds=4)))
+    save_player(tmp_path, SavedPlayer("Ada", Rank.ADMIN, hash_password("pw", rounds=4)))
+    boss = staff("Boss", Rank.ADMIN)
+    ada = staff("Ada", Rank.ADMIN)
+    bea = staff("Bea", Rank.SUPER_USER)
+    server = mfa_command_host(tmp_path)
+    server.people = [boss, ada, bea]
+    process_commands(server, boss, "mfa remove Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Are you sure you want to remove MFA for Bea?\n"]
     assert boss.auth == "mfa_sure"
-    process_input(host, boss, "no")  # type: ignore[arg-type]
-    assert host.sent[-1] == "MFA remove cancelled.\nWhat? > "
-    process_commands(host, boss, "mfa remove Bea")  # type: ignore[arg-type]
-    process_input(host, boss, "yes")  # type: ignore[arg-type]
+    process_input(server, boss, "no")  # type: ignore[arg-type]
+    assert server.sent[-1] == "MFA remove cancelled.\nWhat? > "
+    process_commands(server, boss, "mfa remove Bea")  # type: ignore[arg-type]
+    process_input(server, boss, "yes")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.mfa_secret is None
     assert saved.mfa_on is False
     assert bea.player is not None
     line = "[ Admin ] Boss removes MFA for Bea.\n"
-    assert host.admin_lines == [paint_admin(ada, line)]
+    assert server.admin_lines == [paint_admin(ada, line)]
 
 
 def test_mfa_remove_other_clears_logged_off_player(tmp_path: Path) -> None:
     """Removing MFA for someone who is offline still clears the file after yes."""
     totp_seed = TOTP_TEST_SEED
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_SUPER, hash_password("pw", rounds=4), mfa_secret=totp_seed),
-    )
-    save_player(tmp_path, SavedPlayer("Boss", RANK_ADMIN, hash_password("pw", rounds=4)))
-    boss = _staff("Boss", RANK_ADMIN)
-    host = _mfa_command_host(tmp_path)
-    process_commands(host, boss, "mfa remove Bea")  # type: ignore[arg-type]
-    process_input(host, boss, "yes")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.SUPER_USER, hash_password("pw", rounds=4), mfa_secret=totp_seed))
+    save_player(tmp_path, SavedPlayer("Boss", Rank.ADMIN, hash_password("pw", rounds=4)))
+    boss = staff("Boss", Rank.ADMIN)
+    server = mfa_command_host(tmp_path)
+    process_commands(server, boss, "mfa remove Bea")  # type: ignore[arg-type]
+    process_input(server, boss, "yes")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.mfa_secret is None
@@ -3105,32 +4131,23 @@ def test_mfa_remove_other_clears_logged_off_player(tmp_path: Path) -> None:
 def test_mfa_remove_other_refuses_equal_rank(tmp_path: Path) -> None:
     """An admin cannot remove MFA for another admin."""
     totp_seed = TOTP_TEST_SEED
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_ADMIN, hash_password("pw", rounds=4), mfa_secret=totp_seed),
-    )
-    save_player(tmp_path, SavedPlayer("Boss", RANK_ADMIN, hash_password("pw", rounds=4)))
-    boss = _staff("Boss", RANK_ADMIN)
-    host = _mfa_command_host(tmp_path)
-    process_commands(host, boss, "mfa remove Bea")  # type: ignore[arg-type]
-    assert host.sent == ["You cannot remove MFA for Bea.\n"]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.ADMIN, hash_password("pw", rounds=4), mfa_secret=totp_seed))
+    save_player(tmp_path, SavedPlayer("Boss", Rank.ADMIN, hash_password("pw", rounds=4)))
+    boss = staff("Boss", Rank.ADMIN)
+    server = mfa_command_host(tmp_path)
+    process_commands(server, boss, "mfa remove Bea")  # type: ignore[arg-type]
+    assert server.sent == ["You cannot remove MFA for Bea.\n"]
 
 
 def test_mfa_remove_other_super_admin_clears_admin(tmp_path: Path) -> None:
     """The super admin can clear a promoted admin after yes."""
     totp_seed = TOTP_TEST_SEED
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_ADMIN, hash_password("pw", rounds=4), mfa_secret=totp_seed),
-    )
-    save_player(
-        tmp_path,
-        SavedPlayer("admin", RANK_SUPER_ADMIN, hash_password("pw", rounds=4), mfa_secret=totp_seed),
-    )
-    ada = _staff("admin", RANK_SUPER_ADMIN)
-    host = _mfa_command_host(tmp_path)
-    process_commands(host, ada, "mfa remove Bea")  # type: ignore[arg-type]
-    process_input(host, ada, "yes")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.ADMIN, hash_password("pw", rounds=4), mfa_secret=totp_seed))
+    save_player(tmp_path, SavedPlayer("admin", Rank.SUPER_ADMIN, hash_password("pw", rounds=4), mfa_secret=totp_seed))
+    ada = staff("admin", Rank.SUPER_ADMIN)
+    server = mfa_command_host(tmp_path)
+    process_commands(server, ada, "mfa remove Bea")  # type: ignore[arg-type]
+    process_input(server, ada, "yes")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.mfa_secret is None
@@ -3140,94 +4157,338 @@ def test_mfa_remove_other_super_admin_clears_admin(tmp_path: Path) -> None:
 def test_mfa_remove_other_refuses_super_admin(tmp_path: Path) -> None:
     """Nobody can remove MFA for the super admin through the talker."""
     totp_seed = TOTP_TEST_SEED
-    save_player(
-        tmp_path,
-        SavedPlayer("admin", RANK_SUPER_ADMIN, hash_password("pw", rounds=4), mfa_secret=totp_seed),
-    )
-    save_player(tmp_path, SavedPlayer("Boss", RANK_ADMIN, hash_password("pw", rounds=4)))
-    boss = _staff("Boss", RANK_ADMIN)
-    host = _mfa_command_host(tmp_path)
-    process_commands(host, boss, "mfa remove admin")  # type: ignore[arg-type]
-    assert host.sent == ["You cannot remove MFA for admin.\n"]
+    save_player(tmp_path, SavedPlayer("admin", Rank.SUPER_ADMIN, hash_password("pw", rounds=4), mfa_secret=totp_seed))
+    save_player(tmp_path, SavedPlayer("Boss", Rank.ADMIN, hash_password("pw", rounds=4)))
+    boss = staff("Boss", Rank.ADMIN)
+    server = mfa_command_host(tmp_path)
+    process_commands(server, boss, "mfa remove admin")  # type: ignore[arg-type]
+    assert server.sent == ["You cannot remove MFA for admin.\n"]
 
 
 def test_mfa_remove_other_without_secret(tmp_path: Path) -> None:
     """Removing MFA for someone with no secret is refused."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_SUPER, hash_password("pw", rounds=4)))
-    save_player(tmp_path, SavedPlayer("Boss", RANK_ADMIN, hash_password("pw", rounds=4)))
-    boss = _staff("Boss", RANK_ADMIN)
-    host = _mfa_command_host(tmp_path)
-    process_commands(host, boss, "mfa remove Bea")  # type: ignore[arg-type]
-    assert host.sent == ["Bea has no MFA.\n"]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.SUPER_USER, hash_password("pw", rounds=4)))
+    save_player(tmp_path, SavedPlayer("Boss", Rank.ADMIN, hash_password("pw", rounds=4)))
+    boss = staff("Boss", Rank.ADMIN)
+    server = mfa_command_host(tmp_path)
+    process_commands(server, boss, "mfa remove Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Bea has no MFA.\n"]
 
 
 def test_mfa_remove_unknown_player(tmp_path: Path) -> None:
     """An unknown name is reported before rank or secret checks."""
-    save_player(tmp_path, SavedPlayer("Boss", RANK_ADMIN, hash_password("pw", rounds=4)))
-    boss = _staff("Boss", RANK_ADMIN)
-    host = _mfa_command_host(tmp_path)
-    process_commands(host, boss, "mfa remove Bea")  # type: ignore[arg-type]
-    assert host.sent == ["Player Bea not found.\n"]
+    save_player(tmp_path, SavedPlayer("Boss", Rank.ADMIN, hash_password("pw", rounds=4)))
+    boss = staff("Boss", Rank.ADMIN)
+    server = mfa_command_host(tmp_path)
+    process_commands(server, boss, "mfa remove Bea")  # type: ignore[arg-type]
+    assert server.sent == ["No saved player 'Bea'.\n"]
 
 
 def test_mfa_command_missing_when_disabled(tmp_path: Path) -> None:
-    """Without the host flag, mfa is not a command."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    _register_mfa_command()
-    process_commands(host, bea, "mfa")  # type: ignore[arg-type]
-    assert host.sent == ["No such command 'mfa'\n"]
+    """Without the server flag, mfa is not a command."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    bea = staff("Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    register_mfa_command()
+    process_commands(server, bea, "mfa")  # type: ignore[arg-type]
+    assert server.sent == ["No such command 'mfa'\n"]
 
 
 def test_a_newbie_name_enters_after_yes(tmp_path: Path) -> None:
     """A free name shows the disclaimer and enters after yes."""
-    host = _login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Ada")  # type: ignore[arg-type]
+    server = login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Ada")  # type: ignore[arg-type]
     assert player.player is None
     assert player.sent[-1] == "Do you agree to these rules: "
     page_line = next(line for line in player.sent if "Be kind." in line)
     assert page_line.startswith("\n\n")
-    process_input(host, player, "YES")  # type: ignore[arg-type]
+    process_input(server, player, "YES")  # type: ignore[arg-type]
     assert player.player is not None
-    assert player.player.rank == "newbie"
+    assert player.player.rank is Rank.NEWBIE
     assert player.sent[-1] == "What? > "
+
+
+def test_a_server_at_the_cap_still_accepts_the_last_name(tmp_path: Path) -> None:
+    """A connection count equal to the cap is allowed."""
+    server = login_host(tmp_path)
+    server.config = replace(server.config, max_connections=1)
+    newcomer = FakePlayer(player=None, name=None)
+    server.people = [newcomer]
+    process_input(server, newcomer, "Ada")  # type: ignore[arg-type]
+    assert newcomer.sent[-1] == "Do you agree to these rules: "
+    assert newcomer not in server.dropped_clients
+
+
+def test_the_first_admin_is_not_exempt_when_the_server_is_full(tmp_path: Path) -> None:
+    """A new name with no saved file is dropped when the server is full."""
+    server = login_host(tmp_path, opened=False)
+    server.config = replace(server.config, max_connections=1)
+    server.full_message = "The server is full.\n"
+    filler = FakePlayer(player=None, name=None, auth="name")
+    newcomer = FakePlayer(player=None, name=None, address="127.0.0.1")
+    server.people = [filler, newcomer]
+    process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
+    assert newcomer in server.dropped_clients
+    assert newcomer.sent[-1] != "Password: "
+    assert newcomer.sent[-1] != "Set a password: "
+
+
+def test_a_disclaimer_already_shown_is_not_checked_again(tmp_path: Path) -> None:
+    """Saying yes still enters after the cap filled behind this disclaimer."""
+    server = login_host(tmp_path)
+    server.config = replace(server.config, max_newbies=1)
+    first = FakePlayer(player=None, name=None)
+    server.people = [first]
+    process_input(server, first, "Ada")  # type: ignore[arg-type]
+    assert first.auth == "agree"
+    second = FakePlayer(player=None, name=None)
+    server.people.append(second)
+    process_input(server, second, "Bea")  # type: ignore[arg-type]
+    assert second in server.dropped_clients
+    process_input(server, first, "yes")  # type: ignore[arg-type]
+    assert first.player is not None
+    assert first.player.rank == Rank.NEWBIE
+
+
+def test_a_full_server_drops_a_new_name(tmp_path: Path) -> None:
+    """One connection over the cap sees the full message and is dropped."""
+    server = login_host(tmp_path)
+    server.config = replace(server.config, max_connections=1)
+    server.full_message = "The server is full.\nPlease try again later.\n"
+    filler = FakePlayer(player=None, name=None, auth="name")
+    newcomer = FakePlayer(player=None, name=None)
+    server.people = [filler, newcomer]
+    process_input(server, newcomer, "Ada")  # type: ignore[arg-type]
+    width = frame_width(newcomer.discovered_columns, newcomer.frame_columns)
+    assert newcomer.sent[-1] == refusal_text(server.full_message, width)
+    assert newcomer in server.dropped_clients
+    assert server.announced[-1] is False
+    assert newcomer.auth != "agree"
+
+
+def test_an_admin_reaches_the_password_when_the_server_is_full(tmp_path: Path) -> None:
+    """A saved admin skips the connection cap."""
+    save_player(tmp_path, SavedPlayer("Boss", Rank.ADMIN, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    server.config = replace(server.config, max_connections=1)
+    server.full_message = "The server is full.\n"
+    filler = FakePlayer(player=None, name=None, auth="name")
+    newcomer = FakePlayer(player=None, name=None)
+    server.people = [filler, newcomer]
+    process_input(server, newcomer, "Boss")  # type: ignore[arg-type]
+    assert newcomer.sent[-1] == "Password: "
+    assert newcomer not in server.dropped_clients
+
+
+def test_a_super_admin_reaches_the_password_when_the_server_is_full(tmp_path: Path) -> None:
+    """A saved super admin skips the connection cap."""
+    save_player(tmp_path, SavedPlayer("Ada", Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path, super_admin="Ada")
+    server.config = replace(server.config, max_connections=1)
+    filler = FakePlayer(player=None, name=None, auth="name")
+    newcomer = FakePlayer(player=None, name=None)
+    server.people = [filler, newcomer]
+    process_input(server, newcomer, "Ada")  # type: ignore[arg-type]
+    assert newcomer.sent[-1] == "Password: "
+    assert newcomer not in server.dropped_clients
+
+
+def test_a_super_user_is_dropped_when_the_server_is_full(tmp_path: Path) -> None:
+    """A super user is not exempt from the connection cap."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.SUPER_USER, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    server.config = replace(server.config, max_connections=1)
+    server.full_message = "The server is full.\n"
+    filler = FakePlayer(player=None, name=None, auth="name")
+    newcomer = FakePlayer(player=None, name=None)
+    server.people = [filler, newcomer]
+    process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
+    assert newcomer in server.dropped_clients
+    assert newcomer.sent[-1] != "Password: "
+
+
+def test_a_coder_reaches_the_password_when_the_server_is_full(tmp_path: Path) -> None:
+    """A saved coder skips the connection cap."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.CODER, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    server.config = replace(server.config, max_connections=1)
+    server.full_message = "The server is full.\n"
+    filler = FakePlayer(player=None, name=None, auth="name")
+    newcomer = FakePlayer(player=None, name=None)
+    server.people = [filler, newcomer]
+    process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
+    assert newcomer.sent[-1] == "Password: "
+    assert newcomer not in server.dropped_clients
+
+
+def test_an_su_channel_player_is_dropped_when_the_server_is_full(tmp_path: Path) -> None:
+    """An SU Channel player is not exempt from the connection cap."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.SU_CHANNEL, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    server.config = replace(server.config, max_connections=1)
+    server.full_message = "The server is full.\n"
+    filler = FakePlayer(player=None, name=None, auth="name")
+    newcomer = FakePlayer(player=None, name=None)
+    server.people = [filler, newcomer]
+    process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
+    assert newcomer in server.dropped_clients
+    assert newcomer.sent[-1] != "Password: "
+
+
+def test_lsu_lists_a_coder_and_a_channel_only_player(tmp_path: Path) -> None:
+    """An admin sees a coder and an SU Channel player."""
+    from lupaxa.chat_server.colour import cyan
+
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.ADMIN)
+    assert ada.player is not None
+    ada.player.colour = True
+    bea = staff("Bea", Rank.CODER)
+    cyd = staff("Cyd", Rank.SU_CHANNEL)
+    server.people = [ada, bea, cyd]
+    process_commands(server, ada, "lsu")  # type: ignore[arg-type]
+    text = server.sent[0]
+    assert "Bea" in text
+    assert "Cyd" in text
+    assert cyan("< Channel Only >") in text
+
+
+def test_lsu_hides_channel_only_from_residents_and_shows_off_duty_staff(tmp_path: Path) -> None:
+    """Residents miss SU Channel and off-duty staff. SU Channel sees both."""
+    from lupaxa.chat_server.colour import cyan
+
+    server = login_host(tmp_path)
+    resident = staff("Ada", Rank.RESIDENT)
+    assert resident.player is not None
+    resident.player.colour = True
+    channel = staff("Bea", Rank.SU_CHANNEL)
+    assert channel.player is not None
+    channel.player.colour = True
+    boss = staff("Cyd", Rank.SUPER_USER)
+    assert boss.player is not None
+    boss.player.off_duty = True
+    dee = staff("Dee", Rank.SUPER_USER)
+    server.people = [resident, channel, boss, dee]
+    process_commands(server, resident, "lsu")  # type: ignore[arg-type]
+    assert "Bea" not in server.sent[0]
+    assert "Cyd" not in server.sent[0]
+    assert "Dee" in server.sent[0]
+    server.sent.clear()
+    process_commands(server, channel, "lsu")  # type: ignore[arg-type]
+    assert cyan("< Channel Only >") in server.sent[0]
+    assert "Cyd" in server.sent[0]
+    assert cyan("< Off Duty >") in server.sent[0]
+
+
+def test_an_online_resident_reconnects_when_the_server_is_full(tmp_path: Path) -> None:
+    """A saved name that is already in a room skips the cap and takes over."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    server.config = replace(server.config, max_connections=1)
+    live = staff("Bea", Rank.RESIDENT)
+    newcomer = FakePlayer(player=None, name=None)
+    server.people = [live, newcomer]
+    process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
+    assert newcomer.sent[-1] == "Password: "
+    process_input(server, newcomer, "pw")  # type: ignore[arg-type]
+    assert server.replaced == [live]
+    assert newcomer not in server.dropped_clients
+
+
+def test_a_newbie_cap_drops_a_new_name_before_the_disclaimer(tmp_path: Path) -> None:
+    """Someone already reading the disclaimer fills the newbie cap."""
+    server = login_host(tmp_path)
+    server.config = replace(server.config, max_newbies=1)
+    server.newbie_message = "No more new players can enter right now.\nPlease try again later.\n"
+    waiting = FakePlayer(player=None, name=None, auth="agree", pending_name="Cyd")
+    newcomer = FakePlayer(player=None, name=None)
+    server.people = [waiting, newcomer]
+    process_input(server, newcomer, "Ada")  # type: ignore[arg-type]
+    width = frame_width(newcomer.discovered_columns, newcomer.frame_columns)
+    assert newcomer.sent[-1] == refusal_text(server.newbie_message, width)
+    assert newcomer in server.dropped_clients
+    assert server.announced[-1] is False
+    assert newcomer.auth != "agree"
+
+
+def test_a_logged_in_newbie_in_a_room_fills_the_newbie_cap(tmp_path: Path) -> None:
+    """A logged-in newbie in a room fills the newbie cap."""
+    server = login_host(tmp_path)
+    server.config = replace(server.config, max_newbies=1)
+    server.newbie_message = "No more new players can enter right now.\n"
+    in_room = staff("Cyd", Rank.NEWBIE)
+    in_room.room = "reception"
+    assert in_room.player is not None
+    in_room.player.room = "reception"
+    newcomer = FakePlayer(player=None, name=None)
+    server.people = [in_room, newcomer]
+    process_input(server, newcomer, "Ada")  # type: ignore[arg-type]
+    width = frame_width(newcomer.discovered_columns, newcomer.frame_columns)
+    assert newcomer in server.dropped_clients
+    assert server.announced[-1] is False
+    assert newcomer.sent[-1] == refusal_text(server.newbie_message, width)
+
+
+def test_a_full_server_wins_over_the_newbie_cap(tmp_path: Path) -> None:
+    """Both caps refuse the name with the full message."""
+    server = login_host(tmp_path)
+    server.config = replace(server.config, max_connections=1, max_newbies=1)
+    server.full_message = "The server is full.\n"
+    server.newbie_message = "No more new players can enter right now.\n"
+    waiting = FakePlayer(player=None, name=None, auth="agree", pending_name="Cyd")
+    newcomer = FakePlayer(player=None, name=None)
+    server.people = [waiting, newcomer]
+    process_input(server, newcomer, "Ada")  # type: ignore[arg-type]
+    width = frame_width(newcomer.discovered_columns, newcomer.frame_columns)
+    assert newcomer.sent[-1] == refusal_text(server.full_message, width)
+    assert "No more new players" not in newcomer.sent[-1]
+
+
+def test_a_closed_talker_still_uses_the_closed_line_when_the_caps_have_room(tmp_path: Path) -> None:
+    """Under both caps, a closed talker stays at the name prompt."""
+    server = login_host(tmp_path)
+    server.allow_newbies = False
+    newcomer = FakePlayer(player=None, name=None)
+    server.people = [newcomer]
+    process_input(server, newcomer, "Ada")  # type: ignore[arg-type]
+    assert newcomer.sent[-1] == f"The talker is closed to new people.\n{NAME_PROMPT}"
+    assert newcomer not in server.dropped_clients
 
 
 def test_a_newbie_must_type_yes(tmp_path: Path) -> None:
     """Any other line repeats the prompt and does not draw the page again."""
-    host = _login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Ada")  # type: ignore[arg-type]
-    process_input(host, player, "no")  # type: ignore[arg-type]
+    server = login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Ada")  # type: ignore[arg-type]
+    process_input(server, player, "maybe")  # type: ignore[arg-type]
     assert player.player is None
     assert player.auth == "agree"
     assert player.sent[-1] == "Do you agree to these rules: "
     assert sum("Be kind." in line for line in player.sent) == 1
-    process_input(host, player, "who")  # type: ignore[arg-type]
+    process_input(server, player, "who")  # type: ignore[arg-type]
     assert player.sent[-1] == "Do you agree to these rules: "
     assert player.player is None
 
 
 def test_quit_during_the_disclaimer_disconnects(tmp_path: Path) -> None:
     """Quit at the disclaimer leaves before the room."""
-    host = _login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Ada")  # type: ignore[arg-type]
-    process_input(host, player, "quit")  # type: ignore[arg-type]
-    assert player in host.dropped_clients
+    server = login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Ada")  # type: ignore[arg-type]
+    process_input(server, player, "quit")  # type: ignore[arg-type]
+    assert player in server.dropped_clients
     assert player.player is None
-    assert host.room_lines == []
+    assert server.room_lines == []
 
 
 def test_yes_refuses_a_talker_that_closed(tmp_path: Path) -> None:
     """Closing newbies while the page is up returns to the name prompt."""
-    host = _login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Ada")  # type: ignore[arg-type]
-    host._allow_newbies = False
-    process_input(host, player, "yes")  # type: ignore[arg-type]
+    server = login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Ada")  # type: ignore[arg-type]
+    server.allow_newbies = False
+    process_input(server, player, "yes")  # type: ignore[arg-type]
     assert player.player is None
     assert player.auth == "name"
     assert player.sent[-1] == ("The talker is closed to new people.\nPlease enter your name: ")
@@ -3235,170 +4496,151 @@ def test_yes_refuses_a_talker_that_closed(tmp_path: Path) -> None:
 
 def test_a_missing_disclaimer_disconnects_the_newbie(tmp_path: Path) -> None:
     """No disclaimer topic tells the newbie, drops them, and tells admins."""
-    host = _login_host(tmp_path)
-    host._help = HelpBook(entries=())
-    admin_user = Player("Ann", "reception", datetime.now(timezone.utc), rank="admin")
+    server = login_host(tmp_path)
+    server.help = HelpBook(entries=())
+    admin_user = Player("Ann", "reception", datetime.now(timezone.utc), rank=Rank.ADMIN)
     admin_user.colour = False
-    admin = _Player(name="Ann", player=admin_user)
-    host.people = [admin]
-    player = _Player(player=None)
-    process_input(host, player, "Ada")  # type: ignore[arg-type]
+    admin = FakePlayer(name="Ann", player=admin_user)
+    server.people = [admin]
+    player = FakePlayer(player=None)
+    process_input(server, player, "Ada")  # type: ignore[arg-type]
     assert player.sent == ["The disclaimer is missing.\n"]
-    assert player in host.dropped_clients
-    assert host.announced == [False]
-    assert host.room_lines == []
-    assert host.admin_lines == ["[ Admin ] The disclaimer is missing.\n"]
+    assert player in server.dropped_clients
+    assert server.announced == [False]
+    assert server.room_lines == []
+    assert server.admin_lines == ["[ Admin ] The disclaimer is missing.\n"]
     assert player.player is None
 
 
 def test_the_admin_name_sets_and_confirms_a_password(tmp_path: Path) -> None:
-    """The admin name with no file asks twice, saves rank super admin, then enters."""
-    host = _login_host(tmp_path, opened=False)
-    player = _Player(player=None)
-    process_input(host, player, "admin")  # type: ignore[arg-type]
-    assert host.sent == ["Set a password: "]
-    process_input(host, player, "secret")  # type: ignore[arg-type]
-    assert host.sent[-1] == "\n\nConfirm password: "
-    assert player.player is None
-    process_input(host, player, "secret")  # type: ignore[arg-type]
-    assert player.player is not None
-    assert player.player.rank == "super_admin"
-    assert host.sent[-1] == "What? > "
-    saved = load_saved(player_path(tmp_path, "admin"))
-    assert saved is not None
-    assert saved.rank == "super_admin"
-    assert password_ok("secret", saved.password_hash)
-    assert saved.colour is True
-    assert "colour" not in player_path(tmp_path, "admin").read_text(encoding="utf-8")
+    """The name admin with no file follows the newbie disclaimer like any other name."""
+    server = login_host(tmp_path, super_admin=None, opened=False)
+    player = FakePlayer(player=None)
+    process_input(server, player, "admin")  # type: ignore[arg-type]
+    assert player.auth == "agree"
+    assert "Set a password:" not in "".join(server.sent)
+    assert load_saved(player_path(tmp_path, "admin")) is None
 
 
 def test_set_password_errors_return_to_the_first_prompt(tmp_path: Path) -> None:
     """Empty, long, and mismatched passwords each ask for a new password."""
-    host = _login_host(tmp_path, opened=False)
-    player = _Player(player=None)
-    process_input(host, player, "admin")  # type: ignore[arg-type]
-    process_login(host, player, "")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Password cannot be empty.\nSet a password: "
-    process_login(host, player, "x" * 73)  # type: ignore[arg-type]
-    assert host.sent[-1] == "Password is too long.\nSet a password: "
-    process_login(host, player, "one")  # type: ignore[arg-type]
-    process_login(host, player, "two")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Those passwords do not match.\nSet a password: "
-    assert player.auth == "set"
-    assert player.player is None
-    assert load_saved(player_path(tmp_path, "admin")) is None
+    server = login_host(tmp_path)
+    bea = newbie("Bea")
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [bea, ada]
+    process_commands(server, ada, "resident Bea")  # type: ignore[arg-type]
+    process_login(server, bea, "")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Password cannot be empty.\nSet a password: "
+    process_login(server, bea, "x" * 73)  # type: ignore[arg-type]
+    assert server.sent[-1] == "Password is too long.\nSet a password: "
+    process_login(server, bea, "one")  # type: ignore[arg-type]
+    process_login(server, bea, "two")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Those passwords do not match.\nSet a password: "
+    assert bea.auth == "set"
+    assert bea.player is not None
+    assert load_saved(player_path(tmp_path, "Bea")) is None
 
 
 def test_bob_signs_in_as_the_saved_spelling(tmp_path: Path) -> None:
     """Typing bob enters as Bob, and tell and examine find that spelling."""
-    save_player(tmp_path, SavedPlayer("Bob", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "bob")  # type: ignore[arg-type]
-    assert host.sent == ["Password: "]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bob", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "bob")  # type: ignore[arg-type]
+    assert server.sent == ["Password: "]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
     assert player.player is not None
     assert player.player.name == "Bob"
     assert player.player.lowercase_name == "bob"
-    host.people = [player]
-    host.sent.clear()
-    teller = _newbie("Ada")
-    host.people.append(teller)
-    process_commands(host, teller, "tell bob hello")  # type: ignore[arg-type]
-    assert any("Bob" in line for line in host.sent)
-    host.sent.clear()
-    process_commands(host, teller, "examine bob")  # type: ignore[arg-type]
-    assert host.sent
-    assert "Bob".center(72) in host.sent[0]
-    assert "Player bob not found." not in host.sent[0]
+    server.people = [player]
+    server.sent.clear()
+    teller = newbie("Ada")
+    server.people.append(teller)
+    process_commands(server, teller, "tell bob hello")  # type: ignore[arg-type]
+    assert any("Bob" in line for line in server.sent)
+    server.sent.clear()
+    process_commands(server, teller, "examine bob")  # type: ignore[arg-type]
+    assert server.sent
+    assert "Bob".center(72) in server.sent[0]
+    assert "Player bob not found." not in server.sent[0]
 
 
 def test_a_saved_name_asks_for_its_password(tmp_path: Path) -> None:
     """A matching saved file asks for the password and enters with its rank."""
-    save_player(tmp_path, SavedPlayer("Bea", "resident", hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    assert host.sent == ["Password: "]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Password: "]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
     assert player.player is not None
     assert player.player.name == "Bea"
-    assert player.player.rank == "resident"
-    assert host.sent[-1] == "What? > "
+    assert player.player.rank is Rank.RESIDENT
+    assert server.sent[-1] == "What? > "
 
 
 def test_a_saved_resident_whose_password_is_quit_can_enter(tmp_path: Path) -> None:
     """``quit`` at the password prompt is checked, not treated as disconnect."""
-    save_player(tmp_path, SavedPlayer("Bea", "resident", hash_password("quit", rounds=4)))
-    host = _login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    assert host.sent == ["Password: "]
-    process_input(host, player, "quit")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("quit", rounds=4)))
+    server = login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Password: "]
+    process_input(server, player, "quit")  # type: ignore[arg-type]
     assert player.player is not None
     assert player.player.name == "Bea"
-    assert player.player.rank == "resident"
-    assert player not in host.dropped_clients
-    assert host.sent[-1] == "What? > "
+    assert player.player.rank is Rank.RESIDENT
+    assert player not in server.dropped_clients
+    assert server.sent[-1] == "What? > "
 
 
 def test_another_spelling_of_a_saved_name_is_refused(tmp_path: Path) -> None:
     """Enter as the saved spelling after typing another case."""
-    save_player(tmp_path, SavedPlayer("Bea", "resident", hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "bea")  # type: ignore[arg-type]
-    assert host.sent == ["Password: "]
-    process_input(host, player, "pw")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "bea")  # type: ignore[arg-type]
+    assert server.sent == ["Password: "]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
     assert player.player is not None
     assert player.player.name == "Bea"
 
 
 def test_a_removed_player_does_not_enter_on_a_correct_password(tmp_path: Path) -> None:
     """The file is gone by the time the password arrives, so the name prompt returns."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_SUPER, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    assert host.sent == ["Password: "]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.SUPER_USER, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Password: "]
     assert delete_player(tmp_path, "Bea") is True
-    process_input(host, player, "pw")  # type: ignore[arg-type]
+    process_input(server, player, "pw")  # type: ignore[arg-type]
     assert player.player is None
     assert player.auth == "name"
-    assert host.sent[-1] == name_prompt()
+    assert server.sent[-1] == name_prompt()
 
 
 def test_a_changed_rank_is_used_when_the_password_arrives(tmp_path: Path) -> None:
     """The rank comes from the file at the time of the correct password."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_SUPER, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    process_input(host, player, "pw")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.SUPER_USER, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    process_input(server, player, "pw")  # type: ignore[arg-type]
     assert player.player is not None
-    assert player.player.rank == RANK_RESIDENT
+    assert player.player.rank == Rank.RESIDENT
 
 
 def test_a_taken_saved_name_still_asks_for_the_password(tmp_path: Path) -> None:
     """A saved name that is in a room is not refused before the password."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    live = _Player(
-        player=Player(
-            "Bea",
-            "hall",
-            datetime(2026, 10, 12, tzinfo=timezone.utc),
-            alarm_seconds=120,
-            idle_seconds=40,
-            prompt="Go: ",
-            rank=RANK_SUPER,
-        )
-    )
-    host.people = [live]
-    newcomer = _Player(player=None, address="10.0.0.5")
-    process_input(host, newcomer, "Bea")  # type: ignore[arg-type]
-    assert host.sent == ["Password: "]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    live = FakePlayer(player=Player("Bea", "hall", datetime(2026, 10, 12, tzinfo=timezone.utc), alarm_seconds=120, idle_seconds=40, prompt="Go: ", rank=Rank.SUPER_USER))  # fmt: skip  # noqa: E501
+    server.people = [live]
+    newcomer = FakePlayer(player=None, address="10.0.0.5")
+    process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Password: "]
     assert newcomer.player is None
     assert live.player is not None
     assert live.player.idle_seconds == 40
@@ -3407,37 +4649,19 @@ def test_a_taken_saved_name_still_asks_for_the_password(tmp_path: Path) -> None:
 def test_the_right_password_reconnects_the_live_session(tmp_path: Path) -> None:
     """The same player stays, idle clears, and the room hears reconnected."""
     logged_out = datetime(2020, 1, 1, tzinfo=timezone.utc)
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            logged_out_at=logged_out,
-            ip_address="192.168.0.9",
-        ),
-    )
-    host = _login_host(tmp_path)
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), logged_out_at=logged_out, ip_address="192.168.0.9"))  # fmt: skip  # noqa: E501
+    server = login_host(tmp_path)
     connected_at = datetime(2026, 10, 12, tzinfo=timezone.utc)
-    user = Player(
-        "Bea",
-        "hall",
-        connected_at,
-        connected_seconds=500,
-        alarm_seconds=120,
-        idle_seconds=40,
-        prompt="Go: ",
-        rank=RANK_SUPER,
-    )
-    live = _Player(player=user, address="192.168.0.9")
-    host.people = [live]
-    host.occupied = 99
-    newcomer = _Player(player=None, address="10.0.0.5")
-    process_input(host, newcomer, "Bea")  # type: ignore[arg-type]
-    host.sent.clear()
-    host.room_lines.clear()
-    process_input(host, newcomer, "pw")  # type: ignore[arg-type]
-    assert host.replaced == [live]
+    user = Player("Bea", "hall", connected_at, connected_seconds=500, alarm_seconds=120, idle_seconds=40, prompt="Go: ", rank=Rank.SUPER_USER)
+    live = FakePlayer(player=user, address="192.168.0.9")
+    server.people = [live]
+    server.occupied = 99
+    newcomer = FakePlayer(player=None, address="10.0.0.5")
+    process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
+    server.sent.clear()
+    server.room_lines.clear()
+    process_input(server, newcomer, "pw")  # type: ignore[arg-type]
+    assert server.replaced == [live]
     assert live.player is user
     assert user.room == "hall"
     assert user.connected_at == connected_at
@@ -3445,15 +4669,15 @@ def test_the_right_password_reconnects_the_live_session(tmp_path: Path) -> None:
     assert user.alarm_seconds == 120
     assert user.prompt == "Go: "
     assert user.idle_seconds == 0
-    assert user.rank == RANK_RESIDENT
+    assert user.rank == Rank.RESIDENT
     assert live.address == "10.0.0.5"
     assert newcomer.player is None
-    assert host.dropped is False
-    assert host.room_lines == ["[Bea has reconnected]\n"]
-    assert any(text == host._layout.brief("hall", []) for text in host.sent)
-    assert "has connected" not in "".join(host.room_lines)
-    assert "has disconnected" not in "".join(host.room_lines)
-    assert host.sent[-1] == "Go: "
+    assert server.dropped is False
+    assert server.room_lines == ["[Bea has reconnected]\n"]
+    assert any(text == server.layout.brief("hall", []) for text in server.sent)
+    assert "has connected" not in "".join(server.room_lines)
+    assert "has disconnected" not in "".join(server.room_lines)
+    assert server.sent[-1] == "Go: "
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.ip_address == "10.0.0.5"
@@ -3463,25 +4687,25 @@ def test_the_right_password_reconnects_the_live_session(tmp_path: Path) -> None:
 
 def test_a_reconnect_drops_an_unfinished_password_change(tmp_path: Path) -> None:
     """Lines after a reconnect are commands, not answers to the old password change."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
     before = load_saved(player_path(tmp_path, "Bea"))
     assert before is not None
-    host = _login_host(tmp_path)
-    live = _Player(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_RESIDENT))
-    host.people = [live]
-    process_input(host, live, "password")  # type: ignore[arg-type]
-    process_input(host, live, "pw")  # type: ignore[arg-type]
+    server = login_host(tmp_path)
+    live = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    server.people = [live]
+    process_input(server, live, "password")  # type: ignore[arg-type]
+    process_input(server, live, "pw")  # type: ignore[arg-type]
     assert live.auth == "renew"
-    newcomer = _Player(player=None, address="10.0.0.5")
-    process_input(host, newcomer, "Bea")  # type: ignore[arg-type]
-    process_input(host, newcomer, "pw")  # type: ignore[arg-type]
-    assert host.replaced == [live]
+    newcomer = FakePlayer(player=None, address="10.0.0.5")
+    process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
+    process_input(server, newcomer, "pw")  # type: ignore[arg-type]
+    assert server.replaced == [live]
     assert live.auth == "name"
     assert live.pending_password == ""
-    host.sent.clear()
-    process_input(host, live, "who")  # type: ignore[arg-type]
-    process_input(host, live, "who")  # type: ignore[arg-type]
-    output = "".join(host.sent)
+    server.sent.clear()
+    process_input(server, live, "who")  # type: ignore[arg-type]
+    process_input(server, live, "who")  # type: ignore[arg-type]
+    output = "".join(server.sent)
     assert output.count("Bea") >= 2
     assert "Password changed." not in output
     assert "Set a password" not in output
@@ -3493,69 +4717,61 @@ def test_a_reconnect_drops_an_unfinished_password_change(tmp_path: Path) -> None
 
 def test_a_taken_newbie_name_is_still_refused(tmp_path: Path) -> None:
     """A name with no file does not get a password just because it is in use."""
-    host = _login_host(tmp_path)
-    live = _Player(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_NEWBIE))
-    host.people = [live]
-    newcomer = _Player(player=None)
-    process_input(host, newcomer, "Bea")  # type: ignore[arg-type]
-    assert host.sent == ["Bea is already in use. Pick another name.\n\nPlease enter your name: "]
-    assert host.replaced == []
+    server = login_host(tmp_path)
+    live = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.NEWBIE))
+    server.people = [live]
+    newcomer = FakePlayer(player=None)
+    process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Bea is already in use. Pick another name.\n\nPlease enter your name: "]
+    assert server.replaced == []
     assert live.player is not None
     assert live.player.idle_seconds == 0
 
 
 def test_another_case_reconnects_the_live_session(tmp_path: Path) -> None:
     """Reconnect the live session after another case and the right password."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_RESIDENT)
-    live = _Player(player=user)
-    host.people = [live]
-    newcomer = _Player(player=None)
-    process_input(host, newcomer, "bea")  # type: ignore[arg-type]
-    assert host.sent == ["Password: "]
-    process_input(host, newcomer, "pw")  # type: ignore[arg-type]
-    assert host.replaced == [live]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    live = FakePlayer(player=user)
+    server.people = [live]
+    newcomer = FakePlayer(player=None)
+    process_input(server, newcomer, "bea")  # type: ignore[arg-type]
+    assert server.sent == ["Password: "]
+    process_input(server, newcomer, "pw")  # type: ignore[arg-type]
+    assert server.replaced == [live]
     assert user.name == "Bea"
 
 
 def test_a_wrong_password_leaves_the_live_session(tmp_path: Path) -> None:
     """Three failures drop only the new connection."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    live = _Player(
-        player=Player(
-            "Bea",
-            "hall",
-            datetime.now(timezone.utc),
-            idle_seconds=40,
-            rank=RANK_RESIDENT,
-        )
-    )
-    host.people = [live]
-    newcomer = _Player(player=None)
-    process_input(host, newcomer, "Bea")  # type: ignore[arg-type]
-    for _times in range(3):
-        process_input(host, newcomer, "no")  # type: ignore[arg-type]
-    assert host.dropped_clients == [newcomer]
-    assert live not in host.dropped_clients
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    live = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), idle_seconds=40, rank=Rank.RESIDENT))
+    server.people = [live]
+    newcomer = FakePlayer(player=None)
+    process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
+    for _ in range(3):
+        process_input(server, newcomer, "no")  # type: ignore[arg-type]
+    assert server.dropped_clients == [newcomer]
+    assert live not in server.dropped_clients
     assert live.player is not None
     assert live.player.idle_seconds == 40
-    assert host.replaced == []
-    assert host.room_lines == []
+    assert server.replaced == []
+    assert server.room_lines == []
 
 
 def test_a_missing_file_does_not_reconnect(tmp_path: Path) -> None:
     """The file is gone when the password arrives, so the live player stays."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    live = _Player(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_RESIDENT))
-    host.people = [live]
-    newcomer = _Player(player=None)
-    process_input(host, newcomer, "Bea")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    live = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    server.people = [live]
+    newcomer = FakePlayer(player=None)
+    process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
     assert delete_player(tmp_path, "Bea") is True
-    process_input(host, newcomer, "pw")  # type: ignore[arg-type]
-    assert host.replaced == []
+    process_input(server, newcomer, "pw")  # type: ignore[arg-type]
+    assert server.replaced == []
     assert newcomer.player is None
     assert newcomer.auth == "name"
     assert live.player is not None
@@ -3564,155 +4780,80 @@ def test_a_missing_file_does_not_reconnect(tmp_path: Path) -> None:
 
 def test_a_saved_name_that_has_left_still_connects(tmp_path: Path) -> None:
     """No live player means a normal connect line."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    newcomer = _Player(player=None, address="10.0.0.5")
-    process_input(host, newcomer, "Bea")  # type: ignore[arg-type]
-    process_input(host, newcomer, "pw")  # type: ignore[arg-type]
-    assert host.replaced == []
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    newcomer = FakePlayer(player=None, address="10.0.0.5")
+    process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
+    process_input(server, newcomer, "pw")  # type: ignore[arg-type]
+    assert server.replaced == []
     assert newcomer.player is not None
     assert newcomer.player.room == "reception"
-    assert host.room_lines == ["[Bea has connected]\n"]
+    assert server.room_lines == ["Bea has connected.\n"]
 
 
-def test_the_admin_name_in_another_case_is_not_a_newbie(tmp_path: Path) -> None:
-    """Treat another spelling of the admin name as that admin."""
-    host = _login_host(tmp_path, opened=False)
-    player = _Player(player=None)
-    process_input(host, player, "Admin")  # type: ignore[arg-type]
-    assert host.sent == ["Set a password: "]
-    assert player.pending_name == "Admin"
-    assert player.player is None
-    assert player.auth == "set"
-
-    remote_host = _login_host(tmp_path, admin="Boss", opened=False)
-    for typed in ("boss", "BOSS"):
-        remote_host.sent.clear()
-        remote = _Player(player=None, address="10.0.0.5")
-        process_input(remote_host, remote, typed)  # type: ignore[arg-type]
-        assert remote_host.sent == [admin_gate_reply()]
-        assert remote.player is None
-        assert remote.auth == "name"
-
-    host = _login_host(tmp_path)
-    for typed in ("Admin", "ADMIN"):
-        host.sent.clear()
-        player = _Player(player=None)
-        process_input(host, player, typed)  # type: ignore[arg-type]
-        assert host.sent == ["Password: "]
-        assert player.pending_name == "admin"
-        assert player.player is None
-        assert player.auth == "password"
-
-    host = _login_host(tmp_path, admin="Boss")
-    player = _Player(player=None)
-    process_input(host, player, "boss")  # type: ignore[arg-type]
-    assert host.sent == ["Password: "]
-    assert player.pending_name == "Boss"
-    assert player.player is None
-
-
-def test_remote_login_waits_until_the_admin_password_exists(tmp_path: Path) -> None:
-    """Allow only localhost to choose the admin password before the file exists."""
-    host = _login_host(tmp_path, opened=False)
-    remote = _Player(player=None, address="10.0.0.5")
-    process_input(host, remote, "admin")  # type: ignore[arg-type]
-    assert host.sent == [admin_gate_reply()]
-    assert remote.player is None
-    assert remote.auth == "name"
-    host.sent.clear()
-    local_other = _Player(player=None, address="127.0.0.1")
-    process_input(host, local_other, "Bea")  # type: ignore[arg-type]
-    assert host.sent == [admin_gate_reply()]
-    host.sent.clear()
-    other_case = _Player(player=None, address="::1")
-    process_input(host, other_case, "Admin")  # type: ignore[arg-type]
-    assert host.sent == ["Set a password: "]
-    host.sent.clear()
-    local = _Player(player=None, address="127.0.0.1")
-    process_input(host, local, "admin")  # type: ignore[arg-type]
-    assert host.sent == ["Set a password: "]
-    assert local.auth == "set"
-    host.people.append(local)
-    host.sent.clear()
-    second = _Player(player=None, address="127.0.0.1")
-    process_input(host, second, "ADMIN")  # type: ignore[arg-type]
-    assert host.sent == [name_taken_reply("ADMIN")]
-    assert load_saved(player_path(tmp_path, "admin")) is None
-    host.drop(local, announce=False)
-    host.sent.clear()
-    retry = _Player(player=None, address="::1")
-    process_input(host, retry, "admin")  # type: ignore[arg-type]
-    assert host.sent == ["Set a password: "]
-    process_input(host, retry, "secret")  # type: ignore[arg-type]
-    process_input(host, retry, "secret")  # type: ignore[arg-type]
-    assert retry.player is not None
-    host.sent.clear()
-    remote_name = _Player(player=None, address="10.0.0.5")
-    process_input(host, remote_name, "Bea")  # type: ignore[arg-type]
-    process_input(host, remote_name, "yes")  # type: ignore[arg-type]
-    assert remote_name.player is not None
-    assert remote_name.player.name == "Bea"
-    host.sent.clear()
-    remote_admin = _Player(player=None, address="10.0.0.5")
-    process_input(host, remote_admin, "admin")  # type: ignore[arg-type]
-    assert host.sent == ["Password: "]
+def test_a_remote_new_name_is_a_newbie(tmp_path: Path) -> None:
+    """A new name from another machine reaches the disclaimer."""
+    server = login_host(tmp_path, super_admin=None)
+    remote = FakePlayer(player=None, address="10.0.0.5")
+    process_input(server, remote, "Bea")  # type: ignore[arg-type]
+    assert remote.auth == "agree"
+    assert "The admin must set a password" not in "".join(server.sent)
 
 
 def test_resident_of_the_admin_name_starts_no_pair(tmp_path: Path) -> None:
     """The admin in any case is refused, and nobody is asked for a password."""
-    admin = _newbie("admin")
-    host = _login_host(tmp_path)
-    host.people = [admin]
-    ada = _staff("Ada", "super")
+    admin = newbie("admin")
+    server = login_host(tmp_path)
+    server.people = [admin]
+    ada = staff("Ada", Rank.SUPER_USER)
     for line in ("resident admin", "resident Admin", "resident ADMIN"):
-        host.sent.clear()
-        process_commands(host, ada, line)  # type: ignore[arg-type]
-        assert host.sent == ["The admin cannot be removed.\n"]
-    assert host.staff_lines == []
+        server.sent.clear()
+        process_commands(server, ada, line)  # type: ignore[arg-type]
+        assert server.sent == ["The super admin cannot be removed.\n"]
+    assert server.staff_lines == []
     assert admin.auth == "name"
 
 
 def test_three_wrong_passwords_drop_the_player(tmp_path: Path) -> None:
     """Each wrong password is answered. The third one closes the connection."""
-    save_player(tmp_path, SavedPlayer("Bea", "resident", hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "Bea")  # type: ignore[arg-type]
-    process_input(host, player, "no")  # type: ignore[arg-type]
-    assert host.sent[-2:] == ["Wrong password.\n", "Password: "]
-    process_input(host, player, "no")  # type: ignore[arg-type]
-    assert host.dropped is False
-    process_input(host, player, "no")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Wrong password.\n"
-    assert host.dropped is True
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "Bea")  # type: ignore[arg-type]
+    process_input(server, player, "no")  # type: ignore[arg-type]
+    assert server.sent[-2:] == ["Wrong password.\n", "Password: "]
+    process_input(server, player, "no")  # type: ignore[arg-type]
+    assert server.dropped is False
+    process_input(server, player, "no")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Wrong password.\n"
+    assert server.dropped is True
     assert player.player is None
 
 
 def test_a_name_that_cannot_be_a_file_is_a_newbie(tmp_path: Path) -> None:
     """A name with path characters never reaches the players directory."""
-    host = _login_host(tmp_path)
-    player = _Player(player=None)
-    process_input(host, player, "../evil")  # type: ignore[arg-type]
+    server = login_host(tmp_path)
+    player = FakePlayer(player=None)
+    process_input(server, player, "../evil")  # type: ignore[arg-type]
     assert player.player is None
-    assert host.sent[-1] == ("A name can use only letters and digits.\n\nPlease enter your name: ")
+    assert server.sent[-1] == ("A name can use only letters and digits.\n\nPlease enter your name: ")
 
 
-def _staff(name: str, rank: str) -> _Player:
+def staff(name: str, rank: Rank) -> FakePlayer:
     user = Player(name, "reception", datetime.now(timezone.utc), rank=rank)
-    return _Player(name=name, player=user)
+    return FakePlayer(name=name, player=user)
 
 
 def test_another_capitalisation_of_a_newbie_is_in_use(tmp_path: Path) -> None:
     """Bea and BEA are the newbie already in the room."""
-    host = _login_host(tmp_path)
-    bea = _Player(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_NEWBIE))
-    host.people = [bea]
+    server = login_host(tmp_path)
+    bea = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.NEWBIE))
+    server.people = [bea]
     for typed in ("bea", "BEA"):
-        host.sent.clear()
-        newcomer = _Player(player=None)
-        process_input(host, newcomer, typed)  # type: ignore[arg-type]
-        assert host.sent == [f"{typed} is already in use. Pick another name.\n\n{name_prompt()}"]
+        server.sent.clear()
+        newcomer = FakePlayer(player=None)
+        process_input(server, newcomer, typed)  # type: ignore[arg-type]
+        assert server.sent == [f"{typed} is already in use. Pick another name.\n\n{name_prompt()}"]
         assert newcomer.player is None
     assert bea.player is not None
     assert bea.player.name == "Bea"
@@ -3720,837 +4861,1076 @@ def test_another_capitalisation_of_a_newbie_is_in_use(tmp_path: Path) -> None:
 
 def test_a_newbie_who_quits_frees_the_name(tmp_path: Path) -> None:
     """After quit, the other capitalisation can enter, and no file is written."""
-    host = _login_host(tmp_path)
-    bea = _Player(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_NEWBIE))
-    host.people = [bea]
-    process_input(host, bea, "quit")  # type: ignore[arg-type]
-    assert bea in host.dropped_clients
-    host.sent.clear()
-    later = _Player(player=None)
-    process_input(host, later, "bea")  # type: ignore[arg-type]
-    process_input(host, later, "yes")  # type: ignore[arg-type]
+    server = login_host(tmp_path)
+    bea = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.NEWBIE))
+    server.people = [bea]
+    process_input(server, bea, "quit")  # type: ignore[arg-type]
+    assert bea in server.dropped_clients
+    server.sent.clear()
+    later = FakePlayer(player=None)
+    process_input(server, later, "bea")  # type: ignore[arg-type]
+    process_input(server, later, "yes")  # type: ignore[arg-type]
     assert later.player is not None
     assert later.player.name == "bea"
-    assert later.player.rank == RANK_NEWBIE
+    assert later.player.rank == Rank.NEWBIE
     assert load_saved(player_path(tmp_path, "bea")) is None
 
 
 def test_a_newbie_setting_a_resident_password_still_holds_the_name(tmp_path: Path) -> None:
     """The name stays taken until confirm writes the file."""
-    host = _login_host(tmp_path)
-    bea = _Player(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_NEWBIE))
-    host.people = [bea]
-    issuer = _staff("Ada", RANK_SUPER)
-    host.people.append(issuer)
-    process_commands(host, issuer, "resident Bea")  # type: ignore[arg-type]
+    server = login_host(tmp_path)
+    bea = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.NEWBIE))
+    server.people = [bea]
+    issuer = staff("Ada", Rank.SUPER_USER)
+    server.people.append(issuer)
+    process_commands(server, issuer, "resident Bea")  # type: ignore[arg-type]
     assert bea.auth == "set"
-    newcomer = _Player(player=None)
-    process_input(host, newcomer, "bea")  # type: ignore[arg-type]
-    assert host.sent[-1] == f"bea is already in use. Pick another name.\n\n{name_prompt()}"
+    newcomer = FakePlayer(player=None)
+    process_input(server, newcomer, "bea")  # type: ignore[arg-type]
+    assert server.sent[-1] == f"bea is already in use. Pick another name.\n\n{name_prompt()}"
     assert load_saved(player_path(tmp_path, "Bea")) is None
-    process_input(host, bea, "quit")  # type: ignore[arg-type]
-    host.sent.clear()
-    process_input(host, newcomer, "bea")  # type: ignore[arg-type]
-    process_input(host, newcomer, "yes")  # type: ignore[arg-type]
+    process_input(server, bea, "quit")  # type: ignore[arg-type]
+    server.sent.clear()
+    process_input(server, newcomer, "bea")  # type: ignore[arg-type]
+    process_input(server, newcomer, "yes")  # type: ignore[arg-type]
     assert newcomer.player is not None
     assert newcomer.player.name == "bea"
     assert load_saved(player_path(tmp_path, "bea")) is None
 
 
-def test_a_saved_player_at_the_password_prompt_does_not_hold_the_name(
-    tmp_path: Path,
-) -> None:
+def test_a_saved_player_at_the_password_prompt_does_not_hold_the_name(tmp_path: Path) -> None:
     """Ask for the password again, including another capitalisation."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    waiting = _Player(player=None, address="10.0.0.5")
-    host.people = [waiting]
-    process_input(host, waiting, "Bea")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    waiting = FakePlayer(player=None, address="10.0.0.5")
+    server.people = [waiting]
+    process_input(server, waiting, "Bea")  # type: ignore[arg-type]
     assert waiting.auth == "password"
-    host.sent.clear()
-    other = _Player(player=None, address="10.0.0.5")
-    process_input(host, other, "Bea")  # type: ignore[arg-type]
-    assert host.sent == ["Password: "]
-    host.sent.clear()
-    spelling = _Player(player=None, address="10.0.0.5")
-    process_input(host, spelling, "bea")  # type: ignore[arg-type]
-    assert host.sent == ["Password: "]
+    server.sent.clear()
+    other = FakePlayer(player=None, address="10.0.0.5")
+    process_input(server, other, "Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Password: "]
+    server.sent.clear()
+    spelling = FakePlayer(player=None, address="10.0.0.5")
+    process_input(server, spelling, "bea")  # type: ignore[arg-type]
+    assert server.sent == ["Password: "]
 
 
-def _newbie(name: str) -> _Player:
-    return _Player(
-        name=name,
-        room="hall",
-        player=Player(name, "hall", datetime.now(timezone.utc)),
-    )
+def newbie(name: str) -> FakePlayer:
+    return FakePlayer(name=name, room="hall", player=Player(name, "hall", datetime.now(timezone.utc)))
 
 
-def _save(tmp_path: Path, name: str, rank: str) -> None:
+def save(tmp_path: Path, name: str, rank: Rank) -> None:
     save_player(tmp_path, SavedPlayer(name, rank, hash_password("pw", rounds=4)))
 
 
 def test_resident_saves_a_connected_newbie(tmp_path: Path) -> None:
     """The newbie is asked for a password pair, and is saved only after the confirm."""
-    bea = _newbie("Bea")
-    ada = _staff("Ada", "super")
-    host = _login_host(tmp_path)
-    host.people = [bea, ada]
-    process_commands(host, ada, "resident Bea")  # type: ignore[arg-type]
-    assert host.staff_lines == [paint_staff(ada, "< SU > Ada makes Bea a resident.\n")]
-    assert host.sent == ["Set a password: "]
+    bea = newbie("Bea")
+    ada = staff("Ada", Rank.SUPER_USER)
+    server = login_host(tmp_path)
+    server.people = [bea, ada]
+    process_commands(server, ada, "resident Bea")  # type: ignore[arg-type]
+    assert server.staff_lines == [paint_staff(ada, "< SU > Ada makes Bea a resident.\n")]
+    assert server.sent == ["Set a password: "]
     assert bea.auth == "set"
     assert bea.player is not None
-    assert bea.player.rank == "newbie"
+    assert bea.player.rank is Rank.NEWBIE
     assert load_saved(player_path(tmp_path, "Bea")) is None
 
-    process_input(host, bea, "hunter2")  # type: ignore[arg-type]
-    assert host.sent[-1] == "\n\nConfirm password: "
-    assert bea.player.rank == "newbie"
+    process_input(server, bea, "hunter2")  # type: ignore[arg-type]
+    assert server.sent[-1] == "\n\nConfirm password: "
+    assert bea.player.rank is Rank.NEWBIE
     assert load_saved(player_path(tmp_path, "Bea")) is None
 
-    process_input(host, bea, "hunter2")  # type: ignore[arg-type]
-    assert bea.player.rank == "resident"
+    process_input(server, bea, "hunter2")  # type: ignore[arg-type]
+    assert bea.player.rank is Rank.RESIDENT
     assert bea.auth == "name"
-    assert host.sent[-3:] == ["You are now a resident.\n", "Bea is now a resident.\n", "What? > "]
+    assert server.sent[-3:] == ["You are now a resident.\n", "Bea is now a resident.\n", "What? > "]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
-    assert saved.rank == "resident"
+    assert saved.rank is Rank.RESIDENT
     assert password_ok("hunter2", saved.password_hash)
 
 
 def test_resident_staff_line_is_sent_at_command_time_only(tmp_path: Path) -> None:
     """Staff hear who made the resident once; promotion does not broadcast again."""
-    bea = _newbie("Bea")
-    ada = _staff("Ada", "super")
-    host = _login_host(tmp_path)
-    host.people = [bea, ada]
-    process_commands(host, ada, "resident Bea")  # type: ignore[arg-type]
+    bea = newbie("Bea")
+    ada = staff("Ada", Rank.SUPER_USER)
+    server = login_host(tmp_path)
+    server.people = [bea, ada]
+    process_commands(server, ada, "resident Bea")  # type: ignore[arg-type]
     staff_line = paint_staff(ada, "< SU > Ada makes Bea a resident.\n")
-    assert host.staff_lines == [staff_line]
-    process_input(host, bea, "hunter2")  # type: ignore[arg-type]
-    process_input(host, bea, "hunter2")  # type: ignore[arg-type]
-    assert host.staff_lines == [staff_line]
+    assert server.staff_lines == [staff_line]
+    process_input(server, bea, "hunter2")  # type: ignore[arg-type]
+    process_input(server, bea, "hunter2")  # type: ignore[arg-type]
+    assert server.staff_lines == [staff_line]
     assert "Bea is now a resident.\n" in ada.sent
 
 
 def test_resident_pair_refuses_a_bad_password(tmp_path: Path) -> None:
     """A mismatch returns to the first prompt and still writes nothing."""
-    bea = _newbie("Bea")
-    host = _login_host(tmp_path)
-    host.people = [bea]
-    process_commands(host, _staff("Ada", "super"), "resident Bea")  # type: ignore[arg-type]
-    process_input(host, bea, "")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Password cannot be empty.\nSet a password: "
-    process_input(host, bea, "one")  # type: ignore[arg-type]
-    process_input(host, bea, "two")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Those passwords do not match.\nSet a password: "
+    bea = newbie("Bea")
+    server = login_host(tmp_path)
+    server.people = [bea]
+    process_commands(server, staff("Ada", Rank.SUPER_USER), "resident Bea")  # type: ignore[arg-type]
+    process_input(server, bea, "")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Password cannot be empty.\nSet a password: "
+    process_input(server, bea, "one")  # type: ignore[arg-type]
+    process_input(server, bea, "two")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Those passwords do not match.\nSet a password: "
     assert bea.auth == "set"
     assert bea.player is not None
-    assert bea.player.rank == "newbie"
+    assert bea.player.rank is Rank.NEWBIE
     assert load_saved(player_path(tmp_path, "Bea")) is None
 
 
 def test_resident_refusals(tmp_path: Path) -> None:
     """Each refusal names the typed name and starts no password pair."""
-    _save(tmp_path, "Cyd", RANK_RESIDENT)
-    odd = _newbie("a/b")
-    host = _login_host(tmp_path)
-    host.people = [odd, _newbie("Bea")]
-    ada = _staff("Ada", "super")
-    for line, reply in (
-        ("resident Zed", "Player Zed not found.\n"),
-        ("resident Cyd", "Cyd is already saved.\n"),
-        ("resident cyd", "cyd is already saved.\n"),
-        ("resident a/b", "That name cannot be saved.\n"),
-    ):
-        host.sent.clear()
-        process_commands(host, ada, line)  # type: ignore[arg-type]
-        assert host.sent == [reply]
-    assert host.staff_lines == []
-    assert all(person.auth == "name" for person in host.people)
+    save(tmp_path, "Cyd", Rank.RESIDENT)
+    odd = newbie("a/b")
+    server = login_host(tmp_path)
+    server.people = [odd, newbie("Bea")]
+    ada = staff("Ada", Rank.SUPER_USER)
+    for line, reply in (("resident Zed", "No such player 'Zed'.\n"), ("resident Cyd", "Cyd is already saved.\n"), ("resident cyd", "cyd is already saved.\n"), ("resident a/b", "That name cannot be saved.\n")):  # fmt: skip  # noqa: E501
+        server.sent.clear()
+        process_commands(server, ada, line)  # type: ignore[arg-type]
+        assert server.sent == [reply]
+    assert server.staff_lines == []
+    assert all(person.auth == "name" for person in server.people)
     assert odd.auth == "name"
 
 
 def test_resident_needs_super_and_a_name(tmp_path: Path) -> None:
     """A resident does not see the command. Super sees the syntax with no name."""
-    host = _login_host(tmp_path)
-    resident = _staff("Ada", RANK_RESIDENT)
-    process_commands(host, resident, "resident Bea")  # type: ignore[arg-type]
-    assert host.sent == ["No such command 'resident'\n"]
-    host = _login_host(tmp_path)
-    process_commands(host, _staff("Ada", RANK_SUPER), "resident")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: resident <name>\n"]
+    server = login_host(tmp_path)
+    resident = staff("Ada", Rank.RESIDENT)
+    process_commands(server, resident, "resident Bea")  # type: ignore[arg-type]
+    assert server.sent == ["No such command 'resident'\n"]
+    server = login_host(tmp_path)
+    process_commands(server, staff("Ada", Rank.SUPER_USER), "resident")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: resident <name>\n"]
 
 
 def test_nuke_deletes_the_file(tmp_path: Path) -> None:
     """Nuking an offline resident deletes the file and says so to staff."""
-    _save(tmp_path, "Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", "super")
-    host.people = [ada]
-    process_commands(host, ada, "nuke Bea spam")  # type: ignore[arg-type]
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [ada]
+    process_commands(server, ada, "nuke Bea spam")  # type: ignore[arg-type]
     assert load_saved(player_path(tmp_path, "Bea")) is None
-    assert host.staff_lines == [paint_staff(ada, "< SU > Ada nukes Bea: spam\n")]
-    assert host.dropped_clients == []
+    assert server.staff_lines == [paint_staff(ada, "< SU > Ada nukes Bea: spam\n")]
+    assert server.dropped_clients == []
 
 
 def test_nuke_deletes_a_saved_name_with_a_space(tmp_path: Path) -> None:
     """A saved name with a space is the whole name, and the rest is the reason."""
-    save_player(
-        tmp_path,
-        SavedPlayer("BeaSmith", RANK_RESIDENT, hash_password("pw", rounds=4)),
-    )
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", "super")
-    host.people = [ada]
-    process_commands(host, ada, "nuke Bea")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Syntax: nuke <name> <reason>\n"
+    save_player(tmp_path, SavedPlayer("BeaSmith", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [ada]
+    process_commands(server, ada, "nuke Bea")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Syntax: nuke <name> <reason>\n"
     assert load_saved(player_path(tmp_path, "BeaSmith")) is not None
-    process_commands(host, ada, "nuke BeaSmith")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Syntax: nuke <name> <reason>\n"
+    process_commands(server, ada, "nuke BeaSmith")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Syntax: nuke <name> <reason>\n"
     assert load_saved(player_path(tmp_path, "BeaSmith")) is not None
-    process_commands(host, ada, "nuke BeaSmith spam")  # type: ignore[arg-type]
+    process_commands(server, ada, "nuke BeaSmith spam")  # type: ignore[arg-type]
     assert load_saved(player_path(tmp_path, "BeaSmith")) is None
-    assert host.staff_lines == [paint_staff(ada, "< SU > Ada nukes BeaSmith: spam\n")]
+    assert server.staff_lines == [paint_staff(ada, "< SU > Ada nukes BeaSmith: spam\n")]
 
 
 def test_nuke_removes_a_connected_player(tmp_path: Path) -> None:
     """A connected target is told, then dropped with the disconnect line."""
-    _save(tmp_path, "Bea", RANK_RESIDENT)
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", "super")
-    host.people = [bea, ada]
-    process_commands(host, ada, "nuke bea  being rude")  # type: ignore[arg-type]
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    bea = staff("Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [bea, ada]
+    process_commands(server, ada, "nuke bea  being rude")  # type: ignore[arg-type]
     assert load_saved(player_path(tmp_path, "Bea")) is None
-    assert host.sent == ["You have been removed.\n"]
-    assert host.dropped_clients == [bea]
-    assert host.staff_lines == [paint_staff(ada, "< SU > Ada nukes Bea: being rude\n")]
+    assert server.sent == ["You have been removed.\n"]
+    assert server.dropped_clients == [bea]
+    assert server.staff_lines == [paint_staff(ada, "< SU > Ada nukes Bea: being rude\n")]
 
 
 def test_nuke_refuses_a_connected_newbie(tmp_path: Path) -> None:
     """A connected newbie has no saved file, so nuke leaves them in place."""
-    bea = _newbie("Bea")
-    host = _login_host(tmp_path)
-    host.people = [bea]
-    process_commands(host, _staff("Ada", "super"), "nuke Bea spam")  # type: ignore[arg-type]
-    assert host.sent == ["Player Bea not found.\n"]
-    assert bea in host.people
+    bea = newbie("Bea")
+    server = login_host(tmp_path)
+    server.people = [bea]
+    process_commands(server, staff("Ada", Rank.SUPER_USER), "nuke Bea spam")  # type: ignore[arg-type]
+    assert server.sent == ["Player Bea not found.\n"]
+    assert bea in server.people
     assert bea.player is not None
-    assert host.dropped_clients == []
-    assert host.staff_lines == []
+    assert server.dropped_clients == []
+    assert server.staff_lines == []
 
 
 def test_disconnect_refuses_yourself() -> None:
     """Disconnect aimed at the typist does not drop them."""
-    host = _Host()
-    ada = _staff("Ada", RANK_SUPER)
-    host.people = [ada]
-    command_disconnect(
-        host,
-        ada,
-        Command("disconnect", command_disconnect, False),
-        "ada spam",
-    )
+    server = FakeServer()
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [ada]
+    command_disconnect(server, ada, Command("disconnect", command_disconnect, False), "ada spam")
     assert ada.sent == ["You cannot do that to yourself.\n"]
-    assert host.dropped_clients == []
+    assert server.dropped_clients == []
 
 
 def test_warn_syntax_without_reason() -> None:
     """Warn needs a name and a reason."""
-    host = _Host()
-    ada = _staff("Ada", RANK_SUPER)
-    host.people = [ada]
-    command_warn(
-        host,
-        ada,
-        Command("warn", command_warn, False, "warn <name> <reason>"),
-        "Bea",
-    )
+    server = FakeServer()
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [ada]
+    command_warn(server, ada, Command("warn", command_warn, False, "<name> <reason>"), "Bea")
     assert ada.sent == ["Syntax: warn <name> <reason>\n"]
 
 
 def test_warn_unknown_player() -> None:
     """Warn misses when the full name is not in a room."""
-    host = _Host()
-    ada = _staff("Ada", RANK_SUPER)
-    host.people = [ada]
-    command_warn(
-        host,
-        ada,
-        Command("warn", command_warn, False, "warn <name> <reason>"),
-        "Bea stop that",
-    )
-    assert ada.sent == ["Player Bea not found.\n"]
-    assert host.staff_lines == []
+    server = FakeServer()
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [ada]
+    command_warn(server, ada, Command("warn", command_warn, False, "<name> <reason>"), "Bea stop that")
+    assert ada.sent == ["No such player 'Bea'.\n"]
+    assert server.staff_lines == []
 
 
 def test_warn_refuses_yourself() -> None:
     """Warn aimed at the typist does not message staff."""
-    host = _Host()
-    ada = _staff("Ada", RANK_SUPER)
-    host.people = [ada]
-    command_warn(
-        host,
-        ada,
-        Command("warn", command_warn, False, "warn <name> <reason>"),
-        "Ada stop that",
-    )
+    server = FakeServer()
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [ada]
+    command_warn(server, ada, Command("warn", command_warn, False, "<name> <reason>"), "Ada stop that")
     assert ada.sent == ["You cannot do that to yourself.\n"]
-    assert host.staff_lines == []
+    assert server.staff_lines == []
 
 
 def test_warn_rejects_a_name_prefix() -> None:
     """Warn needs the full name, not a prefix."""
-    host = _Host()
-    ada = _staff("Ada", RANK_SUPER)
-    bea = _staff("Bea", RANK_RESIDENT)
-    host.people = [ada, bea]
-    command_warn(
-        host,
-        ada,
-        Command("warn", command_warn, False, "warn <name> <reason>"),
-        "Be stop that",
-    )
-    assert ada.sent == ["Player Be not found.\n"]
+    server = FakeServer()
+    ada = staff("Ada", Rank.SUPER_USER)
+    bea = staff("Bea", Rank.RESIDENT)
+    server.people = [ada, bea]
+    command_warn(server, ada, Command("warn", command_warn, False, "<name> <reason>"), "Be stop that")
+    assert ada.sent == ["No such player 'Be'.\n"]
     assert bea.sent == []
-    assert host.staff_lines == []
+    assert server.staff_lines == []
 
 
 def test_warn_sends_a_cyan_line_and_a_beep() -> None:
     """The target sees cyan when colour is on, plain text when it is off."""
-    host = _Host()
-    ada = _staff("Ada", RANK_SUPER)
-    bea = _staff("Bea", RANK_RESIDENT)
-    host.people = [ada, bea]
+    server = FakeServer()
+    ada = staff("Ada", Rank.SUPER_USER)
+    bea = staff("Bea", Rank.RESIDENT)
+    server.people = [ada, bea]
     assert ada.player is not None
     ada.player.colour = False
     assert bea.player is not None
     bea.player.colour = True
-    command_warn(
-        host,
-        ada,
-        Command("warn", command_warn, False, "warn <name> <reason>"),
-        "Bea stop that",
-    )
+    command_warn(server, ada, Command("warn", command_warn, False, "<name> <reason>"), "Bea stop that")
     plain = "-=> Ada warn you: stop that"
     assert bea.sent == [f"\n\n{cyan(plain)}\n\n\n\a"]
-    assert ada.sent == []
-    assert host.staff_lines == ["< SU > Ada warns Bea : stop that\n"]
+    assert ada.sent == ["< SU > Ada warns Bea : stop that\n"]
+    assert server.staff_lines == ["< SU > Ada warns Bea : stop that\n"]
 
-    host.staff_lines.clear()
+    server.staff_lines.clear()
     bea.sent.clear()
     bea.player.colour = False
-    command_warn(
-        host,
-        ada,
-        Command("warn", command_warn, False, "warn <name> <reason>"),
-        "Bea stop that",
-    )
+    command_warn(server, ada, Command("warn", command_warn, False, "<name> <reason>"), "Bea stop that")
     assert bea.sent == [f"\n\n{plain}\n\n\n\a"]
-    assert ada.sent == []
-    assert host.staff_lines == ["< SU > Ada warns Bea : stop that\n"]
+    assert ada.sent == ["< SU > Ada warns Bea : stop that\n", "< SU > Ada warns Bea : stop that\n"]
+    assert server.staff_lines == ["< SU > Ada warns Bea : stop that\n"]
 
 
 def test_resident_refuses_yourself() -> None:
     """Resident aimed at the typist does not start a password pair."""
-    host = _Host()
-    ada = _Player()
-    host.people = [ada]
-    command_resident(host, ada, Command("resident", command_resident, False), "ada")
+    server = FakeServer()
+    ada = FakePlayer()
+    server.people = [ada]
+    command_resident(server, ada, Command("resident", command_resident, False), "ada")
     assert ada.sent == ["You cannot do that to yourself.\n"]
-    assert host.staff_lines == []
+    assert server.staff_lines == []
     assert ada.auth == "name"
+
+
+def test_nuke_of_system_leaves_the_office_file(tmp_path: Path) -> None:
+    """Nuke of a player named System leaves the office file in place."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save(players, "System", Rank.RESIDENT)
+    office = tmp_path / "rooms" / "system.yml"
+    office.parent.mkdir()
+    text = "reception:\n  description: The desk.\n  max_occupancy: 2\n  exits: {}\n"
+    office.write_text(text, encoding="utf-8")
+    server = login_host(players)
+    server.config = replace(server.config, rooms=office, help=tmp_path / "help.yml", players=players)
+    server.layout = load_layout(office).with_void()
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [ada]
+    command_nuke(server, ada, Command("nuke", command_nuke, False, "nuke <name> <reason>"), "System gone")
+    assert office.read_text(encoding="utf-8") == text
+    assert load_saved(player_path(players, "System")) is None
+
+
+def test_nuke_removes_the_house_and_leaves_the_office(tmp_path: Path) -> None:
+    """Nuke removes ada.yml and leaves the office file."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save(players, "Ada", Rank.RESIDENT)
+    office = tmp_path / "system.yml"
+    office.write_text("reception:\n  description: The desk.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    server = login_host(players)
+    server.config = replace(server.config, rooms=office, players=players)
+    server.layout = load_layout(office).with_void()
+    write_default_house(office, "Ada")
+    assert (tmp_path / "ada.yml").is_file()
+    boss = staff("Bea", Rank.SUPER_USER)
+    server.people = [boss]
+    command_nuke(server, boss, Command("nuke", command_nuke, False, "nuke <name> <reason>"), "Ada gone")
+    assert not (tmp_path / "ada.yml").exists()
+    assert office.is_file()
+    assert load_saved(player_path(players, "Ada")) is None
+
+
+def test_retire_removes_the_house_and_leaves_the_office(tmp_path: Path) -> None:
+    """Retire removes ada.yml and leaves the office file."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save(players, "Ada", Rank.RESIDENT)
+    office = tmp_path / "system.yml"
+    office.write_text("reception:\n  description: The desk.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    server = login_host(players)
+    server.config = replace(server.config, rooms=office, players=players)
+    server.layout = load_layout(office).with_void()
+    write_default_house(office, "Ada")
+    ada = staff("Ada", Rank.RESIDENT)
+    server.people = [ada]
+    process_input(server, ada, "retire")  # type: ignore[arg-type]
+    process_input(server, ada, "yes")  # type: ignore[arg-type]
+    process_input(server, ada, "pw")  # type: ignore[arg-type]
+    assert not (tmp_path / "ada.yml").exists()
+    assert office.is_file()
+    assert load_saved(player_path(players, "Ada")) is None
 
 
 def test_nuke_refuses_yourself(tmp_path: Path) -> None:
     """Nuke aimed at the typist does not delete their file."""
-    _save(tmp_path, "Ada", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_SUPER)
-    host.people = [ada]
-    command_nuke(host, ada, Command("nuke", command_nuke, False), "ada gone")
+    save(tmp_path, "Ada", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [ada]
+    command_nuke(server, ada, Command("nuke", command_nuke, False), "ada gone")
     assert ada.sent == ["You cannot do that to yourself.\n"]
     assert load_saved(player_path(tmp_path, "Ada")) is not None
-    assert host.staff_lines == []
+    assert server.staff_lines == []
 
 
 def test_promote_refuses_yourself(tmp_path: Path) -> None:
     """Promote aimed at the typist does not raise their rank."""
-    _save(tmp_path, "Ada", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_ADMIN)
-    host.people = [ada]
-    command_promote(host, ada, Command("promote", command_promote, False), "ada")
+    save(tmp_path, "Ada", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.ADMIN)
+    server.people = [ada]
+    command_promote(server, ada, Command("promote", command_promote, False), "ada")
     assert ada.sent == ["You cannot do that to yourself.\n"]
     saved = load_saved(player_path(tmp_path, "Ada"))
     assert saved is not None
-    assert saved.rank == RANK_RESIDENT
-    assert host.staff_lines == []
+    assert saved.rank == Rank.RESIDENT
+    assert server.staff_lines == []
 
 
 def test_demote_refuses_yourself(tmp_path: Path) -> None:
     """Demote aimed at the typist does not lower their rank."""
-    _save(tmp_path, "Ada", RANK_SUPER)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_ADMIN)
-    host.people = [ada]
-    command_demote(host, ada, Command("demote", command_demote, False), "ada")
+    save(tmp_path, "Ada", Rank.SUPER_USER)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.ADMIN)
+    server.people = [ada]
+    command_demote(server, ada, Command("demote", command_demote, False), "ada")
     assert ada.sent == ["You cannot do that to yourself.\n"]
     saved = load_saved(player_path(tmp_path, "Ada"))
     assert saved is not None
-    assert saved.rank == RANK_SUPER
-    assert host.staff_lines == []
+    assert saved.rank == Rank.SUPER_USER
+    assert server.staff_lines == []
 
 
 def test_disconnect_drops_a_resident_and_keeps_the_file(tmp_path: Path) -> None:
     """Staff are told, the resident is told, and the file stays."""
-    _save(tmp_path, "Bea", RANK_RESIDENT)
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_SUPER)
-    host.people = [bea, ada]
-    process_commands(host, ada, "disconnect Bea spam")  # type: ignore[arg-type]
-    assert host.sent == ["You have been disconnected.\n"]
-    assert host.dropped_clients == [bea]
-    assert host.announced == [True]
-    assert host.staff_lines == [paint_staff(ada, "< SU > Ada disconnects Bea: spam\n")]
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    bea = staff("Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [bea, ada]
+    process_commands(server, ada, "disconnect Bea spam")  # type: ignore[arg-type]
+    assert server.sent == ["You have been disconnected.\n"]
+    assert server.dropped_clients == [bea]
+    assert server.announced == [True]
+    assert server.staff_lines == [paint_staff(ada, "< SU > Ada disconnects Bea: spam\n")]
     assert load_saved(player_path(tmp_path, "Bea")) is not None
 
 
 def test_disconnect_refuses_the_same_rank_or_higher(tmp_path: Path) -> None:
     """A super user cannot drop a super user, the admin, or themselves."""
-    host = _login_host(tmp_path)
-    cy = _staff("Cyd", RANK_SUPER)
-    boss = _staff("Boss", RANK_ADMIN)
-    ada = _staff("Ada", RANK_SUPER)
-    host.people = [cy, boss, ada]
-    process_commands(host, ada, "disconnect Cyd spam")  # type: ignore[arg-type]
-    assert host.sent == ["You cannot disconnect Cyd.\n"]
-    host.sent.clear()
-    process_commands(host, ada, "disconnect Boss spam")  # type: ignore[arg-type]
-    assert host.sent == ["You cannot disconnect Boss.\n"]
-    host.sent.clear()
-    process_commands(host, ada, "disconnect Ada spam")  # type: ignore[arg-type]
-    assert host.sent == ["You cannot do that to yourself.\n"]
-    assert host.dropped_clients == []
-    assert host.staff_lines == []
+    server = login_host(tmp_path)
+    cy = staff("Cyd", Rank.SUPER_USER)
+    boss = staff("Boss", Rank.ADMIN)
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [cy, boss, ada]
+    process_commands(server, ada, "disconnect Cyd spam")  # type: ignore[arg-type]
+    assert server.sent == ["You cannot disconnect Cyd.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "disconnect Boss spam")  # type: ignore[arg-type]
+    assert server.sent == ["You cannot disconnect Boss.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "disconnect Ada spam")  # type: ignore[arg-type]
+    assert server.sent == ["You cannot do that to yourself.\n"]
+    assert server.dropped_clients == []
+    assert server.staff_lines == []
 
 
 def test_an_admin_can_disconnect_a_super_user_but_not_themselves(tmp_path: Path) -> None:
     """A super user is below an admin and is dropped. An admin cannot drop themselves."""
-    host = _login_host(tmp_path)
-    cy = _staff("Cyd", RANK_SUPER)
-    boss = _staff("Boss", RANK_ADMIN)
-    host.people = [cy, boss]
-    process_commands(host, boss, "disconnect Cyd spam")  # type: ignore[arg-type]
-    assert host.sent == ["You have been disconnected.\n"]
-    assert host.dropped_clients == [cy]
-    host.sent.clear()
-    process_commands(host, boss, "disconnect Boss spam")  # type: ignore[arg-type]
-    assert host.sent == ["You cannot do that to yourself.\n"]
-    assert host.dropped_clients == [cy]
+    server = login_host(tmp_path)
+    cy = staff("Cyd", Rank.SUPER_USER)
+    boss = staff("Boss", Rank.ADMIN)
+    server.people = [cy, boss]
+    process_commands(server, boss, "disconnect Cyd spam")  # type: ignore[arg-type]
+    assert server.sent == ["You have been disconnected.\n"]
+    assert server.dropped_clients == [cy]
+    server.sent.clear()
+    process_commands(server, boss, "disconnect Boss spam")  # type: ignore[arg-type]
+    assert server.sent == ["You cannot do that to yourself.\n"]
+    assert server.dropped_clients == [cy]
 
 
 def test_nuke_refuses_the_same_rank_or_higher(tmp_path: Path) -> None:
     """A super user or a promoted admin cannot nuke their rank or above."""
-    _save(tmp_path, "Bea", RANK_ADMIN)
-    _save(tmp_path, "Cyd", RANK_SUPER)
-    host = _login_host(tmp_path)
-    sue = _staff("Sue", RANK_SUPER)
-    boss = _staff("Boss", RANK_ADMIN)
-    host.people = [sue, boss]
-    process_commands(host, sue, "nuke Bea spam")  # type: ignore[arg-type]
-    assert host.sent == ["You cannot nuke Bea.\n"]
-    host.sent.clear()
-    process_commands(host, sue, "nuke Cyd spam")  # type: ignore[arg-type]
-    assert host.sent == ["You cannot nuke Cyd.\n"]
-    host.sent.clear()
-    process_commands(host, boss, "nuke Bea spam")  # type: ignore[arg-type]
-    assert host.sent == ["You cannot nuke Bea.\n"]
+    save(tmp_path, "Bea", Rank.ADMIN)
+    save(tmp_path, "Cyd", Rank.SUPER_USER)
+    server = login_host(tmp_path)
+    sue = staff("Sue", Rank.SUPER_USER)
+    boss = staff("Boss", Rank.ADMIN)
+    server.people = [sue, boss]
+    process_commands(server, sue, "nuke Bea spam")  # type: ignore[arg-type]
+    assert server.sent == ["You cannot nuke Bea.\n"]
+    server.sent.clear()
+    process_commands(server, sue, "nuke Cyd spam")  # type: ignore[arg-type]
+    assert server.sent == ["You cannot nuke Cyd.\n"]
+    server.sent.clear()
+    process_commands(server, boss, "nuke Bea spam")  # type: ignore[arg-type]
+    assert server.sent == ["You cannot nuke Bea.\n"]
     assert load_saved(player_path(tmp_path, "Bea")) is not None
     assert load_saved(player_path(tmp_path, "Cyd")) is not None
-    assert host.staff_lines == []
+    assert server.staff_lines == []
 
 
 def test_the_config_admin_can_nuke_another_admin(tmp_path: Path) -> None:
-    """The account named in the config may nuke another admin."""
-    _save(tmp_path, "Bea", RANK_ADMIN)
-    host = _login_host(tmp_path)
-    boss = _staff("admin", RANK_SUPER_ADMIN)
-    host.people = [boss]
-    process_commands(host, boss, "nuke Bea spam")  # type: ignore[arg-type]
+    """The super admin may nuke another admin."""
+    save(tmp_path, "Bea", Rank.ADMIN)
+    server = login_host(tmp_path)
+    boss = staff("admin", Rank.SUPER_ADMIN)
+    server.people = [boss]
+    process_commands(server, boss, "nuke Bea spam")  # type: ignore[arg-type]
     assert load_saved(player_path(tmp_path, "Bea")) is None
-    assert host.staff_lines == [paint_staff(boss, "< SU > admin nukes Bea: spam\n")]
+    assert server.staff_lines == [paint_staff(boss, "< SU > admin nukes Bea: spam\n")]
 
 
 def test_a_promoted_admin_cannot_disconnect_another_admin(tmp_path: Path) -> None:
     """Same rank is refused when the caller is not the config admin."""
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_ADMIN)
-    boss = _staff("Boss", RANK_ADMIN)
-    host.people = [bea, boss]
-    process_commands(host, boss, "disconnect Bea spam")  # type: ignore[arg-type]
-    assert host.sent == ["You cannot disconnect Bea.\n"]
-    assert host.dropped_clients == []
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.ADMIN)
+    boss = staff("Boss", Rank.ADMIN)
+    server.people = [bea, boss]
+    process_commands(server, boss, "disconnect Bea spam")  # type: ignore[arg-type]
+    assert server.sent == ["You cannot disconnect Bea.\n"]
+    assert server.dropped_clients == []
 
 
 def test_the_config_admin_can_disconnect_another_admin(tmp_path: Path) -> None:
-    """The account named in the config may disconnect another admin."""
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_ADMIN)
-    boss = _staff("admin", RANK_SUPER_ADMIN)
-    host.people = [bea, boss]
-    process_commands(host, boss, "disconnect Bea spam")  # type: ignore[arg-type]
-    assert host.sent == ["You have been disconnected.\n"]
-    assert host.dropped_clients == [bea]
+    """The super admin may disconnect another admin."""
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.ADMIN)
+    boss = staff("admin", Rank.SUPER_ADMIN)
+    server.people = [bea, boss]
+    process_commands(server, boss, "disconnect Bea spam")  # type: ignore[arg-type]
+    assert server.sent == ["You have been disconnected.\n"]
+    assert server.dropped_clients == [bea]
 
 
 def test_disconnect_of_a_login_name_is_not_found(tmp_path: Path) -> None:
     """A name that is only at a password prompt is not a target."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    waiting = _Player(name=None, room=None, player=None)
-    process_input(host, waiting, "Bea")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    waiting = FakePlayer(name=None, room=None, player=None)
+    process_input(server, waiting, "Bea")  # type: ignore[arg-type]
     assert waiting.auth == "password"
-    host.people = [waiting]
-    host.sent.clear()
-    process_commands(host, _staff("Ada", RANK_SUPER), "disconnect Bea spam")  # type: ignore[arg-type]
-    assert host.sent == ["Player Bea not found.\n"]
-    assert host.dropped_clients == []
+    server.people = [waiting]
+    server.sent.clear()
+    process_commands(server, staff("Ada", Rank.SUPER_USER), "disconnect Bea spam")  # type: ignore[arg-type]
+    assert server.sent == ["No such player 'Bea'.\n"]
+    assert server.dropped_clients == []
 
 
 def test_disconnect_finds_a_name_with_a_space(tmp_path: Path) -> None:
-    """The longest in-room name is the player, and the rest is the reason."""
-    bea = _Player(player=Player("BeaSmith", "hall", datetime.now(timezone.utc), rank=RANK_NEWBIE))
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_ADMIN)
-    host.people = [bea, ada]
-    process_commands(
-        host,  # type: ignore[arg-type]
-        ada,  # type: ignore[arg-type]
-        "disconnect BeaSmith being rude",
-    )
-    assert host.sent == ["You have been disconnected.\n"]
-    assert host.staff_lines == [paint_staff(ada, "< SU > Ada disconnects BeaSmith: being rude\n")]
-    assert host.dropped_clients == [bea]
+    """The first word is the name, and the rest is the reason."""
+    bea = FakePlayer(player=Player("BeaSmith", "hall", datetime.now(timezone.utc), rank=Rank.NEWBIE))
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.ADMIN)
+    server.people = [bea, ada]
+    process_commands(server, ada, "disconnect BeaSmith being rude")  # type: ignore[arg-type]
+    assert server.sent == ["You have been disconnected.\n"]
+    assert server.staff_lines == [paint_staff(ada, "< SU > Ada disconnects BeaSmith: being rude\n")]
+    assert server.dropped_clients == [bea]
 
 
 def test_a_resident_cannot_disconnect(tmp_path: Path) -> None:
     """The command does not exist below super user."""
-    host = _login_host(tmp_path)
-    process_commands(host, _staff("Bea", RANK_RESIDENT), "disconnect Ada spam")  # type: ignore[arg-type]
-    assert host.sent == ["No such command 'disconnect'\n"]
-    assert "disconnect" not in command_words(RANK_RESIDENT).split()
-    assert "disconnect" not in command_words(RANK_NEWBIE).split()
-    assert "disconnect" in command_words(RANK_SUPER).split()
-    assert "disconnect" in command_words(RANK_ADMIN).split()
+    server = login_host(tmp_path)
+    process_commands(server, staff("Bea", Rank.RESIDENT), "disconnect Ada spam")  # type: ignore[arg-type]
+    assert server.sent == ["No such command 'disconnect'\n"]
+    assert "disconnect" not in command_words(Rank.RESIDENT).split()
+    assert "disconnect" not in command_words(Rank.NEWBIE).split()
+    assert "disconnect" in command_words(Rank.SUPER_USER).split()
+    assert "disconnect" in command_words(Rank.ADMIN).split()
 
 
 def test_a_promoted_admin_cannot_nuke_another_admin(tmp_path: Path) -> None:
     """Same rank is refused, and the super admin can nuke a promoted admin."""
-    _save(tmp_path, "Bea", RANK_ADMIN)
-    host = _login_host(tmp_path)
-    boss = _staff("Boss", RANK_ADMIN)
-    host.people = [boss]
-    process_commands(host, boss, "nuke Bea spam")  # type: ignore[arg-type]
-    assert host.sent == ["You cannot nuke Bea.\n"]
+    save(tmp_path, "Bea", Rank.ADMIN)
+    server = login_host(tmp_path)
+    boss = staff("Boss", Rank.ADMIN)
+    server.people = [boss]
+    process_commands(server, boss, "nuke Bea spam")  # type: ignore[arg-type]
+    assert server.sent == ["You cannot nuke Bea.\n"]
     assert load_saved(player_path(tmp_path, "Bea")) is not None
-    host.sent.clear()
-    chief = _staff("admin", RANK_SUPER_ADMIN)
-    host.people.append(chief)
-    process_commands(host, chief, "nuke Bea spam")  # type: ignore[arg-type]
+    server.sent.clear()
+    chief = staff("admin", Rank.SUPER_ADMIN)
+    server.people.append(chief)
+    process_commands(server, chief, "nuke Bea spam")  # type: ignore[arg-type]
     assert load_saved(player_path(tmp_path, "Bea")) is None
 
 
 def test_nuke_refusals(tmp_path: Path) -> None:
     """Unknown names and the admin are refused, and the admin file stays."""
-    _save(tmp_path, "admin", RANK_SUPER_ADMIN)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", "super")
-    process_commands(host, ada, "nuke Bea spam")  # type: ignore[arg-type]
-    process_commands(host, ada, "nuke admin spam")  # type: ignore[arg-type]
-    process_commands(host, ada, "nuke ADMIN spam")  # type: ignore[arg-type]
-    assert host.sent == [
+    save(tmp_path, "admin", Rank.SUPER_ADMIN)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    process_commands(server, ada, "nuke Bea spam")  # type: ignore[arg-type]
+    process_commands(server, ada, "nuke admin spam")  # type: ignore[arg-type]
+    process_commands(server, ada, "nuke ADMIN spam")  # type: ignore[arg-type]
+    assert server.sent == [
         "Player Bea not found.\n",
         "You cannot nuke admin.\n",
         "You cannot nuke admin.\n",
     ]
     assert load_saved(player_path(tmp_path, "admin")) is not None
-    assert host.staff_lines == []
-    process_commands(host, ada, "nuke Bea")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Syntax: nuke <name> <reason>\n"
+    assert server.staff_lines == []
+    process_commands(server, ada, "nuke Bea")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Syntax: nuke <name> <reason>\n"
 
 
 def test_promote_refuses_a_logged_off_player(tmp_path: Path) -> None:
     """Promote runs only when that player is in a room."""
-    _save(tmp_path, "Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_ADMIN)
-    host.people = [ada]
-    process_commands(host, ada, "promote Bea")  # type: ignore[arg-type]
-    assert host.sent == ["Bea is not connected.\n"]
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    save(tmp_path, "Cyd", Rank.ADMIN)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.ADMIN)
+    server.people = [ada]
+    process_commands(server, ada, "promote Bea")  # type: ignore[arg-type]
+    assert server.sent == ["No such player 'Bea'.\n"]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
-    assert saved.rank == "resident"
+    assert saved.rank is Rank.RESIDENT
+    server.sent.clear()
+    process_commands(server, ada, "promote Cyd")  # type: ignore[arg-type]
+    assert server.sent == ["No such player 'Cyd'.\n"]
+    saved = load_saved(player_path(tmp_path, "Cyd"))
+    assert saved is not None
+    assert saved.rank is Rank.ADMIN
+
+
+def test_promote_refuses_a_resident_with_no_file(tmp_path: Path) -> None:
+    """A resident in the room still needs a file before the rank can be written."""
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    ada = staff("Ada", Rank.ADMIN)
+    server.people = [bea, ada]
+    process_commands(server, ada, "promote Bea")  # type: ignore[arg-type]
+    assert server.sent == ["No saved player 'Bea'.\n"]
+    assert bea.player is not None
+    assert bea.player.rank is Rank.RESIDENT
 
 
 def test_promote_refuses_a_connected_player_with_no_mfa(tmp_path: Path) -> None:
     """A resident in the room still needs a secret when MFA is on."""
-    _save(tmp_path, "Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    host._mfa_enabled = True
-    bea = _staff("Bea", RANK_RESIDENT)
-    ada = _staff("Ada", RANK_ADMIN)
-    host.people = [bea, ada]
-    process_commands(host, ada, "promote Bea")  # type: ignore[arg-type]
-    assert host.sent == ["Bea must turn on MFA first.\n"]
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    server.mfa_enabled = True
+    bea = staff("Bea", Rank.RESIDENT)
+    ada = staff("Ada", Rank.ADMIN)
+    server.people = [bea, ada]
+    process_commands(server, ada, "promote Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Bea must turn on MFA first.\n"]
 
 
-def test_demote_a_logged_off_super_user_still_writes_resident(tmp_path: Path) -> None:
+def test_demote_a_logged_off_super_user_writes_su_channel(tmp_path: Path) -> None:
     """Demote still rewrites the file when the target is not in a room."""
-    _save(tmp_path, "Bea", RANK_SUPER)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_ADMIN)
-    host.people = [ada]
-    process_commands(host, ada, "demote Bea")  # type: ignore[arg-type]
+    save(tmp_path, "Bea", Rank.SUPER_USER)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.ADMIN)
+    server.people = [ada]
+    process_commands(server, ada, "demote Bea")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
-    assert saved.rank == "resident"
+    assert saved.rank is Rank.SU_CHANNEL
 
 
-def test_promote_makes_a_resident_a_super_user(tmp_path: Path) -> None:
-    """Promote rewrites the file and raises the live rank."""
-    _save(tmp_path, "Bea", RANK_RESIDENT)
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_ADMIN)
-    host.people = [bea, ada]
-    process_commands(host, ada, "promote Bea")  # type: ignore[arg-type]
+def test_promote_makes_a_resident_an_su_channel(tmp_path: Path) -> None:
+    """Promote rewrites the file and raises the live rank one step."""
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    bea = staff("Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.ADMIN)
+    server.people = [bea, ada]
+    process_commands(server, ada, "promote Bea")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
-    assert saved.rank == "super"
+    assert saved.rank is Rank.SU_CHANNEL
     assert bea.player is not None
-    assert bea.player.rank == "super"
-    promoted = "< SU > Ada promotes Bea to Super User.\n"
-    assert host.staff_lines == [paint_staff(ada, promoted), paint_staff(bea, promoted)]
+    assert bea.player.rank is Rank.SU_CHANNEL
+    promoted = "< SU > Ada promotes Bea to SU Channel.\n"
+    assert server.staff_lines == [paint_staff(bea, promoted), paint_staff(ada, promoted)]
+
+
+def test_a_coder_can_promote_a_super_user_to_admin(tmp_path: Path) -> None:
+    """A coder lifts a super user to admin on the staff channel only."""
+    save(tmp_path, "Bea", Rank.SUPER_USER)
+    bea = staff("Bea", Rank.SUPER_USER)
+    ada = staff("Ada", Rank.CODER)
+    server = login_host(tmp_path)
+    server.people = [bea, ada]
+    process_commands(server, ada, "promote Bea")  # type: ignore[arg-type]
+    assert load_saved(player_path(tmp_path, "Bea")).rank is Rank.ADMIN
+    line = "< SU > Ada promotes Bea to Admin.\n"
+    assert server.staff_lines == [paint_staff(bea, line), paint_staff(ada, line)]
+    assert server.admin_lines == []
+
+
+def test_a_coder_cannot_promote_an_admin_to_coder(tmp_path: Path) -> None:
+    """Only the super admin can put someone on Coder."""
+    save(tmp_path, "Bea", Rank.ADMIN)
+    bea = staff("Bea", Rank.ADMIN)
+    ada = staff("Ada", Rank.CODER)
+    boss = staff("Dee", Rank.SUPER_ADMIN)
+    assert bea.player is not None
+    assert ada.player is not None
+    assert boss.player is not None
+    bea.player.colour = False
+    ada.player.colour = False
+    boss.player.colour = False
+    server = login_host(tmp_path)
+    server.people = [bea, ada, boss]
+    process_commands(server, ada, "promote Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Only the super admin can promote Bea to Coder.\n"]
+    assert load_saved(player_path(tmp_path, "Bea")).rank is Rank.ADMIN
+    server.sent.clear()
+    process_commands(server, boss, "promote Bea")  # type: ignore[arg-type]
+    assert load_saved(player_path(tmp_path, "Bea")).rank is Rank.CODER
+    assert server.admin_lines == []
+    assert any(line.endswith("promotes Bea to Coder.\n") for line in server.staff_lines)
+
+
+def test_a_coder_cannot_demote_a_coder(tmp_path: Path) -> None:
+    """A coder who demotes a coder is told only the super admin can."""
+    save(tmp_path, "Bea", Rank.CODER)
+    bea = staff("Bea", Rank.CODER)
+    ada = staff("Ada", Rank.CODER)
+    server = login_host(tmp_path)
+    server.people = [bea, ada]
+    process_commands(server, ada, "demote Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Only the super admin can demote Bea from Coder.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "demote Bea force")  # type: ignore[arg-type]
+    assert server.sent == ["Only the super admin can demote Bea from Coder.\n"]
+    assert load_saved(player_path(tmp_path, "Bea")).rank is Rank.CODER
+
+
+def test_a_coder_can_force_an_admin_to_resident(tmp_path: Path) -> None:
+    """A coder can force an admin down to resident on the staff channel only."""
+    save(tmp_path, "Bea", Rank.ADMIN)
+    bea = staff("Bea", Rank.ADMIN)
+    ada = staff("Ada", Rank.CODER)
+    assert ada.player is not None
+    ada.player.colour = False
+    server = login_host(tmp_path)
+    server.people = [bea, ada]
+    process_commands(server, ada, "demote Bea force")  # type: ignore[arg-type]
+    assert load_saved(player_path(tmp_path, "Bea")).rank is Rank.RESIDENT
+    assert server.admin_lines == []
+    assert any(line.endswith("demotes Bea from Admin.\n") for line in server.staff_lines)
+
+
+def test_an_off_duty_coder_misses_the_promote_line(tmp_path: Path) -> None:
+    """The staff announcement skips a coder who is off duty."""
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    bea = staff("Bea", Rank.RESIDENT)
+    ada = staff("Ada", Rank.CODER)
+    boss = staff("Dee", Rank.SUPER_ADMIN)
+    assert ada.player is not None
+    ada.player.off_duty = True
+    server = login_host(tmp_path)
+    server.people = [bea, ada, boss]
+    process_commands(server, boss, "promote Bea")  # type: ignore[arg-type]
+    assert not any("promotes" in line for line in ada.sent)
+    assert any("promotes Bea to SU Channel." in line for line in boss.sent)
+
+
+def test_an_admin_cannot_warn_a_coder(tmp_path: Path) -> None:
+    """Warn uses may_remove, so an admin cannot warn a coder."""
+    bea = staff("Bea", Rank.CODER)
+    ada = staff("Ada", Rank.ADMIN)
+    server = login_host(tmp_path)
+    server.people = [bea, ada]
+    process_commands(server, ada, "warn Bea stop")  # type: ignore[arg-type]
+    assert server.sent == ["You cannot warn Bea.\n"]
+    assert bea.sent == []
+
+
+def test_a_coder_can_warn_an_admin(tmp_path: Path) -> None:
+    """A coder outranks an admin, so the warning is delivered."""
+    bea = staff("Bea", Rank.ADMIN)
+    ada = staff("Ada", Rank.CODER)
+    server = login_host(tmp_path)
+    server.people = [bea, ada]
+    process_commands(server, ada, "warn Bea stop")  # type: ignore[arg-type]
+    assert any("warn you: stop" in line for line in bea.sent)
 
 
 def test_promote_makes_a_super_user_an_admin(tmp_path: Path) -> None:
-    """The config admin lifts a super user to admin on the admin channel only."""
-    from lupaxa.chat_server.channel import paint_admin
-
-    _save(tmp_path, "Bea", RANK_SUPER)
-    bea = _staff("Bea", RANK_SUPER)
-    sue = _staff("Sue", RANK_SUPER)
-    boss = _staff("admin", RANK_SUPER_ADMIN)
-    host = _login_host(tmp_path)
-    host.people = [bea, sue, boss]
-    process_commands(host, boss, "promote Bea")  # type: ignore[arg-type]
+    """The config admin lifts a super user to admin on the staff channel."""
+    save(tmp_path, "Bea", Rank.SUPER_USER)
+    bea = staff("Bea", Rank.SUPER_USER)
+    sue = staff("Sue", Rank.SUPER_USER)
+    boss = staff("admin", Rank.SUPER_ADMIN)
+    server = login_host(tmp_path)
+    server.people = [bea, sue, boss]
+    process_commands(server, boss, "promote Bea")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
-    assert saved.rank == "admin"
+    assert saved.rank is Rank.ADMIN
     assert bea.player is not None
-    assert bea.player.rank == "admin"
-    line = "[ Admin ] admin promotes Bea to Admin.\n"
-    assert host.admin_lines == [paint_admin(boss, line), paint_admin(bea, line)]
-    assert host.staff_lines == []
+    assert bea.player.rank is Rank.ADMIN
+    line = "< SU > admin promotes Bea to Admin.\n"
+    assert server.staff_lines == [paint_staff(bea, line), paint_staff(sue, line), paint_staff(boss, line)]
+    assert server.admin_lines == []
 
 
 def test_a_promoted_admin_cannot_promote_to_admin(tmp_path: Path) -> None:
-    """A promoted admin may not raise a super user to admin."""
-    _save(tmp_path, "Bea", RANK_SUPER)
-    bea = _staff("Bea", RANK_SUPER)
-    ada = _staff("Ada", RANK_ADMIN)
-    host = _login_host(tmp_path)
-    host.people = [bea, ada]
-    process_commands(host, ada, "promote Bea")  # type: ignore[arg-type]
+    """A promoted admin is told only a coder or the super admin can raise someone to admin."""
+    save(tmp_path, "Bea", Rank.SUPER_USER)
+    bea = staff("Bea", Rank.SUPER_USER)
+    ada = staff("Ada", Rank.ADMIN)
+    server = login_host(tmp_path)
+    server.people = [bea, ada]
+    process_commands(server, ada, "promote Bea")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
-    assert saved.rank == "super"
+    assert saved.rank is Rank.SUPER_USER
     assert bea.player is not None
-    assert bea.player.rank == "super"
-    assert host.sent == ["Only the admin can promote Bea to Admin.\n"]
-    assert host.admin_lines == []
-    assert host.staff_lines == []
+    assert bea.player.rank is Rank.SUPER_USER
+    assert server.sent == ["Only a coder or the super admin can promote Bea to Admin.\n"]
+    assert server.admin_lines == []
+    assert server.staff_lines == []
 
 
 def test_promote_refusals(tmp_path: Path) -> None:
     """Promote needs the admin and a saved resident."""
-    _save(tmp_path, "Cyd", RANK_ADMIN)
-    _save(tmp_path, "admin", RANK_ADMIN)
-    host = _login_host(tmp_path)
-    host.people = [_newbie("Dee")]
-    boss = _staff("Ada", RANK_ADMIN)
-    for line, reply in (
-        ("promote Zed", "Player Zed not found.\n"),
-        ("promote Dee", "Dee is not a resident.\n"),
-        ("promote Cyd", "Cyd is already an admin.\n"),
-        ("promote admin", "admin is the super admin.\n"),
-    ):
-        host.sent.clear()
-        process_commands(host, boss, line)  # type: ignore[arg-type]
-        assert host.sent == [reply]
-    assert host.staff_lines == []
-    host = _login_host(tmp_path)
-    process_commands(host, _staff("Sam", RANK_SUPER), "promote Cyd")  # type: ignore[arg-type]
-    assert host.sent == ["No such command 'promote'\n"]
+    save(tmp_path, "Cyd", Rank.ADMIN)
+    save(tmp_path, "admin", Rank.ADMIN)
+    server = login_host(tmp_path)
+    server.people = [newbie("Dee"), staff("Cyd", Rank.ADMIN), staff("admin", Rank.SUPER_ADMIN)]
+    boss = staff("Ada", Rank.ADMIN)
+    for line, reply in (("promote Zed", "No such player 'Zed'.\n"), ("promote Dee", "Dee is not a resident.\n"), ("promote Cyd", "Only the super admin can promote Cyd to Coder.\n"), ("promote admin", "admin is the super admin.\n")):  # fmt: skip  # noqa: E501
+        server.sent.clear()
+        process_commands(server, boss, line)  # type: ignore[arg-type]
+        assert server.sent == [reply]
+    assert server.staff_lines == []
+    server = login_host(tmp_path)
+    process_commands(server, staff("Sam", Rank.SUPER_USER), "promote Cyd")  # type: ignore[arg-type]
+    assert server.sent == ["No such command 'promote'\n"]
 
 
-def test_demote_makes_a_super_user_a_resident(tmp_path: Path) -> None:
+def test_demote_makes_a_super_user_an_su_channel(tmp_path: Path) -> None:
     """Demote rewrites the file and lowers the live rank."""
-    _save(tmp_path, "Bea", RANK_SUPER)
-    bea = _staff("Bea", RANK_SUPER)
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_ADMIN)
-    host.people = [bea, ada]
-    process_commands(host, ada, "demote Bea")  # type: ignore[arg-type]
+    save(tmp_path, "Bea", Rank.SUPER_USER)
+    bea = staff("Bea", Rank.SUPER_USER)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.ADMIN)
+    server.people = [bea, ada]
+    process_commands(server, ada, "demote Bea")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
-    assert saved.rank == "resident"
+    assert saved.rank is Rank.SU_CHANNEL
     assert bea.player is not None
-    assert bea.player.rank == "resident"
+    assert bea.player.rank is Rank.SU_CHANNEL
     demoted = "< SU > Ada demotes Bea from Super User.\n"
-    assert host.staff_lines == [paint_staff(ada, demoted)]
+    assert server.staff_lines == [paint_staff(bea, demoted), paint_staff(ada, demoted)]
 
 
 def test_demote_makes_an_admin_a_super_user(tmp_path: Path) -> None:
-    """The config admin drops an admin to super user on the admin channel only."""
-    _save(tmp_path, "Bea", RANK_ADMIN)
-    bea = _staff("Bea", RANK_ADMIN)
-    sue = _staff("Sue", RANK_SUPER)
-    boss = _staff("admin", RANK_SUPER_ADMIN)
-    host = _login_host(tmp_path)
-    host.people = [bea, sue, boss]
-    process_commands(host, boss, "demote Bea")  # type: ignore[arg-type]
+    """The config admin drops an admin to super user on the staff channel."""
+    save(tmp_path, "Bea", Rank.ADMIN)
+    bea = staff("Bea", Rank.ADMIN)
+    sue = staff("Sue", Rank.SUPER_USER)
+    boss = staff("admin", Rank.SUPER_ADMIN)
+    server = login_host(tmp_path)
+    server.people = [bea, sue, boss]
+    process_commands(server, boss, "demote Bea")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
-    assert saved.rank == "super"
+    assert saved.rank is Rank.SUPER_USER
     assert bea.player is not None
-    assert bea.player.rank == "super"
-    line = "[ Admin ] admin demotes Bea from Admin.\n"
-    assert host.admin_lines == [paint_admin(boss, line)]
-    assert host.staff_lines == []
+    assert bea.player.rank is Rank.SUPER_USER
+    line = "< SU > admin demotes Bea from Admin.\n"
+    assert server.staff_lines == [paint_staff(bea, line), paint_staff(sue, line), paint_staff(boss, line)]
+    assert server.admin_lines == []
 
 
 def test_a_promoted_admin_cannot_demote_an_admin(tmp_path: Path) -> None:
-    """A promoted admin may not move an admin down, with or without force."""
-    _save(tmp_path, "Bea", RANK_ADMIN)
-    bea = _staff("Bea", RANK_ADMIN)
-    ada = _staff("Ada", RANK_ADMIN)
-    host = _login_host(tmp_path)
-    host.people = [bea, ada]
-    process_commands(host, ada, "demote Bea")  # type: ignore[arg-type]
-    assert host.sent == ["Only the admin can demote Bea from Admin.\n"]
-    host.sent.clear()
-    process_commands(host, ada, "demote Bea force")  # type: ignore[arg-type]
-    assert host.sent == ["Only the admin can demote Bea from Admin.\n"]
+    """A promoted admin is told only a coder or the super admin can demote an admin."""
+    save(tmp_path, "Bea", Rank.ADMIN)
+    bea = staff("Bea", Rank.ADMIN)
+    ada = staff("Ada", Rank.ADMIN)
+    server = login_host(tmp_path)
+    server.people = [bea, ada]
+    process_commands(server, ada, "demote Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Only a coder or the super admin can demote Bea from Admin.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "demote Bea force")  # type: ignore[arg-type]
+    assert server.sent == ["Only a coder or the super admin can demote Bea from Admin.\n"]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
-    assert saved.rank == "admin"
+    assert saved.rank is Rank.ADMIN
     assert bea.player is not None
-    assert bea.player.rank == "admin"
-    assert host.admin_lines == []
-    assert host.staff_lines == []
+    assert bea.player.rank is Rank.ADMIN
+    assert server.admin_lines == []
+    assert server.staff_lines == []
 
 
-def test_demote_force_from_admin_tells_both_channels(tmp_path: Path) -> None:
-    """Force from admin lands on resident and is heard by staff and admins."""
-    _save(tmp_path, "Bea", RANK_ADMIN)
-    bea = _staff("Bea", RANK_ADMIN)
-    sue = _staff("Sue", RANK_SUPER)
-    boss = _staff("admin", RANK_SUPER_ADMIN)
-    host = _login_host(tmp_path)
-    host.people = [bea, sue, boss]
-    process_commands(host, boss, "demote Bea FORCE")  # type: ignore[arg-type]
+def test_demote_force_from_admin_stays_on_staff(tmp_path: Path) -> None:
+    """Force from admin lands on resident and the line is staff only."""
+    save(tmp_path, "Bea", Rank.ADMIN)
+    bea = staff("Bea", Rank.ADMIN)
+    sue = staff("Sue", Rank.SUPER_USER)
+    boss = staff("admin", Rank.SUPER_ADMIN)
+    server = login_host(tmp_path)
+    server.people = [bea, sue, boss]
+    process_commands(server, boss, "demote Bea FORCE")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
-    assert saved.rank == "resident"
+    assert saved.rank is Rank.RESIDENT
     assert bea.player is not None
-    assert bea.player.rank == "resident"
-    staff = "< SU > admin demotes Bea from Admin.\n"
-    admin = "[ Admin ] admin demotes Bea from Admin.\n"
-    assert host.staff_lines == [paint_staff(sue, staff), paint_staff(boss, staff)]
-    assert host.admin_lines == [paint_admin(boss, admin)]
+    assert bea.player.rank is Rank.RESIDENT
+    line = "< SU > admin demotes Bea from Admin.\n"
+    assert server.staff_lines == [paint_staff(sue, line), paint_staff(boss, line)]
+    assert server.admin_lines == []
 
 
 def test_demote_force_from_super_user_stays_on_staff(tmp_path: Path) -> None:
     """Force from super user is the normal super-user demote."""
-    _save(tmp_path, "Bea", RANK_SUPER)
-    bea = _staff("Bea", RANK_SUPER)
-    ada = _staff("Ada", RANK_ADMIN)
-    host = _login_host(tmp_path)
-    host.people = [bea, ada]
-    process_commands(host, ada, "demote Bea force")  # type: ignore[arg-type]
+    save(tmp_path, "Bea", Rank.SUPER_USER)
+    bea = staff("Bea", Rank.SUPER_USER)
+    ada = staff("Ada", Rank.ADMIN)
+    server = login_host(tmp_path)
+    server.people = [bea, ada]
+    process_commands(server, ada, "demote Bea force")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
-    assert saved.rank == "resident"
-    assert bea.player.rank == "resident"
+    assert saved.rank is Rank.RESIDENT
+    assert bea.player.rank is Rank.RESIDENT
     line = "< SU > Ada demotes Bea from Super User.\n"
-    assert host.staff_lines == [paint_staff(ada, line)]
-    assert host.admin_lines == []
+    assert server.staff_lines == [paint_staff(ada, line)]
+    assert server.admin_lines == []
+
+
+def test_promote_walks_each_saved_step(tmp_path: Path) -> None:
+    """Each promote writes the next file word on the staff channel. A coder does not go up."""
+    save(tmp_path, "Bea", Rank.SU_CHANNEL)
+    bea = staff("Bea", Rank.SU_CHANNEL)
+    boss = staff("Ada", Rank.SUPER_ADMIN)
+    assert boss.player is not None
+    boss.player.colour = False
+    server = login_host(tmp_path)
+    server.people = [bea, boss]
+    process_commands(server, boss, "promote Bea")  # type: ignore[arg-type]
+    assert load_saved(player_path(tmp_path, "Bea")).rank is Rank.SUPER_USER
+    save(tmp_path, "Bea", Rank.ADMIN)
+    bea.player.rank = Rank.ADMIN
+    server.sent.clear()
+    server.admin_lines.clear()
+    server.staff_lines.clear()
+    process_commands(server, boss, "promote Bea")  # type: ignore[arg-type]
+    assert load_saved(player_path(tmp_path, "Bea")).rank is Rank.CODER
+    assert server.staff_lines[-1].endswith("promotes Bea to Coder.\n")
+    assert server.admin_lines == []
+    bea.player.rank = Rank.CODER
+    server.sent.clear()
+    process_commands(server, boss, "promote Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Bea is already a coder.\n"]
+
+
+def test_force_from_coder_stays_on_staff(tmp_path: Path) -> None:
+    """Force from coder lands on resident and the line is staff only."""
+    save(tmp_path, "Bea", Rank.CODER)
+    bea = staff("Bea", Rank.CODER)
+    sue = staff("Sue", Rank.SUPER_USER)
+    boss = staff("admin", Rank.SUPER_ADMIN)
+    assert sue.player is not None
+    assert boss.player is not None
+    sue.player.colour = False
+    boss.player.colour = False
+    server = login_host(tmp_path)
+    server.people = [bea, sue, boss]
+    process_commands(server, boss, "demote Bea force")  # type: ignore[arg-type]
+    assert load_saved(player_path(tmp_path, "Bea")).rank is Rank.RESIDENT
+    assert any(line.endswith("demotes Bea from Coder.\n") for line in server.staff_lines)
+    assert server.admin_lines == []
+
+
+def test_promote_clears_an_unknown_rank_word(tmp_path: Path) -> None:
+    """An explicit promote writes the new word and skips the login notice."""
+    path = player_path(tmp_path, "Bea")
+    path.write_text("name: Bea\nlowercase_name: bea\nrank: super\npassword: x\n", encoding="utf-8")
+    bea = staff("Bea", Rank.RESIDENT)
+    ada = staff("Ada", Rank.ADMIN)
+    server = login_host(tmp_path)
+    server.people = [bea, ada]
+    process_commands(server, ada, "promote Bea")  # type: ignore[arg-type]
+    loaded = load_saved(path)
+    assert loaded is not None
+    assert loaded.rank is Rank.SU_CHANNEL
+    assert loaded.unknown_rank is None
+    assert "rank: su_channel\n" in path.read_text(encoding="utf-8")
+
+
+def test_pstats_counts_live_newbies_and_saved_ranks(tmp_path: Path) -> None:
+    """Newbies are logged in. Each saved player is one rank. Roles count holders."""
+    password = hash_password("pw", rounds=4)
+    site = int(Roles.SITE_ADMIN)
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, password))
+    save_player(tmp_path, SavedPlayer("Cam", Rank.RESIDENT, password, roles=site))
+    save_player(tmp_path, SavedPlayer("Dee", Rank.SU_CHANNEL, password))
+    save_player(tmp_path, SavedPlayer("Eve", Rank.SUPER_USER, password))
+    save_player(tmp_path, SavedPlayer("Fay", Rank.ADMIN, password, roles=site))
+    save_player(tmp_path, SavedPlayer("Gus", Rank.CODER, password))
+    save_player(tmp_path, SavedPlayer("Hal", Rank.SUPER_ADMIN, password))
+    ada = staff("Ada", Rank.ADMIN)
+    bea = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.NEWBIE))
+    hal = staff("Hal", Rank.SUPER_ADMIN)
+    waiting = FakePlayer(player=None)
+    server = FakeServer(people=[ada, bea, hal, waiting], roster_dir=tmp_path)
+    process_commands(server, ada, "pstats")  # type: ignore[arg-type]
+    expected = """\
++---------------------------------------+
+| Newbies     : 1   Total Residents : 7 |
+|---------------------------------------|
+| Residents   : 2   Channel Only    : 1 |
+| Super Users : 1   Admins          : 1 |
+| Coders      : 1   Super Admin     : 1 |
+|---------------------------------------|
+| Site Admin  : 2                       |
++---------------------------------------+
+"""
+    assert server.sent == [expected]
+    assert len({len(line) for line in expected.splitlines()}) == 1
+    server.sent.clear()
+    process_commands(server, ada, "pstats please")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: pstats\n"]
+    resident = staff("Ida", Rank.RESIDENT)
+    server.people.append(resident)
+    server.sent.clear()
+    process_commands(server, resident, "pstats")  # type: ignore[arg-type]
+    assert server.sent == ["No such command 'pstats'\n"]
+    assert ada.player is not None
+    ada.player.off_duty = True
+    server.sent.clear()
+    process_commands(server, ada, "pstats")  # type: ignore[arg-type]
+    assert server.sent == ["You are off duty.\n"]
+
+
+def test_pstats_widens_for_a_larger_count_and_shows_zero(tmp_path: Path) -> None:
+    """A wider count grows the box. An empty rank is shown as zero."""
+    password = hash_password("pw", rounds=4)
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, password))
+    ada = staff("Ada", Rank.ADMIN)
+    server = FakeServer(people=[ada], roster_dir=tmp_path)
+    process_commands(server, ada, "pstats")  # type: ignore[arg-type]
+    short = server.sent[0]
+    assert "Channel Only" in short
+    assert ": 0" in short
+    assert "Site Admin" in short
+    for number in range(9):
+        save_player(tmp_path, SavedPlayer(f"R{number:02d}", Rank.RESIDENT, password))
+    server.sent.clear()
+    process_commands(server, ada, "pstats")  # type: ignore[arg-type]
+    long = server.sent[0]
+    assert len(long.splitlines()[0]) > len(short.splitlines()[0])
+    assert len({len(line) for line in long.splitlines()}) == 1
+    assert "Residents   : 10" in long
+
+
+def test_an_admin_cannot_force_a_coder(tmp_path: Path) -> None:
+    """Only the super admin may force a coder down to resident."""
+    save(tmp_path, "Bea", Rank.CODER)
+    bea = staff("Bea", Rank.CODER)
+    ada = staff("Ada", Rank.ADMIN)
+    server = login_host(tmp_path)
+    server.people = [bea, ada]
+    process_commands(server, ada, "demote Bea force")  # type: ignore[arg-type]
+    assert server.sent == ["Only the super admin can demote Bea from Coder.\n"]
+    assert load_saved(player_path(tmp_path, "Bea")).rank is Rank.CODER
 
 
 def test_demote_refusals(tmp_path: Path) -> None:
-    """Demote refuses missing names, residents, newbies, the config admin, and bad force syntax."""
-    _save(tmp_path, "Cyd", RANK_RESIDENT)
-    _save(tmp_path, "admin", RANK_ADMIN)
-    host = _login_host(tmp_path)
-    boss = _staff("Ada", RANK_ADMIN)
-    host.people = [_newbie("Dee")]
-    for line, reply in (
-        ("demote Zed", "Player Zed not found.\n"),
-        ("demote Cyd", "Cyd is a resident.\n"),
-        ("demote Dee", "Dee cannot be demoted.\n"),
-        ("demote admin", "The super admin cannot be demoted.\n"),
-        ("demote admin force", "The super admin cannot be demoted.\n"),
-        ("demote force Bea", "Syntax: demote <name>|demote <name> force\n"),
-        ("demote Bea force extra", "Syntax: demote <name>|demote <name> force\n"),
-    ):
-        host.sent.clear()
-        process_commands(host, boss, line)  # type: ignore[arg-type]
-        assert host.sent == [reply]
-    assert host.staff_lines == []
+    """Demote refuses missing names, residents, newbies, the super admin, and bad force syntax."""
+    save(tmp_path, "Cyd", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    boss = staff("Ada", Rank.ADMIN)
+    server.people = [newbie("Dee")]
+    for line, reply in (("demote Zed", "Player Zed not found.\n"), ("demote Cyd", "Cyd is a resident.\n"), ("demote Dee", "Dee cannot be demoted.\n"), ("demote admin", "The super admin cannot be demoted.\n"), ("demote admin force", "The super admin cannot be demoted.\n"), ("demote force Bea", "Syntax: demote <name> [force]\n"), ("demote Bea force extra", "Syntax: demote <name> [force]\n")):  # fmt: skip  # noqa: E501
+        server.sent.clear()
+        process_commands(server, boss, line)  # type: ignore[arg-type]
+        assert server.sent == [reply]
+    assert server.staff_lines == []
     loaded = load_saved(player_path(tmp_path, "admin"))
     assert loaded is not None
-    assert loaded.rank == "super_admin"
+    assert loaded.rank is Rank.SUPER_ADMIN
 
 
 def test_an_old_admin_file_for_the_config_account_becomes_super_admin(tmp_path: Path) -> None:
-    """The config account stored as admin is rewritten when the file is loaded."""
-    from lupaxa.chat_server.utilities import _find_saved
+    """A saved admin rank is returned unchanged when the file is loaded."""
+    from lupaxa.chat_server.utilities import find_saved
 
-    _save(tmp_path, "admin", RANK_ADMIN)
-    host = _login_host(tmp_path)
-    found = _find_saved(host, "admin")  # type: ignore[arg-type]
+    save(tmp_path, "admin", Rank.ADMIN)
+    server = login_host(tmp_path, super_admin=None)
+    found = find_saved(server, "admin")  # type: ignore[arg-type]
     assert found is not None
-    assert found.rank == "super_admin"
+    assert found.rank == Rank.ADMIN
     saved = load_saved(player_path(tmp_path, "admin"))
     assert saved is not None
-    assert saved.rank == "super_admin"
+    assert saved.rank == Rank.ADMIN
 
 
 def test_finger_shows_when_they_logged_out(tmp_path: Path) -> None:
     """Examine gives rank, the UTC logout time with seconds, and how long ago."""
     left = datetime.now(timezone.utc) - timedelta(hours=2)
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4), logged_out_at=left),
-    )
-    host = _login_host(tmp_path)
-    process_commands(host, _newbie("Ada"), "examine Bea")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), logged_out_at=left))
+    server = login_host(tmp_path)
+    process_commands(server, newbie("Ada"), "examine Bea")  # type: ignore[arg-type]
     stamp = clock_phrase(left)
-    body = examine_frame(
-        "Bea",
-        (
-            ("User Rank", "Resident"),
-            ("Logged out", stamp),
-            ("Ago", "2 hours"),
-            ("Total Login", "0 seconds"),
-        ),
-        72,
-    )
-    assert host.sent == [body]
+    body = examine_frame("Bea", (("User Rank", "Resident"), ("Last from", "unknown"), ("Logged out", stamp), ("Ago", "2 hours"), ("Total Login", "0 seconds"), *ROOM_SENTENCES), 72)
+    assert server.sent == [body]
     assert "Resident" in body
     assert "Logged out" in body
     assert stamp in body
@@ -4558,25 +5938,16 @@ def test_finger_shows_when_they_logged_out(tmp_path: Path) -> None:
     assert "2 hours" in body
     assert "Total Login" in body
     assert "0 seconds" in body
-    assert "Last from" not in body
     assert "Rank:" not in body
 
 
 def test_finger_with_no_logout_time_says_unknown(tmp_path: Path) -> None:
     """A file with no ``logged_out_at`` says unknown, with no Ago line."""
-    _save(tmp_path, "Bea", RANK_SUPER)
-    host = _login_host(tmp_path)
-    process_commands(host, _newbie("Ada"), "examine Bea")  # type: ignore[arg-type]
-    body = examine_frame(
-        "Bea",
-        (
-            ("User Rank", shown_rank(RANK_SUPER, True)),
-            ("Logged out", "unknown"),
-            ("Total Login", "0 seconds"),
-        ),
-        72,
-    )
-    assert host.sent == [body]
+    save(tmp_path, "Bea", Rank.SUPER_USER)
+    server = login_host(tmp_path)
+    process_commands(server, newbie("Ada"), "examine Bea")  # type: ignore[arg-type]
+    body = examine_frame("Bea", (("User Rank", shown_rank(Rank.SUPER_USER, True)), ("Last from", "unknown"), ("Logged out", "unknown"), ("Total Login", "0 seconds"), *ROOM_SENTENCES), 72)
+    assert server.sent == [body]
     assert "Logged out" in body
     assert "unknown" in body
     assert "Ago" not in body
@@ -4584,443 +5955,730 @@ def test_finger_with_no_logout_time_says_unknown(tmp_path: Path) -> None:
 
 def test_finger_and_f_are_unknown() -> None:
     """Finger and f are not commands."""
-    for line, reply in (
-        ("finger Bea", "No such command 'finger'\n"),
-        ("f Bea", "No such command 'f'\n"),
-        ("fBea", "No such command 'fBea'\n"),
-    ):
-        host, _player = _run(line)
-        assert host.sent == [reply]
+    for line, reply in (("finger Bea", "No such command 'finger'\n"), ("f Bea", "No such command 'f'\n"), ("fBea", "No such command 'fBea'\n")):  # fmt: skip  # noqa: E501
+        server, _ = run(line)
+        assert server.sent == [reply]
 
 
-def _viewer(rank: str) -> _Player:
-    return _staff("Ada", rank)
+def viewer(rank: Rank) -> FakePlayer:
+    return staff("Ada", rank)
 
 
-def _here_at(host: _Host, name: str, address: str) -> _Player:
+def here_at(server: FakeServer, name: str, address: str) -> FakePlayer:
     when = datetime.now(timezone.utc) - timedelta(minutes=10)
     user = Player(name, "hall", when, connected_seconds=7200)
-    bea = _Player(name=name, room="hall", player=user, address=address)
-    host.people = [bea]
+    bea = FakePlayer(name=name, room="hall", player=user, address=address)
+    server.people = [bea]
     return bea
 
 
-def test_examine_shows_the_address_to_staff(tmp_path: Path) -> None:
-    """Examine ends with the address for a super user or the admin, and not for others."""
-    rank_words = shown_rank(RANK_NEWBIE, True)
-    plain = (
-        ("User Rank", rank_words),
-        ("Logged in for", "10 minutes"),
-        ("Total Login", "2 hours"),
-        ("Idle for", "Not idle at all"),
-    )
-    for rank in (RANK_NEWBIE, RANK_RESIDENT, RANK_SUPER, RANK_ADMIN):
-        host = _login_host(tmp_path)
-        _here_at(host, "Bea", "10.0.0.5")
-        process_commands(host, _viewer(rank), "examine Bea")  # type: ignore[arg-type]
-        fields: tuple[tuple[str, str], ...] = plain
-        if rank in (RANK_SUPER, RANK_ADMIN):
-            fields = (
-                ("User Rank", rank_words),
-                ("Logged in from", "10.0.0.5"),
-                ("Logged in for", "10 minutes"),
-                ("Total Login", "2 hours"),
-                ("Idle for", "Not idle at all"),
-            )
+def test_examine_shows_where_they_connected(tmp_path: Path) -> None:
+    """Examine shows the hostname, the IP, and telnet or ssh."""
+    rank_words = shown_rank(Rank.NEWBIE, True)
+    fields = (("User Rank", rank_words), ("Logged in from", "10.0.0.5 (10.0.0.5) [via telnet]"), ("Logged in for", "10 minutes"), ("Total Login", "2 hours"), ("Idle for", "Not idle at all"), *ROOM_SENTENCES)  # fmt: skip  # noqa: E501
+    for rank in (Rank.NEWBIE, Rank.RESIDENT, Rank.SUPER_USER, Rank.ADMIN):
+        server = login_host(tmp_path)
+        here_at(server, "Bea", "10.0.0.5")
+        process_commands(server, viewer(rank), "examine Bea")  # type: ignore[arg-type]
         body = examine_frame("Bea", fields, 72)
-        assert host.sent == [body]
-        if rank in (RANK_SUPER, RANK_ADMIN):
-            assert "Logged in from : 10.0.0.5" in body
-        else:
-            assert "Logged in from" not in body
-            assert "Address:" not in body
+        assert server.sent == [body]
+        assert "Logged in from : 10.0.0.5 (10.0.0.5) [via telnet]" in body
 
 
 def test_examine_shows_last_connected_from(tmp_path: Path) -> None:
-    """A logged-out player shows the last address to staff, and not to a resident."""
+    """A logged-out player shows the last hostname and IP."""
     left = datetime.now(timezone.utc) - timedelta(hours=2)
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            logged_out_at=left,
-            ip_address="10.0.0.5",
-        ),
-    )
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), logged_out_at=left, ip_address="10.0.0.5", hostname="bea.example"))
     stamp = clock_phrase(left)
-    logged_out = (
-        ("User Rank", "Resident"),
-        ("Logged out", stamp),
-        ("Ago", "2 hours"),
-        ("Total Login", "0 seconds"),
-    )
-    host = _login_host(tmp_path)
-    process_commands(host, _viewer(RANK_SUPER), "examine Bea")  # type: ignore[arg-type]
-    staff = examine_frame("Bea", (*logged_out, ("Last from", "10.0.0.5")), 72)
-    assert host.sent == [staff]
-    assert "Last from : 10.0.0.5" in " ".join(staff.split())
-    assert "Last connected from:" not in staff
-    host = _login_host(tmp_path)
-    process_commands(host, _viewer(RANK_RESIDENT), "examine Bea")  # type: ignore[arg-type]
-    resident = examine_frame("Bea", logged_out, 72)
-    assert host.sent == [resident]
-    assert "Last from" not in resident
+    logged_out = (("User Rank", "Resident"), ("Last from", "bea.example (10.0.0.5)"), ("Logged out", stamp), ("Ago", "2 hours"), ("Total Login", "0 seconds"), *ROOM_SENTENCES)
+    body = examine_frame("Bea", logged_out, 72)
+    for rank in (Rank.RESIDENT, Rank.SUPER_USER):
+        server = login_host(tmp_path)
+        process_commands(server, viewer(rank), "examine Bea")  # type: ignore[arg-type]
+        assert server.sent == [body]
+    assert "Last from : bea.example (10.0.0.5)" in " ".join(body.split())
+    assert "Last connected from:" not in body
 
 
 def test_finger_says_unknown_when_no_address_is_saved(tmp_path: Path) -> None:
     """A file with no address reads unknown to staff, and adds no Ago line."""
-    _save(tmp_path, "Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    process_commands(host, _viewer(RANK_SUPER), "examine Bea")  # type: ignore[arg-type]
-    body = examine_frame(
-        "Bea",
-        (
-            ("User Rank", "Resident"),
-            ("Logged out", "unknown"),
-            ("Total Login", "0 seconds"),
-            ("Last from", "unknown"),
-        ),
-        72,
-    )
-    assert host.sent == [body]
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    process_commands(server, viewer(Rank.SUPER_USER), "examine Bea")  # type: ignore[arg-type]
+    body = examine_frame("Bea", (("User Rank", "Resident"), ("Last from", "unknown"), ("Logged out", "unknown"), ("Total Login", "0 seconds"), *ROOM_SENTENCES), 72)  # fmt: skip  # noqa: E501
+    assert server.sent == [body]
     assert "Last from : unknown" in " ".join(body.split())
     assert "Last connected from:" not in body
 
 
 def test_entry_remembers_the_address_of_a_saved_player_only(tmp_path: Path) -> None:
     """A resident's file gets the address on entry. A newbie gets no file."""
-    _save(tmp_path, "Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    bea = _Player(player=None, address="10.0.0.5")
-    process_input(host, bea, "Bea")  # type: ignore[arg-type]
-    process_input(host, bea, "pw")  # type: ignore[arg-type]
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    bea = FakePlayer(player=None, address="10.0.0.5")
+    process_input(server, bea, "Bea")  # type: ignore[arg-type]
+    process_input(server, bea, "pw")  # type: ignore[arg-type]
     assert bea.player is not None
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.ip_address == "10.0.0.5"
     assert saved.hostname == "10.0.0.5"
 
-    host = _login_host(tmp_path)
-    cyd = _Player(player=None, address="10.0.0.6")
-    process_input(host, cyd, "Cyd")  # type: ignore[arg-type]
-    process_input(host, cyd, "yes")  # type: ignore[arg-type]
+    server = login_host(tmp_path)
+    cyd = FakePlayer(player=None, address="10.0.0.6")
+    process_input(server, cyd, "Cyd")  # type: ignore[arg-type]
+    process_input(server, cyd, "yes")  # type: ignore[arg-type]
     assert cyd.player is not None
     assert load_saved(player_path(tmp_path, "Cyd")) is None
 
 
 def test_a_new_resident_is_saved_with_the_address(tmp_path: Path) -> None:
     """Saving a connected newbie as a resident stores where they are connected from."""
-    bea = _newbie("Bea")
+    bea = newbie("Bea")
     bea.address = "10.0.0.5"
     bea.hostname = "bea.example"
-    ada = _staff("Ada", RANK_SUPER)
-    host = _login_host(tmp_path)
-    host.people = [bea, ada]
-    process_commands(host, ada, "resident Bea")  # type: ignore[arg-type]
-    process_input(host, bea, "hunter2")  # type: ignore[arg-type]
-    process_input(host, bea, "hunter2")  # type: ignore[arg-type]
+    ada = staff("Ada", Rank.SUPER_USER)
+    server = login_host(tmp_path)
+    server.people = [bea, ada]
+    process_commands(server, ada, "resident Bea")  # type: ignore[arg-type]
+    process_input(server, bea, "hunter2")  # type: ignore[arg-type]
+    process_input(server, bea, "hunter2")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.ip_address == "10.0.0.5"
     assert saved.hostname == "bea.example"
 
 
+def test_su_channel_hears_the_staff_channel_and_can_speak(tmp_path: Path) -> None:
+    """SU Channel hears and speaks on the staff channel. A resident does not."""
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SU_CHANNEL)
+    bea = staff("Bea", Rank.RESIDENT)
+    cyd = staff("Cyd", Rank.SUPER_USER)
+    server.people = [ada, bea, cyd]
+    process_commands(server, ada, "su hello")  # type: ignore[arg-type]
+    assert any("hello" in line for line in ada.sent)
+    assert any("hello" in line for line in cyd.sent)
+    assert not any("hello" in line for line in bea.sent)
+    server.sent.clear()
+    process_commands(server, bea, "su hello")  # type: ignore[arg-type]
+    assert server.sent == ["No such command 'su'\n"]
+    process_commands(server, ada, "lsn")  # type: ignore[arg-type]
+    assert server.sent[-1] == " -=> There are no newbies connected currently.\n"
+
+
 def test_su_stays_on_the_staff_channel(tmp_path: Path) -> None:
     """The sender sees You, the channel gets the name line, and a resident is refused."""
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_SUPER)
-    bob = _staff("Bob", RANK_SUPER)
-    host.people = [ada, bob]
-    for line, mine, theirs in (
-        ("su hello", "< SU > You say 'hello'\n", "< SU > Ada says 'hello'\n"),
-        ("se waves", "< SU > You emote: waves\n", "< SU > Ada waves\n"),
-        ("st lunch", "< SU > You think . o O ( lunch )\n", "< SU > Ada thinks . o O ( lunch )\n"),
-    ):
-        host.sent.clear()
-        host.staff_lines.clear()
-        process_commands(host, ada, line)  # type: ignore[arg-type]
-        assert host.sent == [paint_staff(ada, mine)]
-        assert host.staff_lines == [paint_staff(bob, theirs)]
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    bob = staff("Bob", Rank.SUPER_USER)
+    server.people = [ada, bob]
+    for line, mine, theirs in (("su hello", "< SU > You say 'hello'\n", "< SU > Ada says 'hello'\n"), ("se waves", "< SU > You emote: waves\n", "< SU > Ada waves\n"), ("st lunch", "< SU > You think . o O ( lunch )\n", "< SU > Ada thinks . o O ( lunch )\n")):  # fmt: skip  # noqa: E501
+        server.sent.clear()
+        server.staff_lines.clear()
+        process_commands(server, ada, line)  # type: ignore[arg-type]
+        assert server.sent == [paint_staff(ada, mine)]
+        assert server.staff_lines == [paint_staff(bob, theirs)]
     for word in ("su", "se", "st"):
-        host.sent.clear()
-        process_commands(host, ada, word)  # type: ignore[arg-type]
-        assert host.sent == [f"Syntax: {word} <message>\n"]
-    host.sent.clear()
-    host.staff_lines.clear()
+        server.sent.clear()
+        process_commands(server, ada, word)  # type: ignore[arg-type]
+        assert server.sent == [f"Syntax: {word} <message>\n"]
+    server.sent.clear()
+    server.staff_lines.clear()
     for word in ("su", "se", "st", "lsn"):
-        process_commands(host, _staff("Bea", RANK_RESIDENT), f"{word} hi")  # type: ignore[arg-type]
-    assert host.sent == [f"No such command '{word}'\n" for word in ("su", "se", "st", "lsn")]
-    assert host.staff_lines == []
+        process_commands(server, staff("Bea", Rank.RESIDENT), f"{word} hi")  # type: ignore[arg-type]
+    assert server.sent == [f"No such command '{word}'\n" for word in ("su", "se", "st", "lsn")]
+    assert server.staff_lines == []
 
 
 def test_admin_channel_say_emote_and_think(tmp_path: Path) -> None:
     """au, ae, and at stay on the admin channel and are hidden from super users."""
-    from lupaxa.chat_server.channel import paint_admin
-
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_ADMIN)
-    bob = _staff("Bob", RANK_ADMIN)
-    sue = _staff("Sue", RANK_SUPER)
-    host.people = [ada, bob, sue]
-    cases = (
-        ("au hello", "[ Admin ] You say 'hello'\n", "[ Admin ] Ada says 'hello'\n"),
-        ("ae waves", "[ Admin ] You emote: waves\n", "[ Admin ] Ada waves\n"),
-        (
-            "at lunch",
-            "[ Admin ] You think . o O ( lunch )\n",
-            "[ Admin ] Ada thinks . o O ( lunch )\n",
-        ),
-    )
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.ADMIN)
+    bob = staff("Bob", Rank.ADMIN)
+    sue = staff("Sue", Rank.SUPER_USER)
+    server.people = [ada, bob, sue]
+    cases = (("au hello", "[ Admin ] You say 'hello'\n", "[ Admin ] Ada says 'hello'\n"), ("ae waves", "[ Admin ] You emote: waves\n", "[ Admin ] Ada waves\n"), ("at lunch", "[ Admin ] You think . o O ( lunch )\n", "[ Admin ] Ada thinks . o O ( lunch )\n"))  # fmt: skip  # noqa: E501
     for line, mine, theirs in cases:
-        host.sent.clear()
-        host.admin_lines.clear()
-        host.staff_lines.clear()
-        process_commands(host, ada, line)  # type: ignore[arg-type]
-        assert host.sent == [paint_admin(ada, mine)]
-        assert host.admin_lines == [paint_admin(bob, theirs)]
-        assert host.staff_lines == []
-    host.sent.clear()
-    host.staff_lines.clear()
-    process_commands(host, sue, "su hello")  # type: ignore[arg-type]
-    assert any("Sue says 'hello'" in line for line in host.staff_lines)
+        server.sent.clear()
+        server.admin_lines.clear()
+        server.staff_lines.clear()
+        process_commands(server, ada, line)  # type: ignore[arg-type]
+        assert server.sent == [paint_admin(ada, mine)]
+        assert server.admin_lines == [paint_admin(bob, theirs)]
+        assert server.staff_lines == []
+    server.sent.clear()
+    server.staff_lines.clear()
+    process_commands(server, sue, "su hello")  # type: ignore[arg-type]
+    assert any("Sue says 'hello'" in line for line in server.staff_lines)
     for word in ("au", "ae", "at"):
-        host.sent.clear()
-        process_commands(host, ada, word)  # type: ignore[arg-type]
-        assert host.sent == [f"Syntax: {word} <message>\n"]
+        server.sent.clear()
+        process_commands(server, ada, word)  # type: ignore[arg-type]
+        assert server.sent == [f"Syntax: {word} <message>\n"]
     ada.player.colour = False  # type: ignore[union-attr]
     bob.player.colour = False  # type: ignore[union-attr]
-    host.sent.clear()
-    host.admin_lines.clear()
-    process_commands(host, ada, "au hello")  # type: ignore[arg-type]
-    assert host.sent == ["[ Admin ] You say 'hello'\n"]
-    assert host.admin_lines == ["[ Admin ] Ada says 'hello'\n"]
-    host.sent.clear()
-    process_commands(host, sue, "au hello")  # type: ignore[arg-type]
-    process_commands(host, sue, "ae waves")  # type: ignore[arg-type]
-    process_commands(host, sue, "at lunch")  # type: ignore[arg-type]
-    assert host.sent == [
+    server.sent.clear()
+    server.admin_lines.clear()
+    process_commands(server, ada, "au hello")  # type: ignore[arg-type]
+    assert server.sent == ["[ Admin ] You say 'hello'\n"]
+    assert server.admin_lines == ["[ Admin ] Ada says 'hello'\n"]
+    server.sent.clear()
+    process_commands(server, sue, "au hello")  # type: ignore[arg-type]
+    process_commands(server, sue, "ae waves")  # type: ignore[arg-type]
+    process_commands(server, sue, "at lunch")  # type: ignore[arg-type]
+    assert server.sent == [
         "No such command 'au'\n",
         "No such command 'ae'\n",
         "No such command 'at'\n",
     ]
 
 
+def test_coder_channel_lines(tmp_path: Path) -> None:
+    """Coder and the Super Admin hear the coder channel. An admin does not."""
+    from lupaxa.chat_server.colour import paint_coder
+
+    ada = staff("Ada", Rank.CODER)
+    bea = staff("Bea", Rank.CODER)
+    cyd = staff("Cyd", Rank.ADMIN)
+    dee = staff("Dee", Rank.SUPER_ADMIN)
+    for person in (ada, bea, cyd, dee):
+        assert person.player is not None
+        person.player.colour = True
+    server = login_host(tmp_path)
+    server.people = [ada, bea, cyd, dee]
+    cases = (
+        ("cu hello", "{ Coder } You say 'hello'\n", "{ Coder } Ada says 'hello'\n"),
+        ("ce waves", "{ Coder } You emote: waves\n", "{ Coder } Ada waves\n"),
+        ("ct lunch", "{ Coder } You think . o O ( lunch )\n", "{ Coder } Ada thinks . o O ( lunch )\n"),
+    )
+    for line, mine, theirs in cases:
+        ada.sent.clear()
+        bea.sent.clear()
+        cyd.sent.clear()
+        dee.sent.clear()
+        process_commands(server, ada, line)  # type: ignore[arg-type]
+        assert ada.sent == [paint_coder(ada, mine)]
+        assert bea.sent == [paint_coder(bea, theirs)]
+        assert dee.sent == [paint_coder(dee, theirs)]
+        assert cyd.sent == []
+
+
+def test_off_duty_coder_keeps_the_coder_channel(tmp_path: Path) -> None:
+    """Off duty still blocks su and au, and cu still reaches another coder."""
+    ada = staff("Ada", Rank.CODER)
+    bea = staff("Bea", Rank.CODER)
+    assert ada.player is not None
+    ada.player.off_duty = True
+    ada.player.colour = False
+    assert bea.player is not None
+    bea.player.colour = False
+    server = login_host(tmp_path)
+    server.people = [ada, bea]
+    process_commands(server, ada, "cu hello")  # type: ignore[arg-type]
+    assert ada.sent == ["{ Coder } You say 'hello'\n"]
+    assert bea.sent == ["{ Coder } Ada says 'hello'\n"]
+    server.sent.clear()
+    process_commands(server, ada, "su hidden")  # type: ignore[arg-type]
+    assert server.sent == ["You are off duty.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "au hidden")  # type: ignore[arg-type]
+    assert server.sent == ["You are off duty.\n"]
+
+
+def test_screenlock_still_waits_for_a_coder(tmp_path: Path) -> None:
+    """A locked coder does not deliver cu until the password unlocks the screen."""
+    ada = staff("Ada", Rank.CODER)
+    bea = staff("Bea", Rank.CODER)
+    assert ada.player is not None
+    ada.player.screen_locked = True
+    ada.auth = "screenlock"
+    server = login_host(tmp_path)
+    server.people = [ada, bea]
+    process_input(server, ada, "cu hello")  # type: ignore[arg-type]
+    assert not any("hello" in line for line in bea.sent)
+    assert ada.player.screen_locked is True
+
+
 def test_lsu_pads_the_columns_and_lists_only_staff(tmp_path: Path) -> None:
     """Only connected super users and the admin are listed, sorted, with dashes aligned."""
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_SUPER)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
     assert ada.player is not None
     ada.player.idle_seconds = 0
-    boss = _staff("admin", RANK_ADMIN)
+    boss = staff("admin", Rank.ADMIN)
     assert boss.player is not None
-    boss.player.idle_seconds = 120
-    bea = _staff("Bea", RANK_RESIDENT)
-    cyd = _newbie("Cyd")
-    host.people = [boss, bea, ada, cyd]
+    boss.player.idle_seconds = 300
+    bea = staff("Bea", Rank.RESIDENT)
+    cyd = newbie("Cyd")
+    server.people = [boss, bea, ada, cyd]
     assert ada.discovered_columns == 72
-    process_commands(host, ada, "lsu")  # type: ignore[arg-type]
-    text = host.sent[0]
+    process_commands(server, ada, "lsu")  # type: ignore[arg-type]
+    text = server.sent[0]
     assert "[ Admin ]" in text
     assert "< Super User >" in text
-    assert "00:02:00" in text
+    assert "[00:05:00]" in text
     assert "Super Users:" not in text
     assert "0 seconds" not in text
     assert "Bea" not in text
     assert "Cyd" not in text
     for asker in (cyd, bea):
-        host.sent.clear()
-        process_commands(host, asker, "lsu")  # type: ignore[arg-type]
-        assert host.sent == [text]
+        server.sent.clear()
+        process_commands(server, asker, "lsu")  # type: ignore[arg-type]
+        assert server.sent == [text]
 
 
 def test_lsu_text_is_the_seventy_two_column_frame(tmp_path: Path) -> None:
     """A coloured staff list stays within the 72-column terminal."""
-    from lupaxa.chat_server.colour import cyan, plain_len, red
+    from lupaxa.chat_server.colour import cyan, green, light_black, plain_len, red
 
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_SUPER)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
     assert ada.player is not None
     ada.player.idle_seconds = 0
-    boss = _staff("admin", RANK_ADMIN)
+    boss = staff("admin", Rank.ADMIN)
     assert boss.player is not None
     boss.player.idle_seconds = 3723
-    host.people = [boss, ada]
+    server.people = [boss, ada]
     assert ada.discovered_columns == 72
-    process_commands(host, ada, "lsu")  # type: ignore[arg-type]
-    super_line = "  Ada         < Super User >       Reception                            "
-    super_line = super_line.replace("< Super User >", cyan("< Super User >"), 1)
-    admin_line = "  admin         [ Admin ]          Reception                  01:02:03  "
-    admin_line = admin_line.replace("[ Admin ]", red("[ Admin ]"), 1)
+    process_commands(server, ada, "lsu")  # type: ignore[arg-type]
+    super_line = "  Ada        < Super User >      Reception                  [ Active ]  "
+    super_line = super_line.replace("< Super User >", cyan("< Super User >"), 1).replace("[ Active ]", green("[ Active ]"), 1)
+    admin_line = "  admin        [ Admin ]         Reception                  [--:--:--]  "
+    admin_line = admin_line.replace("[ Admin ]", red("[ Admin ]"), 1).replace("[--:--:--]", light_black("[--:--:--]"), 1)
     assert plain_len(super_line) == 72
     assert plain_len(admin_line) == 72
     lines = [
         "-" * 72,
-        "  Name             Rank              Room         Status        Idle    ",
+        "  Name            Rank             Room         Status         Idle     ",
         "-" * 72,
         super_line,
         admin_line,
         "-" * 72,
     ]
-    assert host.sent == ["\n".join(lines) + "\n"]
+    assert server.sent == ["\n".join(lines) + "\n"]
     for line in lines:
         assert plain_len(line) == 72
 
 
 def test_lsu_with_colour_off_is_the_plain_frame(tmp_path: Path) -> None:
     """With colour off, rank cells have no codes and rules stay 72 columns wide."""
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_SUPER)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
     assert ada.player is not None
     ada.player.colour = False
     ada.player.idle_seconds = 0
-    boss = _staff("admin", RANK_ADMIN)
+    boss = staff("admin", Rank.ADMIN)
     assert boss.player is not None
     boss.player.idle_seconds = 3723
-    host.people = [boss, ada]
+    server.people = [boss, ada]
     assert ada.discovered_columns == 72
-    process_commands(host, ada, "lsu")  # type: ignore[arg-type]
-    super_line = "  Ada         < Super User >       Reception                            "
-    admin_line = "  admin         [ Admin ]          Reception                  01:02:03  "
+    process_commands(server, ada, "lsu")  # type: ignore[arg-type]
+    super_line = "  Ada        < Super User >      Reception                  [ Active ]  "
+    admin_line = "  admin        [ Admin ]         Reception                  [--:--:--]  "
     lines = [
         "-" * 72,
-        "  Name             Rank              Room         Status        Idle    ",
+        "  Name            Rank             Room         Status         Idle     ",
         "-" * 72,
         super_line,
         admin_line,
         "-" * 72,
     ]
-    assert host.sent == ["\n".join(lines) + "\n"]
+    assert server.sent == ["\n".join(lines) + "\n"]
     for rule in (lines[0], lines[2], lines[5]):
         assert len(rule) == 72
 
 
 def test_staff_lists_the_same_frame_as_lsu() -> None:
     """Staff is lsu. staffroom is not. staff please is the lsu syntax."""
-    ada = _Player(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=RANK_SUPER))
-    host = _Host(people=[ada])
-    process_commands(host, ada, "lsu")  # type: ignore[arg-type]
-    listed = host.sent[0]
-    host.sent.clear()
-    process_commands(host, ada, "staff")  # type: ignore[arg-type]
-    assert host.sent == [listed]
-    host.sent.clear()
-    process_commands(host, ada, "staffroom")  # type: ignore[arg-type]
-    assert host.sent == ["No such command 'staffroom'\n"]
-    host.sent.clear()
-    process_commands(host, ada, "staff please")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: lsu\n"]
+    ada = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.SUPER_USER))
+    server = FakeServer(people=[ada])
+    process_commands(server, ada, "lsu")  # type: ignore[arg-type]
+    listed = server.sent[0]
+    server.sent.clear()
+    process_commands(server, ada, "staff")  # type: ignore[arg-type]
+    assert server.sent == [listed]
+    server.sent.clear()
+    process_commands(server, ada, "staffroom")  # type: ignore[arg-type]
+    assert server.sent == ["No such command 'staffroom'\n"]
+    server.sent.clear()
+    process_commands(server, ada, "staff please")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: staff\n"]
 
 
 def test_lsu_with_nobody_to_list(tmp_path: Path) -> None:
     """No connected staff member is one sentence, not a table."""
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_SUPER)
-    host.people = [_staff("Bea", RANK_RESIDENT)]
-    process_commands(host, ada, "lsu")  # type: ignore[arg-type]
-    assert host.sent == [" -=> There are no staff members connected currently.\n"]
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [staff("Bea", Rank.RESIDENT)]
+    process_commands(server, ada, "lsu")  # type: ignore[arg-type]
+    assert server.sent == [" -=> There are no staff members connected currently.\n"]
 
 
 def test_lsu_lists_a_connected_super_admin(tmp_path: Path) -> None:
     """The config super admin appears on the staff list with the Super Admin label."""
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_SUPER)
-    boss = _staff("admin", RANK_SUPER_ADMIN)
-    host.people = [boss, ada]
-    process_commands(host, ada, "lsu")  # type: ignore[arg-type]
-    text = host.sent[0]
-    assert "[ Super Admin ]" in text
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    boss = staff("admin", Rank.SUPER_ADMIN)
+    server.people = [boss, ada]
+    process_commands(server, ada, "lsu")  # type: ignore[arg-type]
+    text = server.sent[0]
+    assert "( Super Admin )" in text
     assert "admin" in text
+
+
+def test_examine_shows_coder_and_super_admin_without_brackets(tmp_path: Path) -> None:
+    """Examine uses the coloured words and no brackets."""
+    from lupaxa.chat_server.colour import light_blue, magenta
+
+    ada = staff("Ada", Rank.CODER)
+    boss = staff("Dee", Rank.SUPER_ADMIN)
+    assert ada.player is not None
+    assert boss.player is not None
+    ada.player.colour = True
+    boss.player.colour = True
+    server = login_host(tmp_path)
+    server.people = [ada, boss]
+    process_commands(server, ada, "examine Dee")  # type: ignore[arg-type]
+    text = "".join(server.sent)
+    assert light_blue("Super Admin") in text
+    assert "( Super Admin )" not in text
+    assert "[ Super Admin ]" not in text
+    server.sent.clear()
+    process_commands(server, boss, "examine Ada")  # type: ignore[arg-type]
+    text = "".join(server.sent)
+    assert magenta("Coder") in text
+    assert "{ Coder }" not in text
+    server.sent.clear()
+    ada.player.colour = False
+    process_commands(server, ada, "examine me")  # type: ignore[arg-type]
+    plain = "".join(server.sent)
+    assert "Coder" in plain
+    assert magenta("Coder") not in plain
+
+
+def test_who_shows_coder_braces_and_super_admin_parentheses(tmp_path: Path) -> None:
+    """Who uses braces for Coder and parentheses for Super Admin."""
+    from lupaxa.chat_server.colour import light_blue, magenta
+
+    ada = staff("Ada", Rank.CODER)
+    boss = staff("Dee", Rank.SUPER_ADMIN)
+    viewer = staff("Bea", Rank.RESIDENT)
+    assert viewer.player is not None
+    viewer.player.colour = True
+    server = login_host(tmp_path)
+    server.people = [ada, boss, viewer]
+    process_commands(server, viewer, "who")  # type: ignore[arg-type]
+    text = "".join(server.sent)
+    assert magenta("{ Coder }") in text
+    assert light_blue("( Super Admin )") in text
+    assert "[ Super Admin ]" not in text
+
+
+def test_lsu_shows_coder_and_an_off_duty_coder(tmp_path: Path) -> None:
+    """Lsu uses magenta braces, including Off Duty."""
+    from lupaxa.chat_server.colour import magenta
+
+    ada = staff("Ada", Rank.CODER)
+    bea = staff("Bea", Rank.CODER)
+    viewer = staff("Cyd", Rank.SU_CHANNEL)
+    resident = staff("Dee", Rank.RESIDENT)
+    assert ada.player is not None
+    assert bea.player is not None
+    assert viewer.player is not None
+    ada.player.off_duty = True
+    viewer.player.colour = True
+    server = login_host(tmp_path)
+    server.people = [ada, bea, viewer, resident]
+    process_commands(server, viewer, "lsu")  # type: ignore[arg-type]
+    text = "".join(server.sent)
+    assert magenta("{ Coder }") in text
+    assert magenta("{ Off Duty }") in text
+    server.sent.clear()
+    process_commands(server, resident, "lsu")  # type: ignore[arg-type]
+    hidden = "".join(server.sent)
+    assert "Ada" not in hidden
+    assert "Bea" in hidden
+
+
+def test_off_duty_hides_the_role_until_on_duty(tmp_path: Path) -> None:
+    """Off duty leaves the channels and staff commands, and hides the row from residents."""
+    from lupaxa.chat_server.colour import cyan, red
+
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    bob = staff("Bob", Rank.SUPER_USER)
+    boss = staff("Ann", Rank.ADMIN)
+    bea = staff("Bea", Rank.RESIDENT)
+    server.people = [ada, bob, boss, bea]
+    process_commands(server, ada, "off_duty")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Syntax: off_duty <reason>\n"
+    server.sent.clear()
+    server.staff_lines.clear()
+    process_commands(server, ada, "off_duty lunch")  # type: ignore[arg-type]
+    assert ada.player is not None
+    assert ada.player.off_duty is True
+    note = "< SU > Ada goes off duty because 'lunch'.\n"
+    assert server.staff_lines == [paint_staff(ada, note), paint_staff(bob, note), paint_staff(boss, note)]
+    server.sent.clear()
+    process_commands(server, ada, "su hello")  # type: ignore[arg-type]
+    assert server.sent == ["You are off duty.\n"]
+    server.sent.clear()
+    server.staff_lines.clear()
+    process_commands(server, bob, "su hello")  # type: ignore[arg-type]
+    assert server.staff_lines == [paint_staff(boss, "< SU > Bob says 'hello'\n")]
+    assert server.sent == [paint_staff(bob, "< SU > You say 'hello'\n")]
+    process_commands(server, bea, "lsu")  # type: ignore[arg-type]
+    assert "Ada" not in server.sent[-1]
+    assert "Bob" in server.sent[-1]
+    server.sent.clear()
+    process_commands(server, bob, "lsu")  # type: ignore[arg-type]
+    assert cyan("< Off Duty >") in server.sent[0]
+    assert red("[ Admin ]") in server.sent[0]
+    server.sent.clear()
+    process_commands(server, ada, "say hello")  # type: ignore[arg-type]
+    assert server.sent[0] == "You say 'hello'\n"
+    save(tmp_path, "Ada", Rank.SUPER_USER)
+    server.sent.clear()
+    server.staff_lines.clear()
+    process_input(server, ada, "on_duty")  # type: ignore[arg-type]
+    assert ada.auth == "on_duty_password"
+    assert ada.player.off_duty is True
+    assert server.sent == ["Password: "]
+    server.sent.clear()
+    process_input(server, ada, "pw")  # type: ignore[arg-type]
+    assert ada.player.off_duty is False
+    assert ada.auth == "name"
+    back = "< SU > Ada has returned to duty.\n"
+    assert paint_staff(ada, back) in server.staff_lines
+    assert server.sent[-1] == "What? > "
+    process_commands(server, bea, "lsu")  # type: ignore[arg-type]
+    assert "Ada" in server.sent[-1]
+
+
+def test_on_duty_wrong_password_stays_off_duty(tmp_path: Path) -> None:
+    """A wrong password leaves them off duty and tells the staff channel."""
+    save(tmp_path, "Ada", Rank.SUPER_USER)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    bob = staff("Bob", Rank.SUPER_USER)
+    server.people = [ada, bob]
+    process_input(server, ada, "off_duty lunch")  # type: ignore[arg-type]
+    process_input(server, ada, "on_duty")  # type: ignore[arg-type]
+    server.sent.clear()
+    server.staff_lines.clear()
+    process_input(server, ada, "nope")  # type: ignore[arg-type]
+    assert ada.player is not None
+    assert ada.player.off_duty is True
+    assert ada.auth == "name"
+    note = "< SU > Ada got their password wrong and failed to return to duty.\n"
+    assert server.staff_lines == [paint_staff(bob, note)]
+    assert server.sent == ["Wrong password.\nWhat? > "]
+
+
+def test_screenlock_takes_su_channel_off_duty(tmp_path: Path) -> None:
+    """Locking sets SU Channel off duty, and the right password clears it."""
+    players = tmp_path / "players"
+    players.mkdir()
+    save_player(players, SavedPlayer("Ada", Rank.SU_CHANNEL, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    server.roster_dir = players
+    server.config = replace(server.config, players=players)
+    ada = staff("Ada", Rank.SU_CHANNEL)
+    bea = staff("Bea", Rank.SU_CHANNEL)
+    server.people = [ada, bea]
+    process_commands(server, ada, "screenlock lunch")  # type: ignore[arg-type]
+    assert ada.player is not None
+    assert ada.player.off_duty is True
+    assert any("locked their screen because 'lunch'" in line for line in bea.sent)
+    ada.auth = "name"
+    server.sent.clear()
+    ada.show_lock = True
+    process_commands(server, ada, "su hidden")  # type: ignore[arg-type]
+    assert server.sent == ["You are off duty.\n"]
+    ada.show_lock = False
+    ada.auth = "screenlock"
+    process_input(server, ada, "pw")  # type: ignore[arg-type]
+    assert ada.player.off_duty is False
+    assert any("unlocked their screen" in line for line in bea.sent)
+    process_commands(server, ada, "su later")  # type: ignore[arg-type]
+    assert any("later" in line for line in bea.sent)
+
+
+def test_screenlock_hides_the_screen_until_the_password(tmp_path: Path) -> None:
+    """A locked screen shows only the unlock prompt, and staff step off duty."""
+    save(tmp_path, "Ada", Rank.SUPER_USER)
+    save(tmp_path, "Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    bob = staff("Bob", Rank.SUPER_USER)
+    bea = staff("Bea", Rank.RESIDENT)
+    neo = staff("Neo", Rank.NEWBIE)
+    server.people = [ada, bob, bea, neo]
+    process_input(server, neo, "screenlock")  # type: ignore[arg-type]
+    assert server.sent[-2:] == ["No such command 'screenlock'\n", "What? > "]
+    server.sent.clear()
+    process_input(server, bea, "screenlock")  # type: ignore[arg-type]
+    assert bea.player is not None
+    assert bea.player.screen_locked is True
+    assert bea.player.off_duty is False
+    assert bea.auth == "screenlock"
+    assert bea.sent == [cls(), "Enter password to unlock: "]
+    assert server.staff_lines == []
+    server.sent.clear()
+    bea.sent.clear()
+    assert bea.player is not None
+    bea.player.auto_reply = "later"
+    process_input(server, ada, "tell Bea hello")  # type: ignore[arg-type]
+    assert bea.sent == []
+    assert "[ Auto Reply from Bea ] later\n" not in ada.sent
+    assert bea.player.auto_reply == "later"
+    assert "[ Screen Locked ] Bea's screen is currently locked\n" in ada.sent
+    server.sent.clear()
+    ada.sent.clear()
+    process_input(server, bea, "say hello")  # type: ignore[arg-type]
+    assert bea.player.screen_locked is True
+    assert bea.sent == ["Wrong password.\nEnter password to unlock: "]
+    assert server.room_lines == []
+    server.sent.clear()
+    bea.sent.clear()
+    process_input(server, bea, "pw")  # type: ignore[arg-type]
+    assert bea.player.screen_locked is False
+    assert bea.auth == "name"
+    assert bea.sent == ["Screen is now unlocked.\n", "What? > "]
+    server.sent.clear()
+    server.staff_lines.clear()
+    ada.sent.clear()
+    process_input(server, ada, "screenlock lunch")  # type: ignore[arg-type]
+    assert ada.player is not None
+    assert ada.player.screen_locked is True
+    assert ada.player.off_duty is True
+    note = "< SU > Ada has locked their screen because 'lunch'.\n"
+    assert server.staff_lines == [paint_staff(bob, note)]
+    assert ada.sent == [cls(), "Enter password to unlock: "]
+    server.sent.clear()
+    ada.sent.clear()
+    server.staff_lines.clear()
+    process_input(server, bob, "tell Ada hi")  # type: ignore[arg-type]
+    assert ada.sent == []
+    assert "[ Screen Locked ] Ada's screen is currently locked lunch\n" in bob.sent
+    server.sent.clear()
+    ada.sent.clear()
+    server.staff_lines.clear()
+    process_input(server, ada, "pw")  # type: ignore[arg-type]
+    assert ada.player.screen_locked is False
+    assert ada.player.off_duty is False
+    assert ada.auth == "name"
+    unlocked = "< SU > Ada has unlocked their screen.\n"
+    assert paint_staff(ada, unlocked) in server.staff_lines
+    assert paint_staff(bob, unlocked) in server.staff_lines
+    assert server.sent[-1] == "What? > "
+    assert "Screen is now unlocked.\n" in ada.sent
+
+
+def test_off_list_hides_an_admin_from_the_public_staff_list(tmp_path: Path) -> None:
+    """Off list changes lsu only. The admin still hears the channel and can use commands."""
+    from lupaxa.chat_server.colour import red
+
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    boss = staff("Ann", Rank.ADMIN)
+    bea = staff("Bea", Rank.RESIDENT)
+    server.people = [ada, boss, bea]
+    process_commands(server, ada, "off_list training")  # type: ignore[arg-type]
+    assert server.sent[-1] == "No such command 'off_list'\n"
+    server.sent.clear()
+    server.staff_lines.clear()
+    process_commands(server, boss, "off_list training")  # type: ignore[arg-type]
+    assert boss.player is not None
+    assert boss.player.off_list is True
+    note = "< SU > Ann has gone off list because 'training'.\n"
+    assert paint_staff(boss, note) in server.staff_lines
+    process_commands(server, bea, "lsu")  # type: ignore[arg-type]
+    assert "Ann" not in server.sent[-1]
+    assert "Ada" in server.sent[-1]
+    server.sent.clear()
+    process_commands(server, ada, "lsu")  # type: ignore[arg-type]
+    assert red("[ Off List ]") in server.sent[0]
+    server.sent.clear()
+    server.staff_lines.clear()
+    process_commands(server, boss, "au hello")  # type: ignore[arg-type]
+    assert server.sent == [paint_admin(boss, "[ Admin ] You say 'hello'\n")]
+    server.sent.clear()
+    server.staff_lines.clear()
+    process_commands(server, boss, "on_list")  # type: ignore[arg-type]
+    assert boss.player.off_list is False
+    assert paint_staff(boss, "< SU > Ann has gone back on list.\n") in server.staff_lines
+    process_commands(server, bea, "lsu")  # type: ignore[arg-type]
+    assert "Ann" in server.sent[-1]
 
 
 def test_lsn_lists_connected_newbies(tmp_path: Path) -> None:
     """A super user sees each connected newbie with the address, names padded."""
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_SUPER)
-    host.people = [ada, _staff("Dee", RANK_RESIDENT)]
-    host.newbies = [("Bea", "10.0.0.5", "reception", 0), ("Cora", "192.168.1.20", "hall", 11)]
-    process_commands(host, ada, "lsn")  # type: ignore[arg-type]
-    text = host.sent[0]
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [ada, staff("Dee", Rank.RESIDENT)]
+    server.newbies = [("Bea", "10.0.0.5", "reception", 0), ("Cora", "192.168.1.20", "hall", 300)]
+    process_commands(server, ada, "lsn")  # type: ignore[arg-type]
+    text = server.sent[0]
     assert "Newbies:" not in text
     assert "10.0.0.5" in text
     assert "192.168.1.20" in text
     assert "Reception" in text
     assert "Hall" in text
-    assert "00:00:11" in text
+    assert "[ Active ]" in text
+    assert "[00:05:00]" in text
 
 
 def test_lsn_shows_hostname_and_room() -> None:
     """Each newbie row shows hostname, room display name, and idle clock."""
-    ada = _Player(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=RANK_SUPER))
-    host = _Host(people=[ada])
-    host.newbies = [("Bea", "bea.example", "hall", 11)]
-    process_commands(host, ada, "lsn")  # type: ignore[arg-type]
-    text = host.sent[0]
+    ada = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.SUPER_USER))
+    server = FakeServer(people=[ada])
+    server.newbies = [("Bea", "bea.example", "hall", 300)]
+    process_commands(server, ada, "lsn")  # type: ignore[arg-type]
+    text = server.sent[0]
     assert "Address" in text
     assert "Room" in text
     assert "bea.example" in text
     assert "Hall" in text
-    assert "00:00:11" in text
+    assert "[00:05:00]" in text
 
 
 def test_lsn_with_no_newbies(tmp_path: Path) -> None:
     """No connected newbie is one sentence, not a table."""
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_SUPER)
-    process_commands(host, ada, "lsn")  # type: ignore[arg-type]
-    assert host.sent == [" -=> There are no newbies connected currently.\n"]
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    process_commands(server, ada, "lsn")  # type: ignore[arg-type]
+    assert server.sent == [" -=> There are no newbies connected currently.\n"]
 
 
 def test_lsn_refuses_extra_text(tmp_path: Path) -> None:
     """Extra text after lsn is a syntax error."""
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_SUPER)
-    host.newbies = [("Bea", "10.0.0.5", "reception", 0)]
-    process_commands(host, ada, "lsn now")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: lsn\n"]
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.newbies = [("Bea", "10.0.0.5", "reception", 0)]
+    process_commands(server, ada, "lsn now")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: lsn\n"]
 
 
 def test_newbie_cannot_lsn(tmp_path: Path) -> None:
     """A newbie and a resident get no such command, and help hides it from a newbie."""
-    host = _login_host(tmp_path)
-    host.newbies = [("Bea", "10.0.0.5", "reception", 0)]
-    process_commands(host, _newbie("Bea"), "lsn")  # type: ignore[arg-type]
-    process_commands(host, _staff("Dee", RANK_RESIDENT), "lsn")  # type: ignore[arg-type]
-    assert host.sent == ["No such command 'lsn'\n", "No such command 'lsn'\n"]
-    host = _Host(
-        _help=HelpBook(entries=(HelpEntry("lsn", (), "List connected newbies."),)),
-    )
-    process_commands(host, _newbie("Bea"), "help lsn")  # type: ignore[arg-type]
-    assert host.sent == ["help for lsn not found\n"]
+    server = login_host(tmp_path)
+    server.newbies = [("Bea", "10.0.0.5", "reception", 0)]
+    process_commands(server, newbie("Bea"), "lsn")  # type: ignore[arg-type]
+    process_commands(server, staff("Dee", Rank.RESIDENT), "lsn")  # type: ignore[arg-type]
+    assert server.sent == ["No such command 'lsn'\n", "No such command 'lsn'\n"]
+    server = FakeServer(help=HelpBook(entries=(HelpEntry("lsn", (), "List connected newbies."),)))
+    process_commands(server, newbie("Bea"), "help lsn")  # type: ignore[arg-type]
+    assert server.sent == ["help for lsn not found\n"]
 
 
 def test_connection_rows_use_the_pending_name_and_sort_by_ip() -> None:
     """No name is <pending>. A typed name is kept. Rows sort by name, then IP."""
-    early = _Player(
-        player=None,
-        name=None,
-        room=None,
-        address="10.0.0.1",
-        hostname="10.0.0.1",
-    )
-    late = _Player(
-        player=None,
-        name=None,
-        room=None,
-        address="9.9.9.9",
-        hostname="9.9.9.9",
-    )
-    held = _Player(
-        player=None,
-        name=None,
-        room=None,
-        pending_name="Bea",
-        address="203.0.113.4",
-        hostname="203.0.113.4",
-    )
-    ada = _Player(address="198.51.100.2", hostname="ada.example", ssh=True)
-    logging_in = _Player(pending_name="NotAda", auth="current", address="198.51.100.8")
+    early = FakePlayer(player=None, name=None, room=None, address="10.0.0.1", hostname="10.0.0.1")
+    late = FakePlayer(player=None, name=None, room=None, address="9.9.9.9", hostname="9.9.9.9")
+    held = FakePlayer(player=None, name=None, room=None, pending_name="Bea", address="203.0.113.4", hostname="203.0.113.4")
+    ada = FakePlayer(address="198.51.100.2", hostname="ada.example", ssh=True)
+    logging_in = FakePlayer(pending_name="NotAda", auth="current", address="198.51.100.8")
     rows = connections([late, ada, held, early, logging_in])  # type: ignore[arg-type]
     assert [row[0] for row in rows] == ["<pending>", "<pending>", "Ada", "Ada", "Bea"]
     assert rows[0][2] == "10.0.0.1"
@@ -5035,21 +6693,11 @@ def test_connection_rows_use_the_pending_name_and_sort_by_ip() -> None:
 def test_connections_frames_every_socket_for_a_super_user() -> None:
     """The frame names the columns and includes the person who asked."""
     when = datetime.now(timezone.utc)
-    viewer = _Player(
-        player=Player("Cyd", "reception", when, rank=RANK_SUPER),
-        address="192.0.2.1",
-        hostname="staff.example",
-    )
-    unnamed = _Player(
-        player=None,
-        name=None,
-        room=None,
-        address="192.0.2.10",
-        hostname="192.0.2.10",
-    )
-    host = _Host(people=[unnamed, viewer])
-    process_commands(host, viewer, "connections")  # type: ignore[arg-type]
-    frame = host.sent[0]
+    viewer = FakePlayer(player=Player("Cyd", "reception", when, rank=Rank.SUPER_USER), address="192.0.2.1", hostname="staff.example")
+    unnamed = FakePlayer(player=None, name=None, room=None, address="192.0.2.10", hostname="192.0.2.10")
+    server = FakeServer(people=[unnamed, viewer])
+    process_commands(server, viewer, "connections")  # type: ignore[arg-type]
+    frame = server.sent[0]
     assert frame.splitlines()[1].split()[:4] == ["Name", "Hostname", "IP", "Address"]
     assert "Type" in frame.splitlines()[1]
     assert "<pending>" in frame
@@ -5058,80 +6706,80 @@ def test_connections_frames_every_socket_for_a_super_user() -> None:
     assert "192.0.2.1" in frame
     assert "telnet" in frame
     assert frame.index("<pending>") < frame.index("Cyd")
+    assert "Country" not in frame.splitlines()[1]
+
+
+def test_connections_adds_a_country_column_when_lookup_is_on() -> None:
+    """Country sits between the IP and the connection type."""
+    when = datetime.now(timezone.utc)
+    viewer = FakePlayer(player=Player("Cyd", "reception", when, rank=Rank.SUPER_USER), address="8.8.8.8", hostname="dns.example", country_name="United States", country_code="US")
+    server = FakeServer(people=[viewer], country_lookup=True)
+    process_commands(server, viewer, "connections")  # type: ignore[arg-type]
+    frame = server.sent[0]
+    assert "Country" in frame.splitlines()[1]
+    assert "United States" in frame
+    assert frame.index("8.8.8.8") < frame.index("United States") < frame.index("telnet")
 
 
 def test_conns_is_the_same_list_and_needs_a_space() -> None:
     """Conns lists sockets. connsplease is not the command."""
-    viewer = _Player(player=Player("Cyd", "reception", datetime.now(timezone.utc), rank=RANK_SUPER))
-    listed, _player = _run("conns", viewer)
+    viewer = FakePlayer(player=Player("Cyd", "reception", datetime.now(timezone.utc), rank=Rank.SUPER_USER))
+    listed, _ = run("conns", viewer)
     assert "Cyd" in listed.sent[0]
-    missing, _player = _run("connsplease", viewer)
+    missing, _ = run("connsplease", viewer)
     assert missing.sent == ["No such command 'connsplease'\n"]
-    extra, _player = _run("connections please", viewer)
+    extra, _ = run("connections please", viewer)
     assert extra.sent == ["Syntax: connections\n"]
-    alias_extra, _player = _run("conns please", viewer)
-    assert alias_extra.sent == ["Syntax: connections\n"]
+    alias_extra, _ = run("conns please", viewer)
+    assert alias_extra.sent == ["Syntax: conns\n"]
 
 
 def test_a_resident_cannot_use_connections() -> None:
     """Residents are told the words are not commands."""
-    resident = _Player(
-        player=Player("Ada", "reception", datetime.now(timezone.utc), rank=RANK_RESIDENT)
-    )
-    refused, _player = _run("connections", resident)
+    resident = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    refused, _ = run("connections", resident)
     assert refused.sent == ["No such command 'connections'\n"]
-    alias, _player = _run("conns", resident)
+    alias, _ = run("conns", resident)
     assert alias.sent == ["No such command 'conns'\n"]
 
 
 def test_a_newbie_has_no_password_to_change(tmp_path: Path) -> None:
     """A newbie is told there is no saved password to change."""
-    host = _login_host(tmp_path)
-    process_commands(host, _newbie("Ada"), "password")  # type: ignore[arg-type]
-    assert host.sent == ["You have no saved password.\n"]
+    server = login_host(tmp_path)
+    process_commands(server, newbie("Ada"), "password")  # type: ignore[arg-type]
+    assert server.sent == ["You have no saved password.\n"]
 
 
 def test_password_syntax_rejects_extra_text(tmp_path: Path) -> None:
     """Password does not take a remainder."""
-    host = _login_host(tmp_path)
-    process_commands(host, _staff("Bea", RANK_RESIDENT), "password extra")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: password\n"]
+    server = login_host(tmp_path)
+    process_commands(server, staff("Bea", Rank.RESIDENT), "password extra")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: password\n"]
 
 
 def test_password_via_process_input_leaves_only_current_prompt(tmp_path: Path) -> None:
     """The live path must not append the play prompt to the current-password line."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    process_input(host, bea, "password")  # type: ignore[arg-type]
-    assert host.sent == ["Current password: "]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    bea = staff("Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    process_input(server, bea, "password")  # type: ignore[arg-type]
+    assert server.sent == ["Current password: "]
     assert bea.auth == "current"
 
 
 def test_saved_player_can_change_password(tmp_path: Path) -> None:
     """A saved resident replaces their password after the three prompts."""
     left = datetime(2024, 6, 1, 12, 0, tzinfo=timezone.utc)
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            logged_out_at=left,
-            ip_address="10.0.0.5",
-            prompt="Go: ",
-            connected_seconds=90,
-        ),
-    )
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    process_commands(host, bea, "password")  # type: ignore[arg-type]
-    assert host.sent == ["Current password: "]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), logged_out_at=left, ip_address="10.0.0.5", prompt="Go: ", connected_seconds=90))  # fmt: skip  # noqa: E501
+    bea = staff("Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    process_commands(server, bea, "password")  # type: ignore[arg-type]
+    assert server.sent == ["Current password: "]
     assert bea.auth == "current"
-    process_input(host, bea, "pw")  # type: ignore[arg-type]
-    process_input(host, bea, "next")  # type: ignore[arg-type]
-    process_input(host, bea, "next")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Password changed.\nWhat? > "
+    process_input(server, bea, "pw")  # type: ignore[arg-type]
+    process_input(server, bea, "next")  # type: ignore[arg-type]
+    process_input(server, bea, "next")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Password changed.\nWhat? > "
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert password_ok("next", saved.password_hash)
@@ -5143,31 +6791,20 @@ def test_saved_player_can_change_password(tmp_path: Path) -> None:
     assert saved.connected_seconds == 90
 
 
-def test_password_change_reseals_with_the_new_password(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_password_change_reseals_with_the_new_password(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A new password still opens the same MFA secret."""
     from lupaxa.chat_server.mfa_seal import open_mfa_secret, seal_mfa_secret
 
     totp_seed = TOTP_TEST_SEED
     sealed = seal_mfa_secret("pw", totp_seed)
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            mfa_secret=sealed,
-            mfa_on=True,
-        ),
-    )
-    host = _login_host(tmp_path)
-    host._mfa_enabled = False
-    bea = _staff("Bea", RANK_RESIDENT)
-    process_commands(host, bea, "password")  # type: ignore[arg-type]
-    process_input(host, bea, "pw")  # type: ignore[arg-type]
-    process_input(host, bea, "next")  # type: ignore[arg-type]
-    process_input(host, bea, "next")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_secret=sealed, mfa_on=True))
+    server = login_host(tmp_path)
+    server.mfa_enabled = False
+    bea = staff("Bea", Rank.RESIDENT)
+    process_commands(server, bea, "password")  # type: ignore[arg-type]
+    process_input(server, bea, "pw")  # type: ignore[arg-type]
+    process_input(server, bea, "next")  # type: ignore[arg-type]
+    process_input(server, bea, "next")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.mfa_secret is not None
@@ -5175,33 +6812,22 @@ def test_password_change_reseals_with_the_new_password(
     assert open_mfa_secret("pw", saved.mfa_secret) is None
 
 
-def test_password_change_reseals_after_mismatch_confirm(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_password_change_reseals_after_mismatch_confirm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A failed confirm still reseals with the new password on retry."""
     from lupaxa.chat_server.mfa_seal import open_mfa_secret, seal_mfa_secret
 
     totp_seed = TOTP_TEST_SEED
     sealed = seal_mfa_secret("pw", totp_seed)
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            mfa_secret=sealed,
-            mfa_on=True,
-        ),
-    )
-    host = _login_host(tmp_path)
-    host._mfa_enabled = False
-    bea = _staff("Bea", RANK_RESIDENT)
-    process_commands(host, bea, "password")  # type: ignore[arg-type]
-    process_input(host, bea, "pw")  # type: ignore[arg-type]
-    process_input(host, bea, "next")  # type: ignore[arg-type]
-    process_input(host, bea, "nope")  # type: ignore[arg-type]
-    process_input(host, bea, "next")  # type: ignore[arg-type]
-    process_input(host, bea, "next")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_secret=sealed, mfa_on=True))
+    server = login_host(tmp_path)
+    server.mfa_enabled = False
+    bea = staff("Bea", Rank.RESIDENT)
+    process_commands(server, bea, "password")  # type: ignore[arg-type]
+    process_input(server, bea, "pw")  # type: ignore[arg-type]
+    process_input(server, bea, "next")  # type: ignore[arg-type]
+    process_input(server, bea, "nope")  # type: ignore[arg-type]
+    process_input(server, bea, "next")  # type: ignore[arg-type]
+    process_input(server, bea, "next")  # type: ignore[arg-type]
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.mfa_secret is not None
@@ -5211,13 +6837,13 @@ def test_password_change_reseals_after_mismatch_confirm(
 
 def test_password_wrong_current_keeps_the_old_hash(tmp_path: Path) -> None:
     """A wrong current password does not drop the player or change the file."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    process_commands(host, bea, "password")  # type: ignore[arg-type]
-    process_input(host, bea, "no")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Wrong password.\nWhat? > "
-    assert host.dropped is False
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    bea = staff("Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    process_commands(server, bea, "password")  # type: ignore[arg-type]
+    process_input(server, bea, "no")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Wrong password.\nWhat? > "
+    assert server.dropped is False
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert password_ok("pw", saved.password_hash)
@@ -5225,14 +6851,14 @@ def test_password_wrong_current_keeps_the_old_hash(tmp_path: Path) -> None:
 
 def test_password_mismatch_returns_to_set_prompt(tmp_path: Path) -> None:
     """Mismatched new passwords stay on the first new-password prompt."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    process_commands(host, bea, "password")  # type: ignore[arg-type]
-    process_input(host, bea, "pw")  # type: ignore[arg-type]
-    process_input(host, bea, "one")  # type: ignore[arg-type]
-    process_input(host, bea, "two")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Those passwords do not match.\nSet a password: "
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    bea = staff("Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    process_commands(server, bea, "password")  # type: ignore[arg-type]
+    process_input(server, bea, "pw")  # type: ignore[arg-type]
+    process_input(server, bea, "one")  # type: ignore[arg-type]
+    process_input(server, bea, "two")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Those passwords do not match.\nSet a password: "
     assert bea.auth == "renew"
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
@@ -5241,15 +6867,15 @@ def test_password_mismatch_returns_to_set_prompt(tmp_path: Path) -> None:
 
 def test_password_renew_rejects_empty_and_long(tmp_path: Path) -> None:
     """Empty and overlong new passwords keep the old hash."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    process_commands(host, bea, "password")  # type: ignore[arg-type]
-    process_input(host, bea, "pw")  # type: ignore[arg-type]
-    process_input(host, bea, "")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Password cannot be empty.\nSet a password: "
-    process_input(host, bea, "x" * 73)  # type: ignore[arg-type]
-    assert host.sent[-1] == "Password is too long.\nSet a password: "
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    bea = staff("Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    process_commands(server, bea, "password")  # type: ignore[arg-type]
+    process_input(server, bea, "pw")  # type: ignore[arg-type]
+    process_input(server, bea, "")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Password cannot be empty.\nSet a password: "
+    process_input(server, bea, "x" * 73)  # type: ignore[arg-type]
+    assert server.sent[-1] == "Password is too long.\nSet a password: "
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert password_ok("pw", saved.password_hash)
@@ -5257,12 +6883,12 @@ def test_password_renew_rejects_empty_and_long(tmp_path: Path) -> None:
 
 def test_password_without_confirm_keeps_the_old_hash(tmp_path: Path) -> None:
     """Stopping after the first new password leaves the file unchanged."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    bea = _staff("Bea", RANK_RESIDENT)
-    host = _login_host(tmp_path)
-    process_commands(host, bea, "password")  # type: ignore[arg-type]
-    process_input(host, bea, "pw")  # type: ignore[arg-type]
-    process_input(host, bea, "next")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    bea = staff("Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    process_commands(server, bea, "password")  # type: ignore[arg-type]
+    process_input(server, bea, "pw")  # type: ignore[arg-type]
+    process_input(server, bea, "next")  # type: ignore[arg-type]
     assert bea.auth == "renew_confirm"
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
@@ -5270,28 +6896,29 @@ def test_password_without_confirm_keeps_the_old_hash(tmp_path: Path) -> None:
 
 
 def test_admin_commands_are_coloured_and_say_is_plain() -> None:
-    """Super-user names are cyan, admin names are red, and say stays plain."""
-    from lupaxa.chat_server.colour import cyan, red
+    """Super-user names are cyan, admin names are red, coder names are magenta, and say stays plain."""
+    from lupaxa.chat_server.colour import cyan, magenta, red
 
-    boss = _staff("admin", RANK_ADMIN)
-    host, _player = _run("commands", boss)
-    text = host.sent[0]
+    boss = staff("admin", Rank.SUPER_ADMIN)
+    server, _ = run("commands", boss)
+    text = server.sent[0]
     assert cyan("lsn") in text
     assert cyan("conns") in text
-    assert red("shutdown") in text
+    assert red("allow") in text
+    assert magenta("shutdown") in text
     assert cyan("say") not in text
-    assert red("network") in text
+    assert magenta("network") in text
     assert "say" in text.split()
 
 
 def test_commands_without_colour_have_no_codes() -> None:
     """Colour off leaves the command list as plain words."""
-    boss = _staff("admin", RANK_ADMIN)
+    boss = staff("admin", Rank.CODER)
     assert boss.player is not None
     boss.player.colour = False
-    host, _player = _run("commands", boss)
-    assert "\x1b" not in host.sent[0]
-    assert "shutdown" in host.sent[0]
+    server, _ = run("commands", boss)
+    assert "\x1b" not in server.sent[0]
+    assert "shutdown" in server.sent[0]
 
 
 def test_examine_ranks_use_the_viewers_colour() -> None:
@@ -5299,138 +6926,119 @@ def test_examine_ranks_use_the_viewers_colour() -> None:
     from lupaxa.chat_server.colour import cyan, green, red
 
     when = datetime.now(timezone.utc)
-    newbie = _Player(player=Player("Bea", "hall", when))
-    host = _Host(people=[newbie])
-    process_commands(host, newbie, "examine me")  # type: ignore[arg-type]
-    assert green("Newbie") in host.sent[0]
-    assert "User Rank" in host.sent[0]
-    assert host.sent[0].split("User Rank")[1].startswith("      : ")
+    newbie = FakePlayer(player=Player("Bea", "hall", when))
+    server = FakeServer(people=[newbie])
+    process_commands(server, newbie, "examine me")  # type: ignore[arg-type]
+    assert green("Newbie") in server.sent[0]
+    assert "User Rank" in server.sent[0]
+    assert server.sent[0].split("User Rank")[1].startswith("      : ")
 
-    resident = _staff("Bea", RANK_RESIDENT)
-    host = _Host(people=[resident])
-    process_commands(host, resident, "examine me")  # type: ignore[arg-type]
-    assert "Resident" in host.sent[0]
-    assert "\x1b" not in host.sent[0]
+    resident = staff("Bea", Rank.RESIDENT)
+    server = FakeServer(people=[resident])
+    process_commands(server, resident, "examine me")  # type: ignore[arg-type]
+    assert "Resident" in server.sent[0]
+    assert "\x1b" not in server.sent[0]
 
-    super_user = _staff("Ada", RANK_SUPER)
-    host = _Host(people=[super_user])
-    process_commands(host, super_user, "examine me")  # type: ignore[arg-type]
-    assert cyan("Super User") in host.sent[0]
+    super_user = staff("Ada", Rank.SUPER_USER)
+    server = FakeServer(people=[super_user])
+    process_commands(server, super_user, "examine me")  # type: ignore[arg-type]
+    assert cyan("Super User") in server.sent[0]
 
-    boss = _staff("admin", RANK_ADMIN)
+    boss = staff("admin", Rank.ADMIN)
     assert boss.player is not None
     boss.player.colour = False
-    host = _Host(people=[super_user, boss])
-    process_commands(host, boss, "examine Ada")  # type: ignore[arg-type]
-    assert "Super User" in host.sent[0]
-    assert cyan("Super User") not in host.sent[0]
+    server = FakeServer(people=[super_user, boss])
+    process_commands(server, boss, "examine Ada")  # type: ignore[arg-type]
+    assert "Super User" in server.sent[0]
+    assert cyan("Super User") not in server.sent[0]
 
-    boss = _staff("admin", RANK_ADMIN)
-    host = _Host(people=[boss])
-    process_commands(host, boss, "examine me")  # type: ignore[arg-type]
-    assert red("Admin") in host.sent[0]
+    boss = staff("admin", Rank.ADMIN)
+    server = FakeServer(people=[boss])
+    process_commands(server, boss, "examine me")  # type: ignore[arg-type]
+    assert red("Admin") in server.sent[0]
     assert boss.player is not None
     boss.player.colour = False
-    host.sent.clear()
-    process_commands(host, boss, "examine me")  # type: ignore[arg-type]
-    assert "Admin" in host.sent[0]
-    assert red("Admin") not in host.sent[0]
+    server.sent.clear()
+    process_commands(server, boss, "examine me")  # type: ignore[arg-type]
+    assert "Admin" in server.sent[0]
+    assert red("Admin") not in server.sent[0]
 
 
 def test_logged_out_examine_colours_the_rank(tmp_path: Path) -> None:
     """A logged-out super user is cyan for a viewer whose colour is on."""
     from lupaxa.chat_server.colour import cyan
 
-    save_player(tmp_path, SavedPlayer("Bea", RANK_SUPER, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_SUPER)
-    host.people = [ada]
-    process_commands(host, ada, "examine Bea")  # type: ignore[arg-type]
-    assert cyan("Super User") in host.sent[0]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.SUPER_USER, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [ada]
+    process_commands(server, ada, "examine Bea")  # type: ignore[arg-type]
+    assert cyan("Super User") in server.sent[0]
 
 
 def test_admin_words_include_the_new_commands() -> None:
     """The admin sees every command word."""
-    assert command_words(RANK_ADMIN) == (
-        "! \" ' , . : ; < > ? ` ~ ae alarm allow at au auto_reply broadcast color "
-        "colour commands connections "
-        "conns demote "
-        "description disconnect emote entermsg examine go help join look lsn lsu main map network "
-        "nuke "
-        "password promote prompt quit recap reload remote resident retire save say se shout "
-        "shutdown st staff status su "
-        "tell term_width think time version w warn who x"
-    )
-    assert "main" in command_words(RANK_NEWBIE).split()
-    assert "idle" not in command_words(RANK_NEWBIE).split()
-    assert "password" in command_words(RANK_NEWBIE).split()
-    assert "finger" not in command_words(RANK_NEWBIE).split()
-    assert "f" not in command_words(RANK_NEWBIE).split()
-    assert "lsn" in command_words(RANK_SUPER).split()
-    assert "lsn" not in command_words(RANK_RESIDENT).split()
-    assert "lsn" not in command_words(RANK_NEWBIE).split()
-    assert "connections" in command_words(RANK_SUPER).split()
-    assert "conns" in command_words(RANK_SUPER).split()
-    assert "connections" not in command_words(RANK_RESIDENT).split()
-    assert "conns" not in command_words(RANK_RESIDENT).split()
-    assert "connections" not in command_words(RANK_NEWBIE).split()
-    assert "lsu" in command_words(RANK_NEWBIE).split()
-    assert "lsu" in command_words(RANK_RESIDENT).split()
+    assert command_words(Rank.ADMIN) == ("! \" ' , . : ; < > ? ` ~ ae alarm allow appoint at au chains cls color colour commands connections conns demote disconnect dismiss emote examine go grab help home join l look lsn lsu main map nuke off_duty off_list on_duty on_list password promote pstats quit recap remote resident retire roles rthink save say screenlock se set shout st staff su tell term_width testcard think time version w warn who x")  # fmt: skip  # noqa: E501
+    assert "main" in command_words(Rank.NEWBIE).split()
+    assert "idle" not in command_words(Rank.NEWBIE).split()
+    assert "password" in command_words(Rank.NEWBIE).split()
+    assert "finger" not in command_words(Rank.NEWBIE).split()
+    assert "f" not in command_words(Rank.NEWBIE).split()
+    assert "lsn" in command_words(Rank.SUPER_USER).split()
+    assert "lsn" not in command_words(Rank.RESIDENT).split()
+    assert "lsn" not in command_words(Rank.NEWBIE).split()
+    assert "connections" in command_words(Rank.SUPER_USER).split()
+    assert "conns" in command_words(Rank.SUPER_USER).split()
+    assert "connections" not in command_words(Rank.RESIDENT).split()
+    assert "conns" not in command_words(Rank.RESIDENT).split()
+    assert "connections" not in command_words(Rank.NEWBIE).split()
+    assert "lsu" in command_words(Rank.NEWBIE).split()
+    assert "lsu" in command_words(Rank.RESIDENT).split()
     for word in ("su", "se", "st", "lsn"):
-        assert word not in command_words(RANK_RESIDENT).split()
-        assert word not in command_words(RANK_NEWBIE).split()
+        assert word not in command_words(Rank.RESIDENT).split()
+        assert word not in command_words(Rank.NEWBIE).split()
 
 
-def _seconds_saved(tmp_path: Path, seconds: int) -> None:
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4), connected_seconds=seconds),
-    )
+def seconds_saved(tmp_path: Path, seconds: int) -> None:
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), connected_seconds=seconds))
 
 
-def _saved_seconds(tmp_path: Path) -> int:
+def saved_seconds(tmp_path: Path) -> int:
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     return saved.connected_seconds
 
 
-def _resident_bea(seconds: int, flushed: int) -> Player:
-    return Player(
-        "Bea",
-        "hall",
-        datetime.now(timezone.utc),
-        rank=RANK_RESIDENT,
-        connected_seconds=seconds,
-        flushed_seconds=flushed,
-    )
+def resident_bea(seconds: int, flushed: int) -> Player:
+    return Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT, connected_seconds=seconds, flushed_seconds=flushed)
 
 
 def test_note_connected_time_writes_after_300_more_seconds(tmp_path: Path) -> None:
     """Three hundred seconds ahead of the last write saves the total. Fewer does not."""
-    _seconds_saved(tmp_path, 10)
-    user = _resident_bea(10, 10)
+    seconds_saved(tmp_path, 10)
+    user = resident_bea(10, 10)
     note_connected_time(tmp_path, user, 299)
     assert user.connected_seconds == 309
     assert user.flushed_seconds == 10
-    assert _saved_seconds(tmp_path) == 10
+    assert saved_seconds(tmp_path) == 10
     note_connected_time(tmp_path, user, 1)
     assert user.connected_seconds == 310
     assert user.flushed_seconds == 310
-    assert _saved_seconds(tmp_path) == 310
+    assert saved_seconds(tmp_path) == 310
 
 
 def test_note_connected_time_of_300_writes_310(tmp_path: Path) -> None:
     """A saved resident at 10 seconds who adds 300 has 310 in the file."""
-    _seconds_saved(tmp_path, 10)
-    user = _resident_bea(10, 10)
+    seconds_saved(tmp_path, 10)
+    user = resident_bea(10, 10)
     note_connected_time(tmp_path, user, 300)
-    assert _saved_seconds(tmp_path) == 310
+    assert saved_seconds(tmp_path) == 310
     assert user.flushed_seconds == 310
 
 
 def test_note_connected_time_ignores_nothing_to_add(tmp_path: Path) -> None:
     """Zero seconds changes nothing."""
-    user = _resident_bea(10, 10)
+    user = resident_bea(10, 10)
     note_connected_time(tmp_path, user, 0)
     assert user.connected_seconds == 10
 
@@ -5444,12 +7052,10 @@ def test_note_connected_time_keeps_a_newbie_off_disk(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
-def test_a_failed_write_leaves_flushed_seconds_alone(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
+def test_a_failed_write_leaves_flushed_seconds_alone(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """A bad player file is printed, and the next tick tries again."""
     (tmp_path / "bea.yml").write_text("- not a mapping\n", encoding="utf-8")
-    user = _resident_bea(0, 0)
+    user = resident_bea(0, 0)
     note_connected_time(tmp_path, user, 300)
     assert user.connected_seconds == 300
     assert user.flushed_seconds == 0
@@ -5458,8 +7064,8 @@ def test_a_failed_write_leaves_flushed_seconds_alone(
 
 def test_record_saved_logout_writes_the_time_and_the_total_together(tmp_path: Path) -> None:
     """After 40 seconds the file has connected_seconds 40 and a logout time."""
-    _seconds_saved(tmp_path, 0)
-    user = _resident_bea(40, 0)
+    seconds_saved(tmp_path, 0)
+    user = resident_bea(40, 0)
     record_saved_logout(tmp_path, user)
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
@@ -5474,129 +7080,113 @@ def test_record_saved_logout_skips_a_newbie(tmp_path: Path) -> None:
     assert list(tmp_path.iterdir()) == []
 
 
-def _advance(host: _Host, monkeypatch: pytest.MonkeyPatch, now: float) -> None:
-    host._timer_mark = 0.0  # type: ignore[attr-defined]
-    host._timer_remainder = 0.0  # type: ignore[attr-defined]
+def advance(server: FakeServer, monkeypatch: pytest.MonkeyPatch, now: float) -> None:
+    server.timer_mark = 0.0  # type: ignore[attr-defined]
+    server.timer_remainder = 0.0  # type: ignore[attr-defined]
     monkeypatch.setattr("lupaxa.chat_server.timer.time.monotonic", lambda: now)
-    process_timer(host)  # type: ignore[arg-type]
+    process_timer(server)  # type: ignore[arg-type]
 
 
 def test_allow_changes_the_live_flag_and_not_the_file(tmp_path: Path) -> None:
     """Allow closes newbies in memory and leaves config.yml bytes alone."""
     config_path = tmp_path / "config.yml"
     config_path.write_text("allow_newbies: true\n", encoding="utf-8")
-    host = _Host()
-    ada = _Player()
-    ada.player.rank = RANK_ADMIN
-    host.people = [ada]
+    server = FakeServer()
+    ada = FakePlayer()
+    ada.player.rank = Rank.ADMIN
+    server.people = [ada]
     assert ada.player is not None
     ada.player.colour = False
-    command_allow(host, ada, Command("allow", command_allow, False), "newbies off")
-    assert host._allow_newbies is False
+    allow = Command("allow", command_allow, False, "newbies|residents on|off")
+    command_allow(server, ada, allow, "newbies off")
+    assert server.allow_newbies is False
     assert config_path.read_text(encoding="utf-8") == "allow_newbies: true\n"
-    assert host.staff_lines == ["< SU > Ada closes the talker to newbies.\n"]
+    assert server.staff_lines == ["< SU > Ada closes the talker to newbies.\n"]
 
-    host.staff_lines.clear()
-    host._allow_residents = False
-    command_allow(host, ada, Command("allow", command_allow, False), "residents on")
-    assert host._allow_residents is True
-    assert host.staff_lines == ["< SU > Ada opens the talker to residents.\n"]
+    server.staff_lines.clear()
+    server.allow_residents = False
+    command_allow(server, ada, allow, "residents on")
+    assert server.allow_residents is True
+    assert server.staff_lines == ["< SU > Ada opens the talker to residents.\n"]
 
-    host._allow_newbies = True
-    host._allow_residents = True
+    server.allow_newbies = True
+    server.allow_residents = True
     ada.sent.clear()
-    command_allow(host, ada, Command("allow", command_allow, False), "maybe")
+    command_allow(server, ada, allow, "maybe")
     assert ada.sent == ["Syntax: allow newbies|residents on|off\n"]
-    assert host._allow_newbies is True
-    assert host._allow_residents is True
+    assert server.allow_newbies is True
+    assert server.allow_residents is True
 
-    newbie_host, newbie = _run("allow newbies off", _newbie("Bea"))
-    assert newbie.sent == ["No such command 'allow'\n"]
-    assert newbie_host._allow_newbies is True
+    newbie_host, connected = run("allow newbies off", newbie("Bea"))
+    assert connected.sent == ["No such command 'allow'\n"]
+    assert newbie_host.allow_newbies is True
 
 
 def test_broadcast_is_centered_with_blank_lines() -> None:
     """An admin broadcast is red when colour is on, with a blank line after it."""
     plain = "-=> Broadcast Messages from Ada: hello <=-"
-    ada = _Player(
-        player=Player("Ada", "hall", datetime.now(timezone.utc), rank="admin"),
-        frame_columns=len(plain),
-    )
-    host, _player = _run("broadcast hello", ada)
-    assert host.sent[0] == f"\n\n\n{red(plain)}\n\n\n\n"
-    resident, _player = _run("broadcast hello", _staff("Bea", RANK_RESIDENT))
+    ada = FakePlayer(player=Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.CODER), frame_columns=len(plain))
+    server, _ = run("broadcast hello", ada)
+    assert server.sent[0] == f"\n\n\n{red(plain)}\n\n\n\n"
+    resident, _ = run("broadcast hello", staff("Bea", Rank.RESIDENT))
     assert resident.sent == ["No such command 'broadcast'\n"]
-    empty, _player = _run("broadcast", ada)
+    empty, _ = run("broadcast", ada)
     assert empty.sent == ["Syntax: broadcast <message>\n"]
-    ada_off = _Player(
-        player=Player(
-            "Ada",
-            "hall",
-            datetime.now(timezone.utc),
-            rank="admin",
-            colour=False,
-        ),
-        frame_columns=len(plain),
-    )
-    host_off, _player = _run("broadcast hello", ada_off)
+    ada_off = FakePlayer(player=Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.CODER, colour=False), frame_columns=len(plain))
+    host_off, _ = run("broadcast hello", ada_off)
     assert host_off.sent[0] == f"\n\n\n{plain}\n\n\n\n"
-    ada_wide = _Player(
-        player=Player("Ada", "hall", datetime.now(timezone.utc), rank="admin"),
-        frame_columns=len(plain) + 4,
-    )
-    host_wide, _player = _run("broadcast hello", ada_wide)
+    ada_wide = FakePlayer(player=Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.CODER), frame_columns=len(plain) + 4)
+    host_wide, _ = run("broadcast hello", ada_wide)
     assert host_wide.sent[0] == f"\n\n\n  {red(plain)}\n\n\n\n"
 
 
-def test_shutdown_speaks_the_opening_line_and_the_marks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_shutdown_speaks_the_opening_line_and_the_marks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """90 seconds opens in seconds, then 1 minute, then the pair, then stop."""
-    host = _login_host(tmp_path)
-    host._clients = {}  # type: ignore[attr-defined]
-    admin = _staff("Ada", RANK_ADMIN)
-    process_commands(host, admin, "shutdown 90 restart")  # type: ignore[arg-type]
-    assert host.all_lines == ["Shutting down in 90 seconds for 'restart'\n"]
-    assert host.stopped is False
+    server = login_host(tmp_path)
+    server.clients = {}  # type: ignore[attr-defined]
+    admin = staff("Ada", Rank.CODER)
+    process_commands(server, admin, "shutdown 90 restart")  # type: ignore[arg-type]
+    assert server.all_lines == ["Shutting down in 90 seconds for 'restart'\n"]
+    assert server.stopped is False
     now = {"t": 0.0}
-    host._timer_mark = 0.0
-    host._timer_remainder = 0.0
+    server.timer_mark = 0.0
+    server.timer_remainder = 0.0
     monkeypatch.setattr("lupaxa.chat_server.timer.time.monotonic", lambda: now["t"])
     now["t"] = 30.0
-    host.all_lines.clear()
-    process_timer(host)  # type: ignore[arg-type]
-    assert host.all_lines == ["Shutting down in 1 minute for 'restart'\n"]
+    server.all_lines.clear()
+    process_timer(server)  # type: ignore[arg-type]
+    assert server.all_lines == ["Shutting down in 1 minute for 'restart'\n"]
     now["t"] = 89.0
-    host.all_lines.clear()
-    process_timer(host)  # type: ignore[arg-type]
-    assert host.all_lines == [
+    server.all_lines.clear()
+    process_timer(server)  # type: ignore[arg-type]
+    assert server.all_lines == [
         "Shutting down in 1 second for 'restart'\n",
         "Shutting down now!\n",
     ]
-    assert host.stopped is False
+    assert server.stopped is False
     now["t"] = 90.0
-    host.all_lines.clear()
-    process_timer(host)  # type: ignore[arg-type]
-    assert host.all_lines == []
-    assert host.stopped is True
+    server.all_lines.clear()
+    process_timer(server)  # type: ignore[arg-type]
+    assert server.all_lines == []
+    assert server.stopped is True
 
 
 def test_shutdown_5_says_each_second_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The opening 5 is not repeated, and 4, 3, and 2 are said once."""
-    host = _login_host(tmp_path)
-    host._clients = {}  # type: ignore[attr-defined]
-    process_commands(host, _staff("Ada", RANK_ADMIN), "shutdown 5 restart")  # type: ignore[arg-type]
-    assert host.all_lines == ["Shutting down in 5 seconds for 'restart'\n"]
+    server = login_host(tmp_path)
+    server.clients = {}  # type: ignore[attr-defined]
+    process_commands(server, staff("Ada", Rank.CODER), "shutdown 5 restart")  # type: ignore[arg-type]
+    assert server.all_lines == ["Shutting down in 5 seconds for 'restart'\n"]
     now = {"t": 0.0}
-    host._timer_mark = 0.0
-    host._timer_remainder = 0.0
+    server.timer_mark = 0.0
+    server.timer_remainder = 0.0
     monkeypatch.setattr("lupaxa.chat_server.timer.time.monotonic", lambda: now["t"])
     heard: list[str] = []
     for second in range(1, 5):
         now["t"] = float(second)
-        host.all_lines.clear()
-        process_timer(host)  # type: ignore[arg-type]
-        heard.extend(host.all_lines)
+        server.all_lines.clear()
+        process_timer(server)  # type: ignore[arg-type]
+        heard.extend(server.all_lines)
     assert heard == [
         "Shutting down in 4 seconds for 'restart'\n",
         "Shutting down in 3 seconds for 'restart'\n",
@@ -5604,471 +7194,1040 @@ def test_shutdown_5_says_each_second_once(tmp_path: Path, monkeypatch: pytest.Mo
         "Shutting down in 1 second for 'restart'\n",
         "Shutting down now!\n",
     ]
-    assert host.stopped is False
+    assert server.stopped is False
 
 
-def test_a_jump_to_zero_still_says_the_pair(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_jump_to_zero_still_says_the_pair(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Skipped marks stay unsaid. Passing 1 still says the pair, then stops."""
-    host = _login_host(tmp_path)
-    host._clients = {}  # type: ignore[attr-defined]
-    process_commands(host, _staff("Ada", RANK_ADMIN), "shutdown 6 restart")  # type: ignore[arg-type]
-    host._timer_mark = 0.0
-    host._timer_remainder = 0.0
+    server = login_host(tmp_path)
+    server.clients = {}  # type: ignore[attr-defined]
+    process_commands(server, staff("Ada", Rank.CODER), "shutdown 6 restart")  # type: ignore[arg-type]
+    server.timer_mark = 0.0
+    server.timer_remainder = 0.0
     monkeypatch.setattr("lupaxa.chat_server.timer.time.monotonic", lambda: 6.0)
-    host.all_lines.clear()
-    process_timer(host)  # type: ignore[arg-type]
-    assert host.all_lines == [
+    server.all_lines.clear()
+    process_timer(server)  # type: ignore[arg-type]
+    assert server.all_lines == [
         "Shutting down in 1 second for 'restart'\n",
         "Shutting down now!\n",
     ]
-    assert host.stopped is True
+    assert server.stopped is True
 
 
 def test_shutdown_now_stops_without_the_pair(tmp_path: Path) -> None:
     """Now speaks one line and stops, and it replaces a running countdown."""
-    host = _login_host(tmp_path)
-    process_commands(host, _staff("Ada", RANK_ADMIN), "shutdown 600 restart")  # type: ignore[arg-type]
-    host.all_lines.clear()
-    process_commands(host, _staff("Ada", RANK_ADMIN), "shutdown now maintenance")  # type: ignore[arg-type]
-    assert host.all_lines == ["Shutting down now for 'maintenance'.\n"]
-    assert host.stopped is True
-    assert host._shutdown_seconds is None
+    server = login_host(tmp_path)
+    process_commands(server, staff("Ada", Rank.CODER), "shutdown 600 restart")  # type: ignore[arg-type]
+    server.all_lines.clear()
+    process_commands(server, staff("Ada", Rank.CODER), "shutdown now maintenance")  # type: ignore[arg-type]
+    assert server.all_lines == ["Shutting down now for 'maintenance'.\n"]
+    assert server.stopped is True
+    assert server.shutdown_seconds is None
 
 
-def test_shutdown_now_skips_login_timeout_for_a_pending_login(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_shutdown_now_skips_login_timeout_for_a_pending_login(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """An overdue login is not told Login timed out after shutdown now."""
-    host = _login_host(tmp_path)
-    waiting = _Player(
-        name=None,
-        room=None,
-        player=None,
-        auth="set",
-        pending_name="Bea",
-        accepted_at=1_000.0,
-    )
-    host.people = [waiting]
-    host._clients = {"s": waiting}  # type: ignore[attr-defined]
-    admin = _staff("Ada", RANK_ADMIN)
-    process_commands(host, admin, "shutdown now restart")  # type: ignore[arg-type]
-    assert host.all_lines == ["Shutting down now for 'restart'.\n"]
-    assert host.stopped is True
-    host.sent.clear()
-    _advance(host, monkeypatch, 2_000.0)
-    assert "Login timed out.\n" not in host.sent
-    assert waiting not in host.dropped_clients
+    server = login_host(tmp_path)
+    waiting = FakePlayer(name=None, room=None, player=None, auth="set", pending_name="Bea", accepted_at=1_000.0)
+    server.people = [waiting]
+    server.clients = {"s": waiting}  # type: ignore[attr-defined]
+    admin = staff("Ada", Rank.CODER)
+    process_commands(server, admin, "shutdown now restart")  # type: ignore[arg-type]
+    assert server.all_lines == ["Shutting down now for 'restart'.\n"]
+    assert server.stopped is True
+    server.sent.clear()
+    advance(server, monkeypatch, 2_000.0)
+    assert "Login timed out.\n" not in server.sent
+    assert waiting not in server.dropped_clients
 
 
 def test_shutdown_cancel_clears_the_countdown(tmp_path: Path) -> None:
     """Cancel tells the rooms, and a second cancel tells only the admin."""
-    host = _login_host(tmp_path)
-    admin = _staff("Ada", RANK_ADMIN)
-    process_commands(host, admin, "shutdown 600 restart")  # type: ignore[arg-type]
-    host.all_lines.clear()
-    host.sent.clear()
-    process_commands(host, admin, "shutdown cancel maintenance finished")  # type: ignore[arg-type]
-    assert host.all_lines == ["Shutdown cancelled for 'maintenance finished'.\n"]
-    assert host.stopped is False
-    assert host._shutdown_seconds is None
-    host.all_lines.clear()
-    host.sent.clear()
-    process_commands(host, admin, "shutdown cancel again")  # type: ignore[arg-type]
-    assert host.all_lines == []
-    assert host.sent == ["No shutdown is running.\n"]
+    server = login_host(tmp_path)
+    admin = staff("Ada", Rank.CODER)
+    process_commands(server, admin, "shutdown 600 restart")  # type: ignore[arg-type]
+    server.all_lines.clear()
+    server.sent.clear()
+    process_commands(server, admin, "shutdown cancel maintenance finished")  # type: ignore[arg-type]
+    assert server.all_lines == ["Shutdown cancelled for 'maintenance finished'.\n"]
+    assert server.stopped is False
+    assert server.shutdown_seconds is None
+    server.all_lines.clear()
+    server.sent.clear()
+    process_commands(server, admin, "shutdown cancel again")  # type: ignore[arg-type]
+    assert server.all_lines == []
+    assert server.sent == ["No shutdown is running.\n"]
 
 
 def test_a_second_shutdown_replaces_the_first(tmp_path: Path) -> None:
     """One countdown exists. The new time is spoken at once."""
-    host = _login_host(tmp_path)
-    admin = _staff("Ada", RANK_ADMIN)
-    process_commands(host, admin, "shutdown 600 restart")  # type: ignore[arg-type]
-    host.all_lines.clear()
-    process_commands(host, admin, "shutdown 30 maintenance")  # type: ignore[arg-type]
-    assert host._shutdown_seconds == 30
-    assert host._shutdown_reason == "maintenance"
-    assert host.all_lines == ["Shutting down in 30 seconds for 'maintenance'\n"]
-    assert host.stopped is False
+    server = login_host(tmp_path)
+    admin = staff("Ada", Rank.CODER)
+    process_commands(server, admin, "shutdown 600 restart")  # type: ignore[arg-type]
+    server.all_lines.clear()
+    process_commands(server, admin, "shutdown 30 maintenance")  # type: ignore[arg-type]
+    assert server.shutdown_seconds == 30
+    assert server.shutdown_reason == "maintenance"
+    assert server.all_lines == ["Shutting down in 30 seconds for 'maintenance'\n"]
+    assert server.stopped is False
 
 
 def test_shutdown_1_says_the_pair_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Opening at 1 second says the pair, and the next second only stops."""
-    host = _login_host(tmp_path)
-    host._clients = {}  # type: ignore[attr-defined]
-    process_commands(host, _staff("Ada", RANK_ADMIN), "shutdown 1 restart")  # type: ignore[arg-type]
-    assert host.all_lines == [
+    server = login_host(tmp_path)
+    server.clients = {}  # type: ignore[attr-defined]
+    process_commands(server, staff("Ada", Rank.CODER), "shutdown 1 restart")  # type: ignore[arg-type]
+    assert server.all_lines == [
         "Shutting down in 1 second for 'restart'\n",
         "Shutting down now!\n",
     ]
-    assert host.stopped is False
-    host._timer_mark = 0.0
-    host._timer_remainder = 0.0
+    assert server.stopped is False
+    server.timer_mark = 0.0
+    server.timer_remainder = 0.0
     monkeypatch.setattr("lupaxa.chat_server.timer.time.monotonic", lambda: 1.0)
-    host.all_lines.clear()
-    process_timer(host)  # type: ignore[arg-type]
-    assert host.all_lines == []
-    assert host.stopped is True
+    server.all_lines.clear()
+    process_timer(server)  # type: ignore[arg-type]
+    assert server.all_lines == []
+    assert server.stopped is True
 
 
 def test_shutdown_rejects_a_bad_count_and_hides_from_a_super_user(tmp_path: Path) -> None:
     """Below 1 is syntax. A super user is told the command does not exist."""
-    host = _login_host(tmp_path)
-    process_commands(host, _staff("Ada", RANK_ADMIN), "shutdown 0 restart")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: shutdown <seconds> <reason>\n"]
-    assert host._shutdown_seconds is None
-    host.sent.clear()
-    process_commands(host, _staff("Ada", RANK_SUPER), "shutdown 10 restart")  # type: ignore[arg-type]
-    assert host.sent == ["No such command 'shutdown'\n"]
-    assert "shutdown" not in command_words(RANK_SUPER).split()
-    assert "shutdown" in command_words(RANK_ADMIN).split()
+    server = login_host(tmp_path)
+    process_commands(server, staff("Ada", Rank.CODER), "shutdown 0 restart")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: shutdown <seconds> <reason>\n"]
+    assert server.shutdown_seconds is None
+    server.sent.clear()
+    process_commands(server, staff("Ada", Rank.SUPER_USER), "shutdown 10 restart")  # type: ignore[arg-type]
+    assert server.sent == ["No such command 'shutdown'\n"]
+    assert "shutdown" not in command_words(Rank.SUPER_USER).split()
+    assert "shutdown" not in command_words(Rank.ADMIN).split()
+    assert "shutdown" in command_words(Rank.CODER).split()
 
 
 def test_shutdown_rejects_a_unicode_digit_count(tmp_path: Path) -> None:
     """A superscript digit is not a count, and it does not start a countdown."""
-    host = _login_host(tmp_path)
-    process_commands(host, _staff("Ada", RANK_ADMIN), "shutdown ² restart")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: shutdown <seconds> <reason>\n"]
-    assert host.stopped is False
-    assert host._shutdown_seconds is None
+    server = login_host(tmp_path)
+    process_commands(server, staff("Ada", Rank.CODER), "shutdown ² restart")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: shutdown <seconds> <reason>\n"]
+    assert server.stopped is False
+    assert server.shutdown_seconds is None
+
+
+def test_a_site_admin_resident_can_run_shutdown(tmp_path: Path) -> None:
+    """The site-admin role runs shutdown. Resident rank alone does not."""
+    server = login_host(tmp_path)
+    plain = staff("Ada", Rank.RESIDENT)
+    process_commands(server, plain, "shutdown now restart")  # type: ignore[arg-type]
+    assert server.sent[-1] == "No such command 'shutdown'\n"
+    assert server.stopped is False
+    resident = staff("Bea", Rank.RESIDENT)
+    assert resident.player is not None
+    resident.player.roles = int(Roles.SITE_ADMIN)
+    process_commands(server, resident, "shutdown now restart")  # type: ignore[arg-type]
+    assert server.stopped is True
 
 
 def test_reload_help_replaces_the_book(tmp_path: Path) -> None:
     """reload help installs the file and tells the admin."""  # noqa: D403
     path = tmp_path / "help.yml"
     path.write_text("- name: say\n  aliases: []\n  text: Hello.\n", encoding="utf-8")
-    host = _Host()
-    host._config = replace(host._config, help=path)
-    host._help_failed = HelpStamp(1, 2)
-    ada = _staff("Ada", RANK_ADMIN)
+    server = FakeServer()
+    server.config = replace(server.config, help=path)
+    server.help_failed = HelpStamp(1, 2)
+    ada = staff("Ada", Rank.CODER)
     assert ada.player is not None
     ada.player.colour = False
-    host.people = [ada]
-    process_commands(host, ada, "reload help")  # type: ignore[arg-type]
-    loaded = host._help.find("say")
+    server.people = [ada]
+    process_commands(server, ada, "reload help")  # type: ignore[arg-type]
+    loaded = server.help.find("say")
     assert loaded is not None
     assert loaded.text == "Hello."
-    assert host.sent == ["Help reloaded.\n"]
-    assert host.admin_lines == []
-    assert host._help_stamp == help_stamp(path)
-    assert host._help_failed is None
+    assert server.sent == ["Help reloaded.\n"]
+    assert server.admin_lines == []
+    assert server.help_stamp == help_stamp(path)
+    assert server.help_failed is None
 
 
 def test_reload_help_keeps_the_book_when_the_file_is_not_utf8(tmp_path: Path) -> None:
     """A non-UTF-8 file leaves the old book and tells the admin once."""
     path = tmp_path / "help.yml"
-    path.write_text(_GOOD_HELP, encoding="utf-8")
-    host = _Host()
-    host._config = replace(host._config, help=path)
-    host._help = load_help(path)
-    previous = host._help
-    ada = _staff("Ada", RANK_ADMIN)
+    path.write_text(GOOD_HELP, encoding="utf-8")
+    server = FakeServer()
+    server.config = replace(server.config, help=path)
+    server.help = load_help(path)
+    previous = server.help
+    ada = staff("Ada", Rank.CODER)
     assert ada.player is not None
     ada.player.colour = False
-    host.people = [ada]
-    path.write_bytes(_INVALID_UTF8_HELP)
-    process_commands(host, ada, "reload help")  # type: ignore[arg-type]
-    assert host._help is previous
-    assert len(host.sent) == 1
-    assert host.sent[0].startswith("Cannot reload help: Help file ")
-    assert "is not valid UTF-8:" in host.sent[0]
-    assert host.admin_lines == []
-    assert host._help_failed == help_stamp(path)
+    server.people = [ada]
+    path.write_bytes(INVALID_UTF8_HELP)
+    process_commands(server, ada, "reload help")  # type: ignore[arg-type]
+    assert server.help is previous
+    assert len(server.sent) == 1
+    assert server.sent[0].startswith("Cannot reload help: Help file ")
+    assert "is not valid UTF-8:" in server.sent[0]
+    assert server.admin_lines == []
+    assert server.help_failed == help_stamp(path)
 
 
 def test_reload_help_keeps_the_book_when_the_file_is_bad(tmp_path: Path) -> None:
     """A bad file leaves the old book and tells the admin the load error."""
     path = tmp_path / "help.yml"
     path.write_text("- name: say\n  aliases: []\n", encoding="utf-8")
-    host = _Host()
-    host._config = replace(host._config, help=path)
-    previous = host._help
-    ada = _staff("Ada", RANK_ADMIN)
+    server = FakeServer()
+    server.config = replace(server.config, help=path)
+    previous = server.help
+    ada = staff("Ada", Rank.CODER)
     assert ada.player is not None
     ada.player.colour = False
-    host.people = [ada]
-    process_commands(host, ada, "reload help")  # type: ignore[arg-type]
-    assert host._help is previous
-    assert host.sent == ["Cannot reload help: Help entry say is missing text.\n"]
-    assert host.admin_lines == []
-    assert host._help_failed == help_stamp(path)
+    server.people = [ada]
+    process_commands(server, ada, "reload help")  # type: ignore[arg-type]
+    assert server.help is previous
+    assert server.sent == ["Cannot reload help: Help entry say is missing text.\n"]
+    assert server.admin_lines == []
+    assert server.help_failed == help_stamp(path)
 
 
 def test_reload_help_reads_the_file_when_the_stamp_matches(tmp_path: Path) -> None:
     """reload help reads the file even when the stamp already matches."""  # noqa: D403
     path = tmp_path / "help.yml"
     path.write_text("- name: say\n  aliases: []\n  text: Hello.\n", encoding="utf-8")
-    host = _Host()
-    host._config = replace(host._config, help=path)
-    host._help_stamp = help_stamp(path)
-    ada = _staff("Ada", RANK_ADMIN)
-    host.people = [ada]
-    process_commands(host, ada, "reload help")  # type: ignore[arg-type]
-    loaded = host._help.find("say")
+    server = FakeServer()
+    server.config = replace(server.config, help=path)
+    server.help_stamp = help_stamp(path)
+    ada = staff("Ada", Rank.CODER)
+    server.people = [ada]
+    process_commands(server, ada, "reload help")  # type: ignore[arg-type]
+    loaded = server.help.find("say")
     assert loaded is not None
     assert loaded.text == "Hello."
 
 
+def test_reload_rooms_keeps_a_bad_file(tmp_path: Path) -> None:
+    """A bad system file keeps the office and does not move anyone."""
+    server = FakeServer()
+    path = tmp_path / "system.yml"
+    path.write_text("reception:\n  description: Hi.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    server.config = replace(server.config, rooms=path, start="reception")
+    server.layout = load_layout(path).with_void()
+    server.rooms_stamp = help_stamp(path)
+    server.rooms_failed = None
+    server.house_stamps = {}
+    server.house_failed = {}
+    ada = staff("Ada", Rank.CODER)
+    server.people = [ada]
+    path.write_text(":\n", encoding="utf-8")
+    process_commands(server, ada, "reload rooms")  # type: ignore[arg-type]
+    assert ada.room == "reception"
+    assert server.sent[-1].startswith("Cannot reload rooms: ")
+
+
+def test_reload_rooms_moves_a_removed_room_to_the_void(tmp_path: Path) -> None:
+    """A player whose room was removed is told and moved to The Void."""
+    server = FakeServer()
+    path = tmp_path / "system.yml"
+    path.write_text("reception:\n  description: Hi.\n  max_occupancy: 2\n  exits:\n    n: kitchen\nkitchen:\n  description: Mugs.\n  max_occupancy: 2\n  exits:\n    s: reception\n", encoding="utf-8")
+    server.config = replace(server.config, rooms=path, start="reception")
+    server.layout = load_layout(path).with_void()
+    server.rooms_stamp = help_stamp(path)
+    server.rooms_failed = None
+    server.house_stamps = {}
+    server.house_failed = {}
+    ada = staff("Ada", Rank.CODER)
+    ada.room = "kitchen"
+    assert ada.player is not None
+    ada.player.room = "kitchen"
+    server.people = [ada]
+    path.write_text("reception:\n  description: Hi.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    process_commands(server, ada, "reload rooms")  # type: ignore[arg-type]
+    assert ada.room == "void"
+    assert "The room you were in has gone.\n" in server.sent
+    assert "Rooms reloaded.\n" in server.sent
+
+
+def test_reload_rooms_refuses_to_drop_the_start_room(tmp_path: Path) -> None:
+    """Removing the start room keeps the old office."""
+    server = FakeServer()
+    path = tmp_path / "system.yml"
+    path.write_text("reception:\n  description: Hi.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    server.config = replace(server.config, rooms=path, start="reception")
+    server.layout = load_layout(path).with_void()
+    server.rooms_stamp = help_stamp(path)
+    server.rooms_failed = None
+    server.house_stamps = {}
+    server.house_failed = {}
+    ada = staff("Ada", Rank.CODER)
+    server.people = [ada]
+    path.write_text("kitchen:\n  description: Mugs.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    process_commands(server, ada, "reload rooms")  # type: ignore[arg-type]
+    assert ada.room == "reception"
+    assert "reception" in server.layout.rooms
+    assert server.sent[-1].startswith("Cannot reload rooms: Start room reception is not in ")
+
+
+def test_reload_rooms_refuses_to_drop_newbie_start(tmp_path: Path) -> None:
+    """Removing the newbie start room keeps the old office."""
+    server = FakeServer()
+    path = tmp_path / "system.yml"
+    path.write_text("reception:\n  description: Hi.\n  max_occupancy: 2\n  exits: {}\nwaiting_room:\n  description: Chairs.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    server.config = replace(server.config, rooms=path, start="reception", newbie_start="waiting_room")
+    server.layout = load_layout(path).with_void()
+    server.rooms_stamp = help_stamp(path)
+    server.rooms_failed = None
+    server.house_stamps = {}
+    server.house_failed = {}
+    ada = staff("Ada", Rank.CODER)
+    server.people = [ada]
+    path.write_text("reception:\n  description: Hi.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    process_commands(server, ada, "reload rooms")  # type: ignore[arg-type]
+    assert "waiting_room" in server.layout.rooms
+    assert server.sent[-1].startswith("Cannot reload rooms: Newbie start room waiting_room is not in ")
+
+
+def test_reload_rooms_reports_the_start_room_when_newbie_start_matches(tmp_path: Path) -> None:
+    """When newbie_start matches start, reload still reports the start-room error."""
+    server = FakeServer()
+    path = tmp_path / "system.yml"
+    path.write_text("reception:\n  description: Hi.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    server.config = replace(server.config, rooms=path, start="reception", newbie_start="reception")
+    server.layout = load_layout(path).with_void()
+    server.rooms_stamp = help_stamp(path)
+    server.rooms_failed = None
+    server.house_stamps = {}
+    server.house_failed = {}
+    ada = staff("Ada", Rank.CODER)
+    server.people = [ada]
+    path.write_text("kitchen:\n  description: Mugs.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    process_commands(server, ada, "reload rooms")  # type: ignore[arg-type]
+    assert ada.room == "reception"
+    assert "reception" in server.layout.rooms
+    assert server.sent[-1].startswith("Cannot reload rooms: Start room reception is not in ")
+
+
+def test_reload_rooms_keeps_a_bad_house_and_updates_the_office(tmp_path: Path) -> None:
+    """A bad house file stays, and the office still reloads."""
+    server = FakeServer()
+    system = tmp_path / "system.yml"
+    system.write_text("reception:\n  description: Old.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    house = tmp_path / "ada.yml"
+    house.write_text("ada_home:\n  description: You are home.\n  max_occupancy: 1\n  exits: {}\n", encoding="utf-8")
+    server.config = replace(server.config, rooms=system, start="reception")
+    server.layout = load_layout(system).with_void().with_house("Ada", load_house(house, "Ada", {"reception"}))
+    server.rooms_stamp = help_stamp(system)
+    server.rooms_failed = None
+    server.house_stamps = {}
+    server.house_failed = {}
+    ada = staff("Ada", Rank.CODER)
+    ada.room = "ada_home"
+    assert ada.player is not None
+    ada.player.room = "ada_home"
+    server.people = [ada]
+    system.write_text("reception:\n  description: New.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    house.write_text(":\n", encoding="utf-8")
+    process_commands(server, ada, "reload rooms")  # type: ignore[arg-type]
+    assert ada.room == "ada_home"
+    assert server.layout.rooms["reception"].description == "New."
+    assert server.layout.rooms["ada_home"].description == "You are home."
+    assert any(line.startswith("Cannot reload ada's rooms: ") for line in server.sent)
+
+
+def test_reload_rooms_matches_any_case(tmp_path: Path) -> None:
+    """Reload ROOMS reloads rooms, and an unknown word keeps the typed case."""
+    server = FakeServer()
+    path = tmp_path / "system.yml"
+    path.write_text("reception:\n  description: Hi.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    server.config = replace(server.config, rooms=path, start="reception")
+    server.layout = load_layout(path).with_void()
+    server.rooms_stamp = help_stamp(path)
+    server.rooms_failed = None
+    server.house_stamps = {}
+    server.house_failed = {}
+    ada = staff("Ada", Rank.CODER)
+    server.people = [ada]
+    process_commands(server, ada, "reload ROOMS")  # type: ignore[arg-type]
+    assert server.sent == ["Rooms reloaded.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "reload Banners")  # type: ignore[arg-type]
+    assert server.sent == ["No such subcommand 'Banners'.\n"]
+
+
+def test_a_bad_rooms_file_is_announced_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A bad system file announces once for that stamp."""
+    server, _path = help_host(tmp_path, GOOD_HELP)
+    rooms = tmp_path / "system.yml"
+    rooms.write_text("reception:\n  description: Hi.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    server.config = replace(server.config, rooms=rooms, start="reception")
+    server.layout = load_layout(rooms).with_void()
+    server.rooms_stamp = help_stamp(rooms)
+    server.rooms_failed = None
+    server.house_stamps = {}
+    server.house_failed = {}
+    rooms.write_text(":\n", encoding="utf-8")
+    advance(server, monkeypatch, 300)
+    assert len(server.coder_lines) == 1
+    assert server.coder_lines[0].startswith("{ Coder } Cannot reload rooms: ")
+    advance(server, monkeypatch, 300)
+    assert len(server.coder_lines) == 1
+
+
 def test_reload_of_an_unknown_type_does_not_read_the_file(tmp_path: Path) -> None:
-    """reload rooms is refused before the help file is opened."""  # noqa: D403
+    """reload banners is refused before the help file is opened."""  # noqa: D403
     path = tmp_path / "help.yml"
     path.write_text("- name: say\n  aliases: []\n  text: Hello.\n", encoding="utf-8")
-    host = _Host()
-    host._config = replace(host._config, help=path)
-    previous = host._help
-    ada = _staff("Ada", RANK_ADMIN)
-    host.people = [ada]
-    process_commands(host, ada, "reload rooms")  # type: ignore[arg-type]
-    assert host._help is previous
-    assert host.sent == ["reload for rooms not found\n"]
+    server = FakeServer()
+    server.config = replace(server.config, help=path)
+    previous = server.help
+    ada = staff("Ada", Rank.CODER)
+    server.people = [ada]
+    process_commands(server, ada, "reload banners")  # type: ignore[arg-type]
+    assert server.help is previous
+    assert server.sent == ["No such subcommand 'banners'.\n"]
 
 
 def test_bare_reload_replies_with_the_syntax() -> None:
     """reload with no type uses the normal syntax reply."""  # noqa: D403
-    ada = _staff("Ada", RANK_ADMIN)
-    host = _Host(people=[ada])
-    process_commands(host, ada, "reload")  # type: ignore[arg-type]
-    assert host.sent == ["Syntax: reload <type>\n"]
+    ada = staff("Ada", Rank.CODER)
+    server = FakeServer(people=[ada])
+    process_commands(server, ada, "reload")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: reload <command>\n"]
+
+
+def write_hot(directory: Path, text: str) -> Path:
+    """Write hot.yml and return its path."""
+    path = directory / "hot.yml"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def reload_host(tmp_path: Path) -> FakeServer:
+    """Return an admin server with a rooms file, a help file, and the three message files."""
+    server, _help_path = help_host(tmp_path, GOOD_HELP)
+    rooms = tmp_path / "system.yml"
+    rooms.write_text("reception:\n  description: Hi.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    hot = write_hot(tmp_path, "start: reception\nmax_connections: 128\nmax_newbies: 20\nallow_newbies: true\nallow_residents: true\n")
+    server.config = replace(server.config, rooms=rooms, start="reception", newbie_start="reception", hot_path=hot, max_connections=128, max_newbies=20)
+    server.hot_stamp = help_stamp(hot)
+    server.hot_failed = None
+    server.layout = load_layout(rooms).with_void()
+    server.rooms_stamp = help_stamp(rooms)
+    write_messages(server.config.messages_path)
+    return server
+
+
+def test_reload_messages_tells_the_admin(tmp_path: Path) -> None:
+    """Reload messages replaces the three strings and says they reloaded."""
+    server = reload_host(tmp_path)
+    server.banner = "Old banner\n"
+    ada = server.people[0]
+    process_commands(server, ada, "reload messages")  # type: ignore[arg-type]
+    assert server.banner == "Banner\n"
+    assert server.full_message == "Full\n"
+    assert server.newbie_message == "Newbie\n"
+    assert server.sent == ["Messages reloaded.\n"]
+
+
+def test_reload_messages_reports_only_the_bad_file(tmp_path: Path) -> None:
+    """A bad banner leaves the old banner and does not add a success line."""
+    server = reload_host(tmp_path)
+    server.banner = "Old banner\n"
+    server.full_message = "Old full\n"
+    ada = server.people[0]
+    (tmp_path / "files" / "banner.msg").write_bytes(b"caf\xe9\n")
+    (tmp_path / "files" / "full.msg").write_text("Newer full\n", encoding="utf-8")
+    process_commands(server, ada, "reload MESSAGES")  # type: ignore[arg-type]
+    assert server.banner == "Old banner\n"
+    assert server.full_message == "Newer full\n"
+    assert server.newbie_message == "Newbie\n"
+    assert len(server.sent) == 1
+    assert server.sent[0].startswith("Cannot reload banner: ")
+    assert "Messages reloaded." not in server.sent[0]
+
+
+def test_reload_help_please_does_not_read_the_file(tmp_path: Path) -> None:
+    """An extra word is syntax and leaves the book alone."""
+    server = reload_host(tmp_path)
+    previous = server.help
+    ada = server.people[0]
+    process_commands(server, ada, "reload help please")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: reload help\n"]
+    assert server.help is previous
+
+
+def test_reload_commands_lists_the_children() -> None:
+    """Reload commands lists the six names in alphabetical order."""
+    ada = staff("Ada", Rank.CODER)
+    assert ada.player is not None
+    ada.player.colour = False
+    ada.frame_columns = 200
+    server, _ada = run("reload commands", ada)
+    words = server.sent[0].split("Subcommands available:\n", 1)[1].split()
+    assert words == ["all", "commands", "config", "help", "messages", "rooms"]
+
+
+def test_reload_all_sends_rooms_then_help_then_messages(tmp_path: Path) -> None:
+    """Reload all sends the rooms line, then help, then messages."""
+    server = reload_host(tmp_path)
+    ada = server.people[0]
+    process_commands(server, ada, "reload all")  # type: ignore[arg-type]
+    assert server.sent == ["Config reloaded.\n", "Rooms reloaded.\n", "Help reloaded.\n", "Messages reloaded.\n"]
+
+
+def test_reload_all_continues_after_a_bad_help_file(tmp_path: Path) -> None:
+    """A bad help file still reloads rooms and messages."""
+    server = reload_host(tmp_path)
+    ada = server.people[0]
+    (tmp_path / "help.yml").write_text(BAD_HELP, encoding="utf-8")
+    process_commands(server, ada, "reload all")  # type: ignore[arg-type]
+    assert server.sent[0] == "Config reloaded.\n"
+    assert server.sent[1] == "Rooms reloaded.\n"
+    assert server.sent[2].startswith("Cannot reload help: ")
+    assert server.sent[3] == "Messages reloaded.\n"
+    assert server.banner == "Banner\n"
+
+
+def test_reload_config_replaces_the_cap_and_the_gates(tmp_path: Path) -> None:
+    """A good hot file replaces the newbie cap and the live gates."""
+    server = reload_host(tmp_path)
+    ada = server.people[0]
+    server.allow_newbies = False
+    write_hot(tmp_path, "start: reception\nmax_connections: 128\nmax_newbies: 4\nallow_newbies: true\nallow_residents: false\n")
+    process_commands(server, ada, "reload config")  # type: ignore[arg-type]
+    assert server.sent == ["Config reloaded.\n"]
+    assert server.config.max_newbies == 4
+    assert server.allow_newbies is True
+    assert server.allow_residents is False
+    assert server.config.allow_residents is False
+
+
+def test_a_bad_hot_file_keeps_the_old_cap(tmp_path: Path) -> None:
+    """A bad hot file leaves the running cap."""
+    server = reload_host(tmp_path)
+    ada = server.people[0]
+    write_hot(tmp_path, "start: reception\nmax_connections: 128\nmax_newbies: no\n")
+    process_commands(server, ada, "reload config")  # type: ignore[arg-type]
+    assert server.sent[0].startswith("Cannot reload config: ")
+    assert server.config.max_newbies == 20
+    assert "Config reloaded." not in "".join(server.sent)
+
+
+def test_a_cold_key_in_the_hot_file_does_not_change_the_cap(tmp_path: Path) -> None:
+    """Port in the hot file fails the reload and leaves the cap."""
+    server = reload_host(tmp_path)
+    ada = server.people[0]
+    write_hot(tmp_path, "port: 8000\nstart: reception\nmax_connections: 128\nmax_newbies: 4\n")
+    process_commands(server, ada, "reload config")  # type: ignore[arg-type]
+    assert server.sent == ["Cannot reload config: port belongs in the cold config.\n"]
+    assert server.config.max_newbies == 20
+    assert server.config.port == 1
+
+
+def test_a_missing_start_room_fails_the_reload(tmp_path: Path) -> None:
+    """A start room that is not loaded fails and leaves the old start."""
+    server = reload_host(tmp_path)
+    ada = server.people[0]
+    write_hot(tmp_path, "start: attic\nmax_connections: 128\nmax_newbies: 20\n")
+    process_commands(server, ada, "reload config")  # type: ignore[arg-type]
+    rooms = tmp_path / "system.yml"
+    assert server.sent == [f"Cannot reload config: Start room attic is not in {rooms}.\n"]
+    assert server.config.start == "reception"
+
+
+def test_a_loaded_house_cannot_become_the_start_room(tmp_path: Path) -> None:
+    """A loaded house cannot become the start room."""
+    server = reload_host(tmp_path)
+    ada = server.people[0]
+    server.layout = server.layout.with_house("Ada", {house_room_id("Ada"): Room("You are home.", 1, {})})
+    write_hot(tmp_path, "start: ada_home\nmax_connections: 128\nmax_newbies: 20\n")
+    process_commands(server, ada, "reload config")  # type: ignore[arg-type]
+    rooms = tmp_path / "system.yml"
+    assert server.sent == [f"Cannot reload config: Start room ada_home is not in {rooms}.\n"]
+    assert server.config.start == "reception"
+
+
+def test_reload_config_does_not_read_the_cold_file(tmp_path: Path) -> None:
+    """A broken cold file does not stop a hot reload."""
+    server = reload_host(tmp_path)
+    ada = server.people[0]
+    cold = tmp_path / "cold.yml"
+    cold.write_text(":\n", encoding="utf-8")
+    server.config = replace(server.config, cold_path=cold)
+    write_hot(tmp_path, "start: reception\nmax_connections: 64\nmax_newbies: 20\n")
+    process_commands(server, ada, "reload config")  # type: ignore[arg-type]
+    assert server.sent == ["Config reloaded.\n"]
+    assert server.config.max_connections == 64
+    assert server.config.port == 1
+
+
+def test_an_unreadable_country_database_turns_lookup_off(tmp_path: Path) -> None:
+    """The other hot values apply, and the reply says lookup is off."""
+    server = reload_host(tmp_path)
+    ada = server.people[0]
+    database = tmp_path / "missing.mmdb"
+    write_hot(tmp_path, f"start: reception\nmax_connections: 128\nmax_newbies: 20\ncountry_lookup: true\ncountry_database: {database}\n")
+    process_commands(server, ada, "reload config")  # type: ignore[arg-type]
+    assert server.sent == ["Config reloaded.\n", f"Country lookup is off. Cannot read {database.resolve()}.\n"]
+    assert server.country_lookup is False
+    assert server.config.max_newbies == 20
+
+
+def test_reload_config_closes_the_open_country_database(tmp_path: Path) -> None:
+    """A hot reload closes the reader that was already open."""
+    server = reload_host(tmp_path)
+    ada = server.people[0]
+
+    class Reader:
+        """A stand-in country database."""
+
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            """Record that the reader was closed."""
+            self.closed = True
+
+    reader = Reader()
+    server.country_db = reader
+    write_hot(tmp_path, "start: reception\nmax_connections: 128\nmax_newbies: 20\ncountry_lookup: false\n")
+    process_commands(server, ada, "reload config")  # type: ignore[arg-type]
+    assert reader.closed is True
+    assert server.country_db is None
+
+
+def test_turning_mfa_on_registers_the_command(tmp_path: Path) -> None:
+    """A hot file with mfa_enabled true registers mfa once."""
+    from lupaxa.chat_server.commands import by_name
+    from lupaxa.chat_server.globals import COMMANDS
+
+    server = reload_host(tmp_path)
+    ada = server.people[0]
+    server.mfa_enabled = False
+    added = "mfa" not in by_name()
+    write_hot(tmp_path, "start: reception\nmax_connections: 128\nmax_newbies: 20\nmfa_enabled: true\n")
+    process_commands(server, ada, "reload config")  # type: ignore[arg-type]
+    assert server.mfa_enabled is True
+    assert "mfa" in by_name()
+    count = len(COMMANDS)
+    process_commands(server, ada, "reload config")  # type: ignore[arg-type]
+    assert len(COMMANDS) == count
+    assert server.sent == ["Config reloaded.\n", "Config reloaded.\n"]
+    if added:
+        COMMANDS.remove(by_name().pop("mfa"))
+
+
+def test_reload_all_continues_after_a_bad_hot_file(tmp_path: Path) -> None:
+    """A bad hot file still reloads rooms, help, and messages."""
+    server = reload_host(tmp_path)
+    ada = server.people[0]
+    write_hot(tmp_path, "start: reception\nmax_newbies: 4\n")
+    process_commands(server, ada, "reload all")  # type: ignore[arg-type]
+    assert server.sent[0].startswith("Cannot reload config: ")
+    assert "Rooms reloaded.\n" in server.sent
+    assert "Help reloaded.\n" in server.sent
+    assert "Messages reloaded.\n" in server.sent
+    assert server.sent.index("Rooms reloaded.\n") < server.sent.index("Help reloaded.\n")
+    assert server.config.max_newbies == 20
+
+
+def test_an_off_duty_coder_can_reload(tmp_path: Path) -> None:
+    """A coder command still runs while off duty. An admin is told it does not exist."""
+    server = reload_host(tmp_path)
+    ada = server.people[0]
+    assert ada.player is not None
+    ada.player.off_duty = True
+    process_commands(server, ada, "reload messages")  # type: ignore[arg-type]
+    assert server.sent == ["Messages reloaded.\n"]
+    boss = staff("Bea", Rank.ADMIN)
+    assert boss.player is not None
+    boss.player.off_duty = True
+    refused = FakeServer(people=[boss])
+    process_commands(refused, boss, "reload messages")  # type: ignore[arg-type]
+    assert refused.sent == ["No such command 'reload'\n"]
 
 
 def test_a_super_user_cannot_reload() -> None:
-    """Reload is an admin command, so a super user does not see it."""
-    ada = _staff("Ada", RANK_SUPER)
-    host = _Host(people=[ada])
-    process_commands(host, ada, "reload help")  # type: ignore[arg-type]
-    assert host.sent == ["No such command 'reload'\n"]
+    """Reload is a coder command, so a super user does not see it."""
+    ada = staff("Ada", Rank.SUPER_USER)
+    server = FakeServer(people=[ada])
+    process_commands(server, ada, "reload help")  # type: ignore[arg-type]
+    assert server.sent == ["No such command 'reload'\n"]
 
 
-_GOOD_HELP = "- name: say\n  aliases: []\n  text: Hello.\n"
-_BAD_HELP = "- name: say\n  aliases: []\n"
-_INVALID_UTF8_HELP = b"- name: say\n  aliases: []\n  text: caf\xe9\n"
+GOOD_HELP = "- name: say\n  aliases: []\n  text: Hello.\n"
+BAD_HELP = "- name: say\n  aliases: []\n"
+INVALID_UTF8_HELP = b"- name: say\n  aliases: []\n  text: caf\xe9\n"
 
 
-def _help_host(tmp_path: Path, text: str) -> tuple[_Host, Path]:
-    """Return an admin host whose help file is ``text`` and whose stamp matches it."""
+def help_host(tmp_path: Path, text: str) -> tuple[FakeServer, Path]:
+    """Return an admin server whose help file is ``text`` and whose stamp matches it."""
     path = tmp_path / "help.yml"
     path.write_text(text, encoding="utf-8")
-    host = _Host()
-    host._config = replace(host._config, help=path)
-    host._help_stamp = help_stamp(path)
-    ada = _staff("Ada", RANK_ADMIN)
+    messages = tmp_path / "files"
+    server = FakeServer()
+    server.config = replace(server.config, help=path, config_dir=tmp_path, messages_path=messages)
+    server.help_stamp = help_stamp(path)
+    ada = staff("Ada", Rank.CODER)
     assert ada.player is not None
     ada.player.colour = False
-    host.people = [ada]
-    return host, path
+    server.people = [ada]
+    return server, path
 
 
-def test_help_is_not_checked_before_five_minutes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def write_messages(directory: Path, banner: str = "Banner\n", full: str = "Full\n", newbie: str = "Newbie\n") -> Path:
+    """Write the three message files into the messages directory and return that directory."""
+    directory.mkdir(exist_ok=True)
+    (directory / "banner.msg").write_text(banner, encoding="utf-8")
+    (directory / "full.msg").write_text(full, encoding="utf-8")
+    (directory / "no-more-newbies.msg").write_text(newbie, encoding="utf-8")
+    return directory
+
+
+def test_reload_messages_reads_messages_path(tmp_path: Path) -> None:
+    """Reload messages and the stamps read the directory stored on messages_path."""
+    help_path = tmp_path / "docs" / "help.yml"
+    help_path.parent.mkdir(parents=True)
+    help_path.write_text(GOOD_HELP, encoding="utf-8")
+    messages = tmp_path / "messages"
+    server = FakeServer()
+    server.config = replace(server.config, help=help_path, config_dir=tmp_path, messages_path=messages)
+    write_messages(messages, banner="From messages\n", full="Full\n", newbie="Newbie\n")
+    decoy = tmp_path / "files"
+    decoy.mkdir()
+    (decoy / "banner.msg").write_text("From files\n", encoding="utf-8")
+    (decoy / "full.msg").write_text("Decoy full\n", encoding="utf-8")
+    (decoy / "no-more-newbies.msg").write_text("Decoy newbie\n", encoding="utf-8")
+    server.banner = "Old\n"
+    assert message_file_stamps(messages)["banner"] == help_stamp(messages / "banner.msg")
+    assert reload_messages(server, force=True) == []  # type: ignore[arg-type]
+    assert server.banner == "From messages\n"
+
+
+def test_reload_messages_replaces_the_three_files(tmp_path: Path) -> None:
+    """Reload messages replaces the banner, the full message, and the newbie message."""
+    server, _path = help_host(tmp_path, GOOD_HELP)
+    server.banner = "Old banner\n"
+    server.full_message = "Old full\n"
+    server.newbie_message = "Old newbie\n"
+    write_messages(server.config.messages_path)
+    assert reload_messages(server, force=True) == []  # type: ignore[arg-type]
+    assert server.banner == "Banner\n"
+    assert server.full_message == "Full\n"
+    assert server.newbie_message == "Newbie\n"
+
+
+def test_a_bad_banner_leaves_the_old_banner(tmp_path: Path) -> None:
+    """A banner that is not UTF-8 stays, and the other two files still replace."""
+    server, _path = help_host(tmp_path, GOOD_HELP)
+    server.banner = "Old banner\n"
+    files = write_messages(server.config.messages_path)
+    assert reload_messages(server, force=True) == []  # type: ignore[arg-type]
+    (files / "banner.msg").write_bytes(b"caf\xe9\n")
+    (files / "full.msg").write_text("Newer full\n", encoding="utf-8")
+    (files / "no-more-newbies.msg").write_text("Newer newbie\n", encoding="utf-8")
+    errors = reload_messages(server, force=True)  # type: ignore[arg-type]
+    assert len(errors) == 1
+    assert errors[0].startswith("Cannot reload banner: ")
+    assert "is not valid UTF-8:" in errors[0]
+    assert server.banner == "Banner\n"
+    assert server.full_message == "Newer full\n"
+    assert server.newbie_message == "Newer newbie\n"
+
+
+def test_a_changed_banner_reloads_without_a_message(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A changed banner replaces the text after five minutes, and admins are not told."""
+    server, _path = help_host(tmp_path, GOOD_HELP)
+    files = write_messages(server.config.messages_path, banner="Old banner\n")
+    assert reload_messages(server, force=True) == []  # type: ignore[arg-type]
+    (files / "banner.msg").write_text("New banner\n", encoding="utf-8")
+    advance(server, monkeypatch, 300)
+    assert server.banner == "New banner\n"
+    assert server.admin_lines == []
+
+
+def test_a_bad_banner_is_announced_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A banner that is not UTF-8 keeps the old text and announces that stamp once."""
+    server, _path = help_host(tmp_path, GOOD_HELP)
+    files = write_messages(server.config.messages_path)
+    assert reload_messages(server, force=True) == []  # type: ignore[arg-type]
+    previous = server.banner
+    (files / "banner.msg").write_bytes(b"caf\xe9\n")
+    advance(server, monkeypatch, 300)
+    assert server.banner == previous
+    assert len(server.coder_lines) == 1
+    assert server.coder_lines[0].startswith("{ Coder } Cannot reload banner: ")
+    assert "is not valid UTF-8:" in server.coder_lines[0]
+    advance(server, monkeypatch, 300)
+    assert len(server.coder_lines) == 1
+
+
+def test_startup_records_missing_message_stamps(tmp_path: Path) -> None:
+    """Startup records the missing stamp for a message file that is not there."""
+    help_path = tmp_path / "help.yml"
+    help_path.write_text(GOOD_HELP, encoding="utf-8")
+    rooms = tmp_path / "rooms.yml"
+    rooms.write_text("reception:\n  description: Hi.\n  max_occupancy: 2\n  exits: {}\n", encoding="utf-8")
+    config = replace(FakeServer().config, help=help_path, rooms=rooms, start="reception", players=tmp_path, config_dir=tmp_path, messages_path=tmp_path / "files")
+    server = ChatServer(config, load_layout(rooms).with_void(), load_help(help_path))
+    assert set(server.message_stamps) == {"banner", "full", "no-more-newbies"}
+    assert server.message_stamps["banner"] == HelpStamp(-1, -1)
+    assert server.message_failed == {}
+
+
+def test_help_is_not_checked_before_five_minutes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """299 seconds leaves the book alone."""
-    host, path = _help_host(tmp_path, _GOOD_HELP)
-    previous = host._help
-    path.write_text(_GOOD_HELP.replace("Hello.", "Updated."), encoding="utf-8")
-    _advance(host, monkeypatch, 299)
-    assert host._help is previous
-    assert host.admin_lines == []
+    server, path = help_host(tmp_path, GOOD_HELP)
+    previous = server.help
+    path.write_text(GOOD_HELP.replace("Hello.", "Updated."), encoding="utf-8")
+    advance(server, monkeypatch, 299)
+    assert server.help is previous
+    assert server.admin_lines == []
 
 
-def test_an_unchanged_help_file_is_left_alone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_an_unchanged_help_file_is_left_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """300 seconds with the same stamp does not replace the book."""
-    host, _path = _help_host(tmp_path, _GOOD_HELP)
-    previous = host._help
-    _advance(host, monkeypatch, 300)
-    assert host._help is previous
-    assert host.admin_lines == []
-    assert host._help_check_seconds == 0
+    server, path = help_host(tmp_path, GOOD_HELP)
+    previous = server.help
+    advance(server, monkeypatch, 300)
+    assert server.help is previous
+    assert server.admin_lines == []
+    assert server.help_check_seconds == 0
 
 
-def test_a_changed_help_file_reloads_without_a_message(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_changed_help_file_reloads_without_a_message(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A new good file replaces the book and the admin channel stays quiet."""
-    host, path = _help_host(tmp_path, _GOOD_HELP)
-    path.write_text(_GOOD_HELP.replace("Hello.", "Updated."), encoding="utf-8")
-    _advance(host, monkeypatch, 300)
-    loaded = host._help.find("say")
+    server, path = help_host(tmp_path, GOOD_HELP)
+    path.write_text(GOOD_HELP.replace("Hello.", "Updated."), encoding="utf-8")
+    advance(server, monkeypatch, 300)
+    loaded = server.help.find("say")
     assert loaded is not None
     assert loaded.text == "Updated."
-    assert host.admin_lines == []
+    assert server.admin_lines == []
 
 
-def test_a_non_utf8_help_file_is_announced_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_non_utf8_help_file_is_announced_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A non-UTF-8 file keeps the book and announces that stamp once."""
-    host, path = _help_host(tmp_path, _GOOD_HELP)
-    host._help = load_help(path)
-    previous = host._help
-    path.write_bytes(_INVALID_UTF8_HELP)
-    _advance(host, monkeypatch, 300)
-    assert host._help is previous
-    assert len(host.admin_lines) == 1
-    assert host.admin_lines[0].startswith("[ Admin ] Cannot reload help: Help file ")
-    assert "is not valid UTF-8:" in host.admin_lines[0]
-    _advance(host, monkeypatch, 300)
-    assert len(host.admin_lines) == 1
+    server, path = help_host(tmp_path, GOOD_HELP)
+    server.help = load_help(path)
+    previous = server.help
+    path.write_bytes(INVALID_UTF8_HELP)
+    advance(server, monkeypatch, 300)
+    assert server.help is previous
+    assert len(server.coder_lines) == 1
+    assert server.coder_lines[0].startswith("{ Coder } Cannot reload help: Help file ")
+    assert "is not valid UTF-8:" in server.coder_lines[0]
+    advance(server, monkeypatch, 300)
+    assert len(server.coder_lines) == 1
 
 
 def test_a_bad_change_is_announced_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The same failed stamp does not announce again. 700 seconds checks once."""
-    host, path = _help_host(tmp_path, _GOOD_HELP)
-    previous = host._help
-    path.write_text(_BAD_HELP, encoding="utf-8")
-    _advance(host, monkeypatch, 700)
-    assert host._help is previous
-    assert host._help_check_seconds == 100
-    assert host.admin_lines == ["[ Admin ] Cannot reload help: Help entry say is missing text.\n"]
-    _advance(host, monkeypatch, 300)
-    assert host._help is previous
-    assert len(host.admin_lines) == 1
+    server, path = help_host(tmp_path, GOOD_HELP)
+    previous = server.help
+    path.write_text(BAD_HELP, encoding="utf-8")
+    advance(server, monkeypatch, 700)
+    assert server.help is previous
+    assert server.help_check_seconds == 100
+    assert server.coder_lines == ["{ Coder } Cannot reload help: Help entry say is missing text.\n"]
+    assert server.admin_lines == []
+    advance(server, monkeypatch, 300)
+    assert server.help is previous
+    assert len(server.coder_lines) == 1
 
 
-def test_a_missing_help_file_is_announced_once(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_missing_help_file_is_announced_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Deleting the file keeps the book and announces that version once."""
-    host, path = _help_host(tmp_path, _GOOD_HELP)
-    previous = host._help
+    server, path = help_host(tmp_path, GOOD_HELP)
+    previous = server.help
     path.unlink()
-    _advance(host, monkeypatch, 300)
-    assert host._help is previous
-    assert len(host.admin_lines) == 1
-    assert host.admin_lines[0].startswith("[ Admin ] Cannot reload help: Cannot read help file ")
-    _advance(host, monkeypatch, 300)
-    assert len(host.admin_lines) == 1
+    advance(server, monkeypatch, 300)
+    assert server.help is previous
+    assert len(server.coder_lines) == 1
+    assert server.coder_lines[0].startswith("{ Coder } Cannot reload help: Cannot read help file ")
+    advance(server, monkeypatch, 300)
+    assert len(server.coder_lines) == 1
 
 
-def test_a_fix_after_a_failed_reload_clears_the_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_fix_after_a_failed_reload_clears_the_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A later good file replaces the book and does not send another admin line."""
-    host, path = _help_host(tmp_path, _GOOD_HELP)
-    path.write_text(_BAD_HELP, encoding="utf-8")
-    _advance(host, monkeypatch, 300)
-    path.write_text(_GOOD_HELP.replace("Hello.", "Fixed."), encoding="utf-8")
-    _advance(host, monkeypatch, 300)
-    loaded = host._help.find("say")
+    server, path = help_host(tmp_path, GOOD_HELP)
+    path.write_text(BAD_HELP, encoding="utf-8")
+    advance(server, monkeypatch, 300)
+    path.write_text(GOOD_HELP.replace("Hello.", "Fixed."), encoding="utf-8")
+    advance(server, monkeypatch, 300)
+    loaded = server.help.find("say")
     assert loaded is not None
     assert loaded.text == "Fixed."
-    assert len(host.admin_lines) == 1
+    assert len(server.coder_lines) == 1
 
 
-def test_a_manual_failure_is_not_announced_again_by_the_timer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_manual_failure_is_not_announced_again_by_the_timer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Reload help records the failed stamp, so the timer stays quiet."""
-    host, path = _help_host(tmp_path, _GOOD_HELP)
-    ada = host.people[0]
-    path.write_text(_BAD_HELP, encoding="utf-8")
-    process_commands(host, ada, "reload help")  # type: ignore[arg-type]
-    assert host.admin_lines == []
-    _advance(host, monkeypatch, 300)
-    assert host.admin_lines == []
+    server, path = help_host(tmp_path, GOOD_HELP)
+    ada = server.people[0]
+    path.write_text(BAD_HELP, encoding="utf-8")
+    process_commands(server, ada, "reload help")  # type: ignore[arg-type]
+    assert server.admin_lines == []
+    advance(server, monkeypatch, 300)
+    assert server.admin_lines == []
 
 
-def test_a_later_bad_save_is_announced_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_later_bad_save_is_announced_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A new failed stamp is announced once, after an earlier failure."""
-    host, path = _help_host(tmp_path, _GOOD_HELP)
-    path.write_text(_BAD_HELP, encoding="utf-8")
-    _advance(host, monkeypatch, 300)
+    server, path = help_host(tmp_path, GOOD_HELP)
+    path.write_text(BAD_HELP, encoding="utf-8")
+    advance(server, monkeypatch, 300)
     path.write_text("- name: look\n  aliases: []\n", encoding="utf-8")
-    _advance(host, monkeypatch, 300)
-    assert host.admin_lines == [
-        "[ Admin ] Cannot reload help: Help entry say is missing text.\n",
-        "[ Admin ] Cannot reload help: Help entry look is missing text.\n",
+    advance(server, monkeypatch, 300)
+    assert server.coder_lines == [
+        "{ Coder } Cannot reload help: Help entry say is missing text.\n",
+        "{ Coder } Cannot reload help: Help entry look is missing text.\n",
     ]
 
 
-def test_help_is_not_reloaded_while_the_server_is_stopping(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_an_unchanged_hot_file_is_left_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """300 seconds with the same hot stamp does not replace the cap."""
+    server = reload_host(tmp_path)
+    advance(server, monkeypatch, 300)
+    assert server.config.max_newbies == 20
+    assert server.coder_lines == []
+    assert server.admin_lines == []
+
+
+def test_a_changed_hot_file_reloads_without_a_message(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A new good hot file replaces the cap and stays quiet."""
+    server = reload_host(tmp_path)
+    write_hot(tmp_path, "start: reception\nmax_connections: 128\nmax_newbies: 4\nallow_newbies: false\n")
+    advance(server, monkeypatch, 300)
+    assert server.config.max_newbies == 4
+    assert server.allow_newbies is False
+    assert server.coder_lines == []
+
+
+def test_a_bad_hot_stamp_is_announced_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same broken hot stamp announces once. Saving again tries once more."""
+    server = reload_host(tmp_path)
+    write_hot(tmp_path, "start: reception\nmax_newbies: no\n")
+    advance(server, monkeypatch, 300)
+    assert server.config.max_newbies == 20
+    assert server.coder_lines == ["{ Coder } Cannot reload config: Config is missing max_connections.\n"]
+    assert server.admin_lines == []
+    advance(server, monkeypatch, 300)
+    assert server.coder_lines == ["{ Coder } Cannot reload config: Config is missing max_connections.\n"]
+    write_hot(tmp_path, "start: attic\nmax_connections: 128\nmax_newbies: 20\n")
+    advance(server, monkeypatch, 300)
+    assert len(server.coder_lines) == 2
+    assert server.config.max_newbies == 20
+
+
+def test_a_manual_hot_failure_is_not_announced_again_by_the_timer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reload config records the failed stamp, so the timer stays quiet."""
+    server = reload_host(tmp_path)
+    ada = server.people[0]
+    write_hot(tmp_path, "start: reception\nmax_newbies: no\n")
+    process_commands(server, ada, "reload config")  # type: ignore[arg-type]
+    assert server.coder_lines == []
+    advance(server, monkeypatch, 300)
+    assert server.coder_lines == []
+
+
+def test_a_timer_failure_reaches_coders_and_a_site_admin_below_coder(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A coder who is also a site admin gets one copy. A lower site admin gets the direct line. A locked screen stays quiet."""
+    server = reload_host(tmp_path)
+    ada = server.people[0]
+    assert ada.player is not None
+    ada.player.roles = int(Roles.SITE_ADMIN)
+    ada.player.colour = False
+    bea = staff("Bea", Rank.ADMIN)
+    assert bea.player is not None
+    bea.player.roles = int(Roles.SITE_ADMIN)
+    bea.player.colour = False
+    bea.player.off_duty = True
+    cyd = staff("Cyd", Rank.ADMIN)
+    assert cyd.player is not None
+    cyd.player.colour = False
+    cyd.player.screen_locked = True
+    cyd.player.roles = int(Roles.SITE_ADMIN)
+    dee = staff("Dee", Rank.ADMIN)
+    assert dee.player is not None
+    dee.player.colour = False
+    server.people = [ada, bea, cyd, dee]
+    write_hot(tmp_path, "start: reception\nmax_newbies: no\n")
+    advance(server, monkeypatch, 300)
+    line = "{ Coder } Cannot reload config: Config is missing max_connections.\n"
+    assert server.coder_lines == [line]
+    assert server.admin_lines == []
+    assert ada.sent.count(line) == 1
+    assert bea.sent == [line]
+    assert cyd.sent == []
+    assert dee.sent == []
+
+
+def test_help_is_not_reloaded_while_the_server_is_stopping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A stopping server does not read a changed help file."""
-    host, path = _help_host(tmp_path, _GOOD_HELP)
-    previous = host._help
-    path.write_text(_GOOD_HELP.replace("Hello.", "Updated."), encoding="utf-8")
-    host.stopped = True
-    _advance(host, monkeypatch, 300)
-    assert host._help is previous
+    server, path = help_host(tmp_path, GOOD_HELP)
+    previous = server.help
+    path.write_text(GOOD_HELP.replace("Hello.", "Updated."), encoding="utf-8")
+    server.stopped = True
+    advance(server, monkeypatch, 300)
+    assert server.help is previous
 
 
-def test_a_login_that_never_enters_is_timed_out(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_login_that_never_enters_is_timed_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Three minutes from accept, a connection with no room is told and dropped."""
-    host = _login_host(tmp_path)
-    waiting = _Player(
-        name=None,
-        room=None,
-        player=None,
-        auth="set",
-        pending_name="Bea",
-        accepted_at=1_000.0,
-    )
-    host.people = [waiting]
-    host._clients = {"s": waiting}  # type: ignore[attr-defined]
-    _advance(host, monkeypatch, 1_000.0 + 179)
-    assert waiting not in host.dropped_clients
-    assert host.sent == []
-    _advance(host, monkeypatch, 1_000.0 + 180)
-    assert host.sent == ["Login timed out.\n"]
-    assert waiting in host.dropped_clients
-    assert "bea" not in host._unsaved_names()
+    server = login_host(tmp_path)
+    waiting = FakePlayer(name=None, room=None, player=None, auth="set", pending_name="Bea", accepted_at=1_000.0)
+    server.people = [waiting]
+    server.clients = {"s": waiting}  # type: ignore[attr-defined]
+    advance(server, monkeypatch, 1_000.0 + 179)
+    assert waiting not in server.dropped_clients
+    assert server.sent == []
+    advance(server, monkeypatch, 1_000.0 + 180)
+    assert server.sent == ["Login timed out.\n"]
+    assert waiting in server.dropped_clients
+    assert "bea" not in server.unsaved_names()
 
 
-def test_a_player_in_a_room_is_not_login_timed_out(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_player_in_a_room_is_not_login_timed_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A player who already has a room is not dropped by the login limit."""
-    host = _login_host(tmp_path)
-    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_RESIDENT)
-    bea = _Player(player=user, accepted_at=0.0)
-    host._clients = {"b": bea}  # type: ignore[attr-defined]
-    _advance(host, monkeypatch, 10_000.0)
-    assert bea not in host.dropped_clients
-    assert host.sent == []
+    server = login_host(tmp_path)
+    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    bea = FakePlayer(player=user, accepted_at=0.0)
+    server.clients = {"b": bea}  # type: ignore[attr-defined]
+    advance(server, monkeypatch, 10_000.0)
+    assert bea not in server.dropped_clients
+    assert server.sent == []
 
 
-def test_process_timer_adds_the_seconds_to_the_total(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_process_timer_adds_the_seconds_to_the_total(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Each whole second applied to idle is also added to the connected total."""
-    host = _login_host(tmp_path)
-    host._timer_mark = 10.0  # type: ignore[attr-defined]
-    host._timer_remainder = 0.0  # type: ignore[attr-defined]
-    host._clients = {}  # type: ignore[attr-defined]
+    server = login_host(tmp_path)
+    server.timer_mark = 10.0  # type: ignore[attr-defined]
+    server.timer_remainder = 0.0  # type: ignore[attr-defined]
+    server.clients = {}  # type: ignore[attr-defined]
     user = Player("Ada", "hall", datetime.now(timezone.utc))
-    host._clients["a"] = _Player(player=user)  # type: ignore[attr-defined]
+    server.clients["a"] = FakePlayer(player=user)  # type: ignore[attr-defined]
     monkeypatch.setattr("lupaxa.chat_server.timer.time.monotonic", lambda: 13.0)
-    process_timer(host)  # type: ignore[arg-type]
+    process_timer(server)  # type: ignore[arg-type]
     assert user.idle_seconds == 3
     assert user.connected_seconds == 3
 
 
 def test_login_loads_colour_off(tmp_path: Path) -> None:
     """A saved player starts from the colour stored in the file."""
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4), colour=False),
-    )
-    host = _login_host(tmp_path)
-    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_RESIDENT)
-    entry_api._load_profile(host, user)  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), colour=False))
+    server = login_host(tmp_path)
+    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    entry_api.load_profile(server, user)  # type: ignore[arg-type]
     assert user.colour is False
 
 
 def test_entry_loads_the_saved_total(tmp_path: Path) -> None:
     """A saved player enters with the total from the file, already flushed."""
-    _seconds_saved(tmp_path, 7200)
-    host = _login_host(tmp_path)
-    bea = _Player(player=None)
-    process_input(host, bea, "Bea")  # type: ignore[arg-type]
-    process_input(host, bea, "pw")  # type: ignore[arg-type]
+    seconds_saved(tmp_path, 7200)
+    server = login_host(tmp_path)
+    bea = FakePlayer(player=None)
+    process_input(server, bea, "Bea")  # type: ignore[arg-type]
+    process_input(server, bea, "pw")  # type: ignore[arg-type]
     assert bea.player is not None
     assert bea.player.connected_seconds == 7200
     assert bea.player.flushed_seconds == 7200
@@ -6076,10 +8235,10 @@ def test_entry_loads_the_saved_total(tmp_path: Path) -> None:
 
 def test_a_newbie_enters_with_no_total(tmp_path: Path) -> None:
     """A name with no file starts the total at zero."""
-    host = _login_host(tmp_path)
-    ada = _Player(player=None)
-    process_input(host, ada, "Ada")  # type: ignore[arg-type]
-    process_input(host, ada, "yes")  # type: ignore[arg-type]
+    server = login_host(tmp_path)
+    ada = FakePlayer(player=None)
+    process_input(server, ada, "Ada")  # type: ignore[arg-type]
+    process_input(server, ada, "yes")  # type: ignore[arg-type]
     assert ada.player is not None
     assert ada.player.connected_seconds == 0
     assert ada.player.flushed_seconds == 0
@@ -6087,38 +8246,38 @@ def test_a_newbie_enters_with_no_total(tmp_path: Path) -> None:
 
 def test_a_new_resident_is_saved_with_the_total_so_far(tmp_path: Path) -> None:
     """Promotion stores the seconds already counted and marks them flushed."""
-    bea = _newbie("Bea")
+    bea = newbie("Bea")
     assert bea.player is not None
     bea.player.connected_seconds = 120
-    ada = _staff("Ada", RANK_SUPER)
-    host = _login_host(tmp_path)
-    host.people = [bea, ada]
-    process_commands(host, ada, "resident Bea")  # type: ignore[arg-type]
-    process_input(host, bea, "hunter2")  # type: ignore[arg-type]
-    process_input(host, bea, "hunter2")  # type: ignore[arg-type]
-    assert _saved_seconds(tmp_path) == 120
+    ada = staff("Ada", Rank.SUPER_USER)
+    server = login_host(tmp_path)
+    server.people = [bea, ada]
+    process_commands(server, ada, "resident Bea")  # type: ignore[arg-type]
+    process_input(server, bea, "hunter2")  # type: ignore[arg-type]
+    process_input(server, bea, "hunter2")  # type: ignore[arg-type]
+    assert saved_seconds(tmp_path) == 120
     assert bea.player.flushed_seconds == 120
 
 
 def test_a_newbie_cannot_set_entermsg() -> None:
     """The command does not exist below resident."""
-    host, _player = _run("entermsg crawls into the room")
-    assert host.sent == ["No such command 'entermsg'\n"]
+    server, _ = run("set entermsg crawls into the room")
+    assert server.sent == ["No such command 'set'\n"]
 
 
 def test_a_resident_sets_and_clears_entermsg(tmp_path: Path) -> None:
     """The sentence is saved, and a bare command removes it."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_RESIDENT)
-    process_commands(host, bea, "entermsg crawls into the room")  # type: ignore[arg-type]
-    assert host.sent[-1] == "Enter message set.\n"
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    process_commands(server, bea, "set entermsg crawls into the room")  # type: ignore[arg-type]
+    assert server.sent[-1] == "Enter message set.\n"
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.entermsg == "crawls into the room"
-    host.sent.clear()
-    process_commands(host, bea, "entermsg")  # type: ignore[arg-type]
-    assert "Enter message cleared.\n" in host.sent[-1]
+    server.sent.clear()
+    process_commands(server, bea, "set entermsg")  # type: ignore[arg-type]
+    assert "Enter message cleared.\n" in server.sent[-1]
     cleared = load_saved(player_path(tmp_path, "Bea"))
     assert cleared is not None
     assert cleared.entermsg is None
@@ -6126,17 +8285,17 @@ def test_a_resident_sets_and_clears_entermsg(tmp_path: Path) -> None:
 
 def test_entermsg_rejects_more_than_80_characters(tmp_path: Path) -> None:
     """A long sentence is refused and the file stays unchanged."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_RESIDENT)
-    process_commands(host, bea, "entermsg " + ("x" * 81))  # type: ignore[arg-type]
-    assert "An enter message is at most 80 characters.\n" in "".join(host.sent)
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    process_commands(server, bea, "set entermsg " + ("x" * 81))  # type: ignore[arg-type]
+    assert "An enter message is at most 80 characters.\n" in "".join(server.sent)
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     assert saved.entermsg is None
 
 
-def _entermsg_of(tmp_path: Path) -> str | None:
+def entermsg_of(tmp_path: Path) -> str | None:
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     return saved.entermsg
@@ -6144,69 +8303,196 @@ def _entermsg_of(tmp_path: Path) -> str | None:
 
 def test_the_default_entermsg_stores_no_key(tmp_path: Path) -> None:
     """Choosing the usual line removes a saved enter message."""
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            entermsg="crawls into the room",
-        ),
-    )
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_RESIDENT)
-    process_commands(host, bea, "entermsg arrives.")  # type: ignore[arg-type]
-    assert _entermsg_of(tmp_path) is None
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), entermsg="crawls into the room"))
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    process_commands(server, bea, "set entermsg arrives.")  # type: ignore[arg-type]
+    assert entermsg_of(tmp_path) is None
     assert "entermsg" not in (tmp_path / "bea.yml").read_text(encoding="utf-8")
     assert bea.player is not None
     assert bea.player.entermsg == "arrives."
-    assert host.sent == ["Enter message set.\n"]
+    assert server.sent == ["Enter message set.\n"]
 
 
 def test_save_after_default_entermsg_stores_no_key(tmp_path: Path) -> None:
     """Save keeps the default enter message out of the player file."""
-    save_player(
-        tmp_path,
-        SavedPlayer(
-            "Bea",
-            RANK_RESIDENT,
-            hash_password("pw", rounds=4),
-            entermsg="crawls into the room",
-        ),
-    )
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_RESIDENT)
-    process_commands(host, bea, "entermsg arrives.")  # type: ignore[arg-type]
-    host.sent.clear()
-    process_commands(host, bea, "save")  # type: ignore[arg-type]
-    assert _entermsg_of(tmp_path) is None
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), entermsg="crawls into the room"))
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    process_commands(server, bea, "set entermsg arrives.")  # type: ignore[arg-type]
+    server.sent.clear()
+    process_commands(server, bea, "save")  # type: ignore[arg-type]
+    assert entermsg_of(tmp_path) is None
     assert "entermsg" not in (tmp_path / "bea.yml").read_text(encoding="utf-8")
+
+
+def test_a_resident_sets_loginmsg_and_logoutmsg(tmp_path: Path) -> None:
+    """Login and logout sentences are saved, and the defaults omit the keys."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    process_commands(server, bea, "set loginmsg wanders in")  # type: ignore[arg-type]
+    process_commands(server, bea, "set logoutmsg slips away")  # type: ignore[arg-type]
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.loginmsg == "wanders in"
+    assert saved.logoutmsg == "slips away"
+    assert bea.player is not None
+    assert bea.player.loginmsg == "wanders in"
+    assert bea.player.logoutmsg == "slips away"
+    server.sent.clear()
+    process_commands(server, bea, "set loginmsg")  # type: ignore[arg-type]
+    process_commands(server, bea, "set logoutmsg")  # type: ignore[arg-type]
+    cleared = load_saved(player_path(tmp_path, "Bea"))
+    assert cleared is not None
+    assert cleared.loginmsg is None
+    assert cleared.logoutmsg is None
+    assert "Login message cleared.\n" in server.sent
+    assert "Logout message cleared.\n" in server.sent
+
+
+def test_a_custom_loginmsg_is_the_room_line(tmp_path: Path) -> None:
+    """The room hears the saved login sentence. Staff are not told."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), loginmsg="wanders in"))
+    server = login_host(tmp_path)
+    watcher = staff("Ada", Rank.SUPER_USER)
+    server.people = [watcher]
+    newcomer = FakePlayer(player=None, address="10.0.0.5")
+    process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
+    process_input(server, newcomer, "pw")  # type: ignore[arg-type]
+    assert "Bea wanders in.\n" in server.room_lines
+    assert server.staff_lines == []
+
+
+def test_a_newbie_who_reaches_a_room_alerts_staff(tmp_path: Path) -> None:
+    """Staff hear the name, then the room the newbie entered."""
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [ada]
+    bea = FakePlayer(player=None, name=None, hostname="bea.example")
+    process_input(server, bea, "Bea")  # type: ignore[arg-type]
+    assert any("AWOOGA AWOOGA!!" in line and "Bea is connecting from bea.example" in line for line in server.staff_lines)
+    process_input(server, bea, "yes")  # type: ignore[arg-type]
+    assert bea.player is not None
+    assert bea.player.rank == Rank.NEWBIE
+    assert any("[ Newbie Alert ] Bea is in Reception." in line for line in server.staff_lines)
+    assert all("< SU >" not in line for line in server.staff_lines)
+
+
+def test_a_newbie_lands_in_newbie_start(tmp_path: Path) -> None:
+    """A newbie enters the configured newbie room and staff hear its name."""
+    server = login_host(tmp_path)
+    server.layout = Layout(rooms={"reception": Room("The desk.", 4, {}), "waiting_room": Room("A row of chairs.", 4, {}),})  # fmt: skip  # noqa: E501
+    server.config = replace(server.config, newbie_start="waiting_room")
+    ada = staff("Ada", Rank.SUPER_USER)
+    bea = FakePlayer(player=None, name=None)
+    server.people = [ada, bea]
+    process_input(server, bea, "Bea")  # type: ignore[arg-type]
+    process_input(server, bea, "yes")  # type: ignore[arg-type]
+    assert bea.player is not None
+    assert bea.player.room == "waiting_room"
+    assert any("[ Newbie Alert ] Bea is in Waiting Room." in line for line in server.staff_lines)
+
+
+def test_a_full_newbie_room_drops_the_connection(tmp_path: Path) -> None:
+    """A capped newbie room still uses the existing full line."""
+    server = login_host(tmp_path)
+    server.config = replace(server.config, newbie_start="waiting_room")
+    server.layout = Layout(rooms={"reception": Room("The desk.", 4, {}), "waiting_room": Room("A row of chairs.", 1, {}),})  # fmt: skip  # noqa: E501
+    server.occupied = 1
+    ada = staff("Ada", Rank.SUPER_USER)
+    bea = FakePlayer(player=None, name=None)
+    server.people = [ada, bea]
+    process_input(server, bea, "Bea")  # type: ignore[arg-type]
+    process_input(server, bea, "yes")  # type: ignore[arg-type]
+    assert "Waiting Room is full.\n" in bea.sent
+    assert bea in server.dropped_clients
+    assert bea.player is None
+    assert all("is in Waiting Room" not in line for line in server.staff_lines)
+
+
+def test_no_at_the_disclaimer_tells_staff(tmp_path: Path) -> None:
+    """No at the disclaimer drops the newbie and tells staff."""
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
+    server.people = [ada]
+    bea = FakePlayer(player=None, name=None)
+    process_input(server, bea, "Bea")  # type: ignore[arg-type]
+    process_input(server, bea, "no")  # type: ignore[arg-type]
+    assert bea in server.dropped_clients
+    assert bea.player is None
+    assert any("[ Newbie Alert ] Bea quit at the disclaimer" in line for line in server.staff_lines)
+
+
+def test_a_plan_sits_under_the_sentences_online_and_offline(tmp_path: Path) -> None:
+    """Plan is saved like a description and sits under the sentences either way."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), plan="Out for lunch"))
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    process_commands(server, bea, "set plan Back later")  # type: ignore[arg-type]
+    assert server.sent == ["Plan set.\n"]
+    assert bea.player is not None
+    assert bea.player.plan == "Back later"
+    saved = load_saved(player_path(tmp_path, "Bea"))
+    assert saved is not None
+    assert saved.plan == "Back later"
+    ada = staff("Ada", Rank.RESIDENT)
+    server.people = [bea, ada]
+    server.sent.clear()
+    process_commands(server, ada, "examine Bea")  # type: ignore[arg-type]
+    lines = server.sent[0].splitlines()
+    plan_index = next(i for i, line in enumerate(lines) if line.startswith("  Back later"))
+    message_index = next(i for i, line in enumerate(lines) if "Logout message" in line)
+    assert lines[plan_index - 1] == lines[0]
+    assert lines[plan_index + 1] == lines[0]
+    assert plan_index > message_index
+    server.sent.clear()
+    process_commands(server, bea, "set plan")  # type: ignore[arg-type]
+    assert server.sent == ["Plan cleared.\n"]
+    server.sent.clear()
+    process_commands(server, bea, f"set plan {'x' * 81}")  # type: ignore[arg-type]
+    assert server.sent == ["A plan is at most 80 characters.\n"]
+    left = datetime.now(timezone.utc) - timedelta(hours=1)
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), logged_out_at=left, plan="Out for lunch", description="Hello"))
+    server = login_host(tmp_path)
+    process_commands(server, viewer(Rank.RESIDENT), "examine Bea")  # type: ignore[arg-type]
+    lines = server.sent[0].splitlines()
+    assert "  Hello" not in server.sent[0]
+    plan_index = next(i for i, line in enumerate(lines) if line.startswith("  Out for lunch"))
+    message_index = next(i for i, line in enumerate(lines) if "Logout message" in line)
+    assert lines[plan_index - 1] == lines[0]
+    assert lines[plan_index + 1] == lines[0]
+    assert plan_index > message_index
+    assert "plan" not in command_words(Rank.NEWBIE).split()
+    assert "plan" not in subcommand_words(by_name()["set"], Rank.NEWBIE).split()
+    assert "plan" in subcommand_words(by_name()["set"], Rank.RESIDENT).split()
 
 
 def test_a_newbie_cannot_set_a_prompt() -> None:
     """A newbie is told prompt does not exist, and help hides it."""
     when = datetime.now(timezone.utc)
-    newbie = _Player(player=Player("Ada", "reception", when, rank=RANK_NEWBIE))
-    host, _player = _run("prompt Go:", newbie)
-    assert host.sent == ["No such command 'prompt'\n"]
+    newbie = FakePlayer(player=Player("Ada", "reception", when, rank=Rank.NEWBIE))
+    server, _ = run("set prompt Go:", newbie)
+    assert server.sent == ["No such command 'set'\n"]
     assert newbie.player is not None
     assert newbie.player.prompt == "What? > "
 
-    book = HelpBook(entries=(HelpEntry("say", (), "Speak."), HelpEntry("prompt", (), "Set it.")))
-    helped = _Host(_help=book)
-    process_commands(helped, newbie, "help prompt")  # type: ignore[arg-type]
-    assert helped.sent == ["help for prompt not found\n"]
-    listed = _Host(_help=book)
+    book = HelpBook(entries=(HelpEntry("say", (), "Speak."), HelpEntry("set prompt", (), "Set it.")))
+    helped = FakeServer(help=book)
+    process_commands(helped, newbie, "help set prompt")  # type: ignore[arg-type]
+    assert helped.sent == ["help for set prompt not found\n"]
+    listed = FakeServer(help=book)
     process_commands(listed, newbie, "help")  # type: ignore[arg-type]
     assert listed.sent == ["Syntax: help <topic>\n"]
 
-    assert "prompt" not in command_words(RANK_NEWBIE).split()
-    assert "prompt" in command_words(RANK_RESIDENT).split()
-    assert command_words(RANK_SUPER).split().count("prompt") == 1
-    assert command_words(RANK_ADMIN).split().count("prompt") == 1
+    assert "prompt" not in command_words(Rank.NEWBIE).split()
+    set_children = subcommand_words(by_name()["set"], Rank.RESIDENT).split()
+    assert "prompt" in set_children
+    assert subcommand_words(by_name()["set"], Rank.SUPER_USER).split().count("prompt") == 1
+    assert subcommand_words(by_name()["set"], Rank.ADMIN).split().count("prompt") == 1
 
 
-def _prompt_of(tmp_path: Path) -> str | None:
+def prompt_of(tmp_path: Path) -> str | None:
     saved = load_saved(player_path(tmp_path, "Bea"))
     assert saved is not None
     return saved.prompt
@@ -6214,82 +8500,76 @@ def _prompt_of(tmp_path: Path) -> str | None:
 
 def test_a_resident_prompt_is_saved_and_loaded_at_login(tmp_path: Path) -> None:
     """The file keeps ``Go: `` and the next login of that player types at it."""
-    _seconds_saved(tmp_path, 0)
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_RESIDENT)
-    process_commands(host, bea, "prompt Go:")  # type: ignore[arg-type]
-    assert host.sent == ["Prompt set.\n"]
-    assert _prompt_of(tmp_path) == "Go: "
+    seconds_saved(tmp_path, 0)
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    process_commands(server, bea, "set prompt Go:")  # type: ignore[arg-type]
+    assert server.sent == ["Prompt set.\n"]
+    assert prompt_of(tmp_path) == "Go: "
 
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4), prompt="Go: "),
-    )
-    login_host = _login_host(tmp_path)
-    again = _Player(player=None)
-    process_input(login_host, again, "Bea")  # type: ignore[arg-type]
-    process_input(login_host, again, "pw")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), prompt="Go: "))
+    server = login_host(tmp_path)
+    again = FakePlayer(player=None)
+    process_input(server, again, "Bea")  # type: ignore[arg-type]
+    process_input(server, again, "pw")  # type: ignore[arg-type]
     assert again.player is not None
     assert again.player.prompt == "Go: "
-    assert login_host.sent[-1] == "Go: "
+    assert server.sent[-1] == "Go: "
 
 
 def test_a_file_without_a_prompt_keeps_the_default(tmp_path: Path) -> None:
     """No prompt key leaves ``What? > `` on the new session."""
-    _seconds_saved(tmp_path, 0)
-    host = _login_host(tmp_path)
-    bea = _Player(player=None)
-    process_input(host, bea, "Bea")  # type: ignore[arg-type]
-    process_input(host, bea, "pw")  # type: ignore[arg-type]
+    seconds_saved(tmp_path, 0)
+    server = login_host(tmp_path)
+    bea = FakePlayer(player=None)
+    process_input(server, bea, "Bea")  # type: ignore[arg-type]
+    process_input(server, bea, "pw")  # type: ignore[arg-type]
     assert bea.player is not None
     assert bea.player.prompt == "What? > "
 
 
 def test_the_default_prompt_stores_no_key(tmp_path: Path) -> None:
     """Choosing the usual line removes a saved prompt."""
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4), prompt="Go: "),
-    )
-    host = _login_host(tmp_path)
-    bea = _staff("Bea", RANK_RESIDENT)
-    process_commands(host, bea, "prompt What? >")  # type: ignore[arg-type]
-    assert _prompt_of(tmp_path) is None
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), prompt="Go: "))
+    server = login_host(tmp_path)
+    bea = staff("Bea", Rank.RESIDENT)
+    process_commands(server, bea, "set prompt What? >")  # type: ignore[arg-type]
+    assert prompt_of(tmp_path) is None
     assert "prompt" not in (tmp_path / "bea.yml").read_text(encoding="utf-8")
     assert bea.player is not None
     assert bea.player.prompt == "What? > "
-    assert host.sent == ["Prompt set.\n"]
+    assert server.sent == ["Prompt set.\n"]
 
 
 def test_becoming_a_resident_stores_no_prompt(tmp_path: Path) -> None:
     """A newbie's prompt is never written when they are promoted."""
-    bea = _newbie("Bea")
+    bea = newbie("Bea")
     assert bea.player is not None
-    ada = _staff("Ada", RANK_SUPER)
-    host = _login_host(tmp_path)
-    host.people = [bea, ada]
-    process_commands(host, ada, "resident Bea")  # type: ignore[arg-type]
-    process_input(host, bea, "hunter2")  # type: ignore[arg-type]
-    process_input(host, bea, "hunter2")  # type: ignore[arg-type]
-    assert _prompt_of(tmp_path) is None
+    ada = staff("Ada", Rank.SUPER_USER)
+    server = login_host(tmp_path)
+    server.people = [bea, ada]
+    process_commands(server, ada, "resident Bea")  # type: ignore[arg-type]
+    process_input(server, bea, "hunter2")  # type: ignore[arg-type]
+    process_input(server, bea, "hunter2")  # type: ignore[arg-type]
+    assert prompt_of(tmp_path) is None
     assert "prompt" not in (tmp_path / "bea.yml").read_text(encoding="utf-8")
 
 
 def test_custom_prompt_ends_with_a_space() -> None:
     """A custom prompt gains one trailing space and keeps it."""
-    user = Player("Ada", "hall", datetime.now(timezone.utc), rank=RANK_RESIDENT)
-    ada = _Player(player=user)
-    host, _player = _run("prompt Hi:", ada)
+    user = Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    ada = FakePlayer(player=user)
+    server, _ = run("set prompt Hi:", ada)
     assert user.prompt == "Hi: "
-    assert host.sent[-1] == "Prompt set.\n"
+    assert server.sent[-1] == "Prompt set.\n"
 
 
 def test_commands_wrap_on_visible_width() -> None:
     """Colour codes do not make the command list wrap early."""
-    on_user = Player("Ada", "hall", datetime.now(timezone.utc), rank=RANK_ADMIN, colour=True)
-    off_user = Player("Ada", "hall", datetime.now(timezone.utc), rank=RANK_ADMIN, colour=False)
-    on, _player = _run("commands", _Player(player=on_user, frame_columns=60))
-    off, _player = _run("commands", _Player(player=off_user, frame_columns=60))
+    on_user = Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.ADMIN, colour=True)
+    off_user = Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.ADMIN, colour=False)
+    on, _ = run("commands", FakePlayer(player=on_user, frame_columns=60))
+    off, _ = run("commands", FakePlayer(player=off_user, frame_columns=60))
     on_body = on.sent[0].split("Commands available:\n", 1)[1]
     off_body = off.sent[0].split("Commands available:\n", 1)[1]
     on_lines = on_body.splitlines()
@@ -6301,81 +8581,78 @@ def test_commands_wrap_on_visible_width() -> None:
 
 def test_player_prompt_adds_a_space_to_a_legacy_saved_value(tmp_path: Path) -> None:
     """A file that kept ``Hi:`` still types at ``Hi: ``."""
-    save_player(
-        tmp_path,
-        SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4), prompt="Hi:"),
-    )
-    login_host = _login_host(tmp_path)
-    again = _Player(player=None)
-    process_input(login_host, again, "Bea")  # type: ignore[arg-type]
-    process_input(login_host, again, "pw")  # type: ignore[arg-type]
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), prompt="Hi:"))
+    server = login_host(tmp_path)
+    again = FakePlayer(player=None)
+    process_input(server, again, "Bea")  # type: ignore[arg-type]
+    process_input(server, again, "pw")  # type: ignore[arg-type]
     assert again.player is not None
     assert again.player.prompt == "Hi:"
     assert entry_api.player_prompt(again) == "Hi: "
-    assert login_host.sent[-1] == "Hi: "
+    assert server.sent[-1] == "Hi: "
 
 
 def test_examine_and_lsu_keep_the_same_line_count_with_colour(tmp_path: Path) -> None:
     """Colour codes do not add or remove frame lines."""
-    host = _login_host(tmp_path)
-    ada = _staff("Ada", RANK_SUPER)
+    server = login_host(tmp_path)
+    ada = staff("Ada", Rank.SUPER_USER)
     assert ada.player is not None
     ada.player.idle_seconds = 0
-    boss = _staff("admin", RANK_ADMIN)
+    boss = staff("admin", Rank.ADMIN)
     assert boss.player is not None
     boss.player.idle_seconds = 3723
-    host.people = [boss, ada]
+    server.people = [boss, ada]
 
-    process_commands(host, ada, "examine me")  # type: ignore[arg-type]
-    examine_on = host.sent[0]
+    process_commands(server, ada, "examine me")  # type: ignore[arg-type]
+    examine_on = server.sent[0]
     for line in examine_on.splitlines():
         assert plain_len(line) == 72
     ada.player.colour = False
-    host.sent.clear()
-    process_commands(host, ada, "examine me")  # type: ignore[arg-type]
-    assert host.sent[0].count("\n") == examine_on.count("\n")
+    server.sent.clear()
+    process_commands(server, ada, "examine me")  # type: ignore[arg-type]
+    assert server.sent[0].count("\n") == examine_on.count("\n")
 
     ada.player.colour = True
-    host.sent.clear()
-    process_commands(host, ada, "lsu")  # type: ignore[arg-type]
-    lsu_on = host.sent[0]
+    server.sent.clear()
+    process_commands(server, ada, "lsu")  # type: ignore[arg-type]
+    lsu_on = server.sent[0]
     for line in lsu_on.splitlines():
         assert plain_len(line) == 72
     ada.player.colour = False
-    host.sent.clear()
-    process_commands(host, ada, "lsu")  # type: ignore[arg-type]
-    assert host.sent[0].count("\n") == lsu_on.count("\n")
+    server.sent.clear()
+    process_commands(server, ada, "lsu")  # type: ignore[arg-type]
+    assert server.sent[0].count("\n") == lsu_on.count("\n")
 
 
 def test_coloured_frames_match_the_terminal_width(tmp_path: Path) -> None:
     """A red admin rank and a plain resident rank use the same rule length."""
     from lupaxa.chat_server.colour import plain_len
 
-    host = _login_host(tmp_path)
-    resident = _staff("Bea", RANK_RESIDENT)
-    boss = _staff("Ada", RANK_ADMIN)
+    server = login_host(tmp_path)
+    resident = staff("Bea", Rank.RESIDENT)
+    boss = staff("Ada", Rank.ADMIN)
     assert resident.player is not None
     assert boss.player is not None
     resident.player.colour = True
     boss.player.colour = True
-    host.people = [resident, boss]
+    server.people = [resident, boss]
 
-    process_commands(host, resident, "examine me")  # type: ignore[arg-type]
-    resident_rules = [line for line in host.sent[0].splitlines() if set(line) == {"-"}]
-    process_commands(host, boss, "examine me")  # type: ignore[arg-type]
-    admin_text = host.sent[-1]
+    process_commands(server, resident, "examine me")  # type: ignore[arg-type]
+    resident_rules = [line for line in server.sent[0].splitlines() if set(line) == {"-"}]
+    process_commands(server, boss, "examine me")  # type: ignore[arg-type]
+    admin_text = server.sent[-1]
     admin_rules = [line for line in admin_text.splitlines() if set(line) == {"-"}]
     assert resident_rules[0] == "-" * 72
     assert admin_rules[0] == "-" * 72
     for line in admin_text.splitlines():
         assert plain_len(line) == 72
 
-    host.sent.clear()
-    host.newbies = [("Cyd", "10.0.0.8", "reception", 0)]
-    process_commands(host, boss, "lsn")  # type: ignore[arg-type]
-    process_commands(host, boss, "lsu")  # type: ignore[arg-type]
-    lsn_rule = host.sent[0].splitlines()[0]
-    lsu_rule = host.sent[1].splitlines()[0]
+    server.sent.clear()
+    server.newbies = [("Cyd", "10.0.0.8", "reception", 0)]
+    process_commands(server, boss, "lsn")  # type: ignore[arg-type]
+    process_commands(server, boss, "lsu")  # type: ignore[arg-type]
+    lsn_rule = server.sent[0].splitlines()[0]
+    lsu_rule = server.sent[1].splitlines()[0]
     assert lsn_rule == lsu_rule == "-" * 72
     assert plain_len(lsu_rule) == 72
 
@@ -6391,52 +8668,50 @@ def test_a_wide_plain_cell_grows_the_rule() -> None:
     assert coloured.splitlines()[0] == "-" * 72
 
 
-def test_ten_seconds_rolls_port_and_connection_counters(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_ten_seconds_rolls_port_and_connection_counters(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """One 10-second step rolls telnet, combined, and the connection."""
-    host = _login_host(tmp_path)
-    host._timer_mark = 0.0
-    host._timer_remainder = 0.0
-    person = _Player(player=Player("Ada", "hall", datetime.now(timezone.utc)))
+    server = login_host(tmp_path)
+    server.timer_mark = 0.0
+    server.timer_remainder = 0.0
+    person = FakePlayer(player=Player("Ada", "hall", datetime.now(timezone.utc)))
     person.net.in_current = 25
-    host._telnet_net.in_current = 25
-    host._combined_net.in_current = 25
-    host.people = [person]
+    server.telnet_net.in_current = 25
+    server.combined_net.in_current = 25
+    server.people = [person]
     monkeypatch.setattr("lupaxa.chat_server.timer.time.monotonic", lambda: 10.0)
-    process_timer(host)  # type: ignore[arg-type]
-    assert host._net_count == 10
-    assert host._telnet_net.in_total == 25
-    assert host._telnet_net.in_bps == 2
-    assert host._telnet_net.in_average == 1
-    assert host._telnet_net.in_current == 0
+    process_timer(server)  # type: ignore[arg-type]
+    assert server.net_count == 10
+    assert server.telnet_net.in_total == 25
+    assert server.telnet_net.in_bps == 2
+    assert server.telnet_net.in_average == 1
+    assert server.telnet_net.in_current == 0
     assert person.net.in_total == 25
     assert person.net.in_current == 0
 
 
 def test_a_short_window_is_still_divided_by_ten(tmp_path: Path) -> None:
     """Three bytes in a window that closes early have a rate of 0."""
-    host = _login_host(tmp_path)
-    host._net_count = 1
-    person = _Player()
+    server = login_host(tmp_path)
+    server.net_count = 1
+    person = FakePlayer()
     person.net.in_current = 3
-    host.people = [person]
-    apply_net_tick(host, 1)  # type: ignore[arg-type]
+    server.people = [person]
+    apply_net_tick(server, 1)  # type: ignore[arg-type]
     assert person.net.in_bps == 0
     assert person.net.in_total == 3
 
 
 def test_a_fifteen_second_tick_rolls_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A late tick divides by 10 once and sets the countdown back to 10."""
-    host = _login_host(tmp_path)
-    host._timer_mark = 0.0
-    host._timer_remainder = 0.0
-    host._telnet_net.in_current = 100
+    server = login_host(tmp_path)
+    server.timer_mark = 0.0
+    server.timer_remainder = 0.0
+    server.telnet_net.in_current = 100
     monkeypatch.setattr("lupaxa.chat_server.timer.time.monotonic", lambda: 15.0)
-    process_timer(host)  # type: ignore[arg-type]
-    assert host._net_count == 10
-    assert host._telnet_net.in_bps == 10
-    assert host._telnet_net.in_total == 100
+    process_timer(server)  # type: ignore[arg-type]
+    assert server.net_count == 10
+    assert server.telnet_net.in_bps == 10
+    assert server.telnet_net.in_total == 100
 
 
 def test_telnet_and_ssh_cannot_be_names() -> None:
@@ -6444,75 +8719,662 @@ def test_telnet_and_ssh_cannot_be_names() -> None:
     for typed in ("telnet", "SSH", " Telnet "):
         decision = consider_name(typed, set())
         assert decision.name is None
-        assert decision.reply == (
-            f"{typed.strip()} cannot be used. Pick another name.\n\nPlease enter your name: "
-        )
+        assert decision.reply == (f"{typed.strip()} cannot be used. Pick another name.\n\nPlease enter your name: ")
+
+
+def test_system_cannot_be_a_name() -> None:
+    """System is reserved because that house file is the office rooms file."""
+    for typed in ("system", "System", " SYSTEM "):
+        decision = consider_name(typed, set())
+        assert decision.name is None
+        assert decision.reply == (f"{typed.strip()} cannot be used. Pick another name.\n\nPlease enter your name: ")
+
+
+def test_command_parameters_can_still_be_names() -> None:
+    """A command parameter is not reserved unless it shares a player argument."""
+    parameters = {
+        "newbies",
+        "residents",
+        "on",
+        "off",
+        "login",
+        "force",
+        "help",
+        "rooms",
+        "setup",
+        "remove",
+        "auto",
+        "now",
+        "cancel",
+        "leave",
+        "delete",
+        "north",
+        "south",
+        "east",
+        "west",
+        "down",
+        "yes",
+    }
+    assert parameters.isdisjoint(RESERVED_NAMES)
+    assert consider_name("Help", set()).name == "Help"
+    assert consider_name("Rooms", set()).name == "Rooms"
+    assert consider_name("Off", set()).name == "Off"
+    assert {"me", "who", "quit", "ssh", "telnet", "system"} <= RESERVED_NAMES
+
+
+def test_a_house_file_name_cannot_be_the_rooms_or_help_file(tmp_path: Path) -> None:
+    """Help stays a legal name, and is refused when that file is the help file."""
+    server = login_host(tmp_path)
+    server.config = replace(server.config, rooms=tmp_path / "office.yml", help=tmp_path / "help.yml")
+    player = FakePlayer(player=None)
+    process_input(server, player, "Help")  # type: ignore[arg-type]
+    assert player.player is None
+    assert server.sent == ["Help cannot be used. Pick another name.\n\nPlease enter your name: "]
+    assert not (tmp_path / "help.yml").exists()
 
 
 def test_a_resident_cannot_use_network(tmp_path: Path) -> None:
-    """Below admin, network is not a command."""
-    host = _login_host(tmp_path)
-    user = Player("Ada", "reception", datetime.now(timezone.utc), rank=RANK_RESIDENT)
-    player = _Player(player=user)
-    process_commands(host, player, "network")  # type: ignore[arg-type]
+    """Below coder, network is not a command."""
+    server = login_host(tmp_path)
+    user = Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    player = FakePlayer(player=user)
+    process_commands(server, player, "network")  # type: ignore[arg-type]
     assert player.sent[-1] == "No such command 'network'\n"
 
 
 def test_network_with_no_argument_shows_the_combined_box(tmp_path: Path) -> None:
     """Bare network is the combined counter."""
-    host = _login_host(tmp_path)
-    host._combined_net.in_total = 1500
-    host._telnet_net.in_total = 9
-    user = Player("Ann", "reception", datetime.now(timezone.utc), rank=RANK_ADMIN)
-    player = _Player(player=user)
-    host.people = [player]
-    process_commands(host, player, "network")  # type: ignore[arg-type]
+    server = login_host(tmp_path)
+    server.combined_net.in_total = 1500
+    server.telnet_net.in_total = 9
+    user = Player("Ann", "reception", datetime.now(timezone.utc), rank=Rank.CODER)
+    player = FakePlayer(player=user)
+    server.people = [player]
+    process_commands(server, player, "network")  # type: ignore[arg-type]
     assert "1.5 KB" in player.sent[-1]
     assert "9 B" not in player.sent[-1]
 
 
 def test_network_telnet_and_ssh_select_those_ports(tmp_path: Path) -> None:
     """The port words win in any case."""
-    host = _login_host(tmp_path)
-    host._telnet_net.in_total = 1500
-    host._ssh_net.out_total = 300_000_000
-    user = Player("Ann", "reception", datetime.now(timezone.utc), rank=RANK_ADMIN)
-    player = _Player(player=user)
-    host.people = [player]
-    process_commands(host, player, "network TELNET")  # type: ignore[arg-type]
+    server = login_host(tmp_path)
+    server.telnet_net.in_total = 1500
+    server.ssh_net.out_total = 300_000_000
+    user = Player("Ann", "reception", datetime.now(timezone.utc), rank=Rank.CODER)
+    player = FakePlayer(player=user)
+    server.people = [player]
+    process_commands(server, player, "network TELNET")  # type: ignore[arg-type]
     assert "1.5 KB" in player.sent[-1]
-    process_commands(host, player, "network ssh")  # type: ignore[arg-type]
+    process_commands(server, player, "network ssh")  # type: ignore[arg-type]
     assert "300.0 MB" in player.sent[-1]
+
+
+def test_network_me_shows_the_callers_connection(tmp_path: Path) -> None:
+    """Network me is the caller's own counters, the way examine me is the caller."""
+    server = login_host(tmp_path)
+    user = Player("Ann", "reception", datetime.now(timezone.utc), rank=Rank.CODER)
+    player = FakePlayer(player=user)
+    player.net.in_total = 42
+    server.people = [player]
+    process_commands(server, player, "network me")  # type: ignore[arg-type]
+    assert "42 B" in player.sent[-1]
+
+
+def test_ipinfo_frames_a_player_or_an_address(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ipinfo shows the database record, and does not exist while lookup is off."""
+    monkeypatch.setattr("lupaxa.chat_server.admin.lookup_hostname", lambda ip: "dns.google")
+    server = login_host(tmp_path)
+    admin = staff("Ann", Rank.ADMIN)
+    server.people = [admin]
+    process_commands(server, admin, "ipinfo 8.8.8.8")  # type: ignore[arg-type]
+    assert server.sent[-1] == "No such command 'ipinfo'\n"
+    assert "ipinfo" not in command_words(Rank.ADMIN).split()
+    server.country_lookup = True
+    sue = staff("Sue", Rank.SUPER_USER)
+    server.people.append(sue)
+    server.sent.clear()
+    process_commands(server, sue, "ipinfo 8.8.8.8")  # type: ignore[arg-type]
+    assert server.sent[-1] == "No such command 'ipinfo'\n"
+    assert "ipinfo" in command_words(Rank.ADMIN, country_lookup=True).split()
+
+    class Reader:
+        def get_with_prefix_len(self, ip: str) -> tuple[dict[str, str], int]:
+            assert ip == "8.8.8.8"
+            return {"country": "United States", "country_code": "US", "continent": "North America", "continent_code": "NA", "asn": "AS15169", "as_name": "Google LLC", "as_domain": "google.com"}, 24
+
+    server.ensure_country_reader = lambda: Reader()  # type: ignore[attr-defined]
+    server.sent.clear()
+    process_commands(server, admin, "ipinfo 8.8.8.8")  # type: ignore[arg-type]
+    text = server.sent[-1]
+    assert "8.8.8.8" in text
+    assert "dns.google" in text
+    assert "United States (US)" in text
+    assert "North America (NA)" in text
+    assert "AS15169" in text
+    assert "Google LLC" in text
+    assert "google.com" in text
+    assert "8.8.8.0/24" in text
+    server.sent.clear()
+    process_commands(server, admin, "ipinfo me")  # type: ignore[arg-type]
+    mine = server.sent[-1]
+    assert "Ann" in mine
+    assert "Localhost (XL)" in mine
+    assert "127.0.0.0/8" in mine
+    bea = staff("Bea", Rank.RESIDENT)
+    bea.address = "192.168.1.9"
+    bea.hostname = "bea.home"
+    server.people.append(bea)
+    server.sent.clear()
+    process_commands(server, admin, "ipinfo Bea")  # type: ignore[arg-type]
+    shown = server.sent[-1]
+    assert "Bea" in shown
+    assert "bea.home" in shown
+    assert "Private Network (XP)" in shown
+    assert "192.168.0.0/16" in shown
+    assert "ASN" not in shown
 
 
 def test_network_shows_one_connection_from_accept(tmp_path: Path) -> None:
     """The player's box is the connection counter, including login bytes."""
-    host = _login_host(tmp_path)
-    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=RANK_RESIDENT)
-    bea = _Player(name="Bea", player=user, room="hall")
+    server = login_host(tmp_path)
+    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    bea = FakePlayer(name="Bea", player=user, room="hall")
     bea.net.in_total = 999
-    admin_user = Player("Ann", "reception", datetime.now(timezone.utc), rank=RANK_ADMIN)
-    admin = _Player(player=admin_user)
-    host.people = [admin, bea]
-    process_commands(host, admin, "network bea")  # type: ignore[arg-type]
+    admin_user = Player("Ann", "reception", datetime.now(timezone.utc), rank=Rank.CODER)
+    admin = FakePlayer(player=admin_user)
+    server.people = [admin, bea]
+    process_commands(server, admin, "network bea")  # type: ignore[arg-type]
     assert "999 B" in admin.sent[-1]
 
 
 def test_network_reports_a_missing_player_and_extra_words(tmp_path: Path) -> None:
     """An unknown name and a second word are refused."""
-    host = _login_host(tmp_path)
-    user = Player("Ann", "reception", datetime.now(timezone.utc), rank=RANK_ADMIN)
-    player = _Player(player=user)
-    host.people = [player]
-    process_commands(host, player, "network Ada")  # type: ignore[arg-type]
+    server = login_host(tmp_path)
+    user = Player("Ann", "reception", datetime.now(timezone.utc), rank=Rank.CODER)
+    player = FakePlayer(player=user)
+    server.people = [player]
+    process_commands(server, player, "network Ada")  # type: ignore[arg-type]
     assert player.sent[-1] == "Player Ada not found.\n"
-    process_commands(host, player, "network telnet please")  # type: ignore[arg-type]
+    process_commands(server, player, "network telnet please")  # type: ignore[arg-type]
     assert player.sent[-1] == "Syntax: network [telnet|ssh|<player>]\n"
 
 
 def test_a_saved_player_file_has_no_network_fields(tmp_path: Path) -> None:
     """Traffic counters are not written to the player file."""
-    save_player(tmp_path, SavedPlayer("Bea", RANK_RESIDENT, hash_password("pw", rounds=4)))
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
     text = player_path(tmp_path, "Bea").read_text(encoding="utf-8")
     assert "in_total" not in text
     assert "in_bps" not in text
+
+
+class SampleProcess:
+    """One fixed process snapshot."""
+
+    pid = 18432
+
+    def oneshot(self) -> object:
+        return contextlib.nullcontext()
+
+    def cpu_percent(self, interval: None = None) -> float:
+        del interval
+        return 2.4
+
+    def cpu_times(self) -> object:
+        return SimpleNamespace(user=182.4, system=34.1)
+
+    def memory_info(self) -> object:
+        return SimpleNamespace(rss=50960794, vms=432852173)
+
+    def memory_full_info(self) -> object:
+        return SimpleNamespace(uss=41104179)
+
+    def num_threads(self) -> int:
+        return 4
+
+    def num_fds(self) -> int:
+        return 87
+
+    def net_connections(self, kind: str = "inet") -> list[None]:
+        del kind
+        return [None] * 42
+
+    def io_counters(self) -> object:
+        return SimpleNamespace(read_bytes=13002342, write_bytes=193147699)
+
+    def num_ctx_switches(self) -> object:
+        return SimpleNamespace(voluntary=124821, involuntary=2143)
+
+
+def test_system_shows_uptime_cpu_memory_and_load(monkeypatch: pytest.MonkeyPatch) -> None:
+    """System shows the process box with uptime and resource figures."""
+    fixed = datetime(2026, 10, 12, 13, 45, 3, tzinfo=timezone.utc)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            return fixed
+
+    monkeypatch.setattr("lupaxa.chat_server.coder.datetime", Clock)
+    ada = staff("Ada", Rank.CODER)
+    assert ada.player is not None
+    ada.player.colour = False
+    server = FakeServer(people=[ada, FakePlayer(player=None), FakePlayer(player=None)])
+    server.started_at = fixed - timedelta(hours=2, minutes=5)
+    server.process = SampleProcess()
+    process_commands(server, ada, "system")  # type: ignore[arg-type]
+    narrow = """\
++---------------------------------------------------------------+
+| PID                  : 18432                                  |
+| Uptime               : 2 hours, 5 minutes                     |
+| Booted at            : Monday 12th October 2026, 11:40:03 UTC |
+| CPU usage            : 2.4%                                   |
+| CPU user time        : 3 minutes, 2.4 seconds                 |
+| CPU system time      : 34.1 seconds                           |
+|---------------------------------------------------------------|
+| Memory RSS           : 48.6 MiB                               |
+| Memory USS           : 39.2 MiB                               |
+| Memory VMS           : 412.8 MiB                              |
+|---------------------------------------------------------------|
+| Threads              : 4                                      |
+| File descriptors     : 87                                     |
+| Total sockets        : 42                                     |
+| Sessions             : 3                                      |
+|---------------------------------------------------------------|
+| Disk read            : 12.4 MiB                               |
+| Disk written         : 184.2 MiB                              |
+|---------------------------------------------------------------|
+| Voluntary switches   : 124821                                 |
+| Involuntary switches : 2143                                   |
++---------------------------------------------------------------+
+"""
+    assert server.sent == [narrow]
+    lines = narrow.splitlines()
+    width = len(lines[0])
+    assert all(len(line) == width for line in lines)
+    server.rebooted_at = datetime(2026, 10, 12, 12, 10, 3, tzinfo=timezone.utc)
+    server.sent.clear()
+    process_commands(server, ada, "system")  # type: ignore[arg-type]
+    wide = """\
++---------------------------------------------------------------+
+| PID                  : 18432                                  |
+| Uptime               : 2 hours, 5 minutes                     |
+| Booted at            : Monday 12th October 2026, 11:40:03 UTC |
+| Rebooted at          : Monday 12th October 2026, 12:10:03 UTC |
+| CPU usage            : 2.4%                                   |
+| CPU user time        : 3 minutes, 2.4 seconds                 |
+| CPU system time      : 34.1 seconds                           |
+|---------------------------------------------------------------|
+| Memory RSS           : 48.6 MiB                               |
+| Memory USS           : 39.2 MiB                               |
+| Memory VMS           : 412.8 MiB                              |
+|---------------------------------------------------------------|
+| Threads              : 4                                      |
+| File descriptors     : 87                                     |
+| Total sockets        : 42                                     |
+| Sessions             : 3                                      |
+|---------------------------------------------------------------|
+| Disk read            : 12.4 MiB                               |
+| Disk written         : 184.2 MiB                              |
+|---------------------------------------------------------------|
+| Voluntary switches   : 124821                                 |
+| Involuntary switches : 2143                                   |
++---------------------------------------------------------------+
+"""
+    assert server.sent == [wide]
+    wide_lines = wide.splitlines()
+    assert all(len(line) == len(wide_lines[0]) for line in wide_lines)
+    assert len(wide_lines[0]) == width
+
+
+def test_system_shows_unavailable_for_denied_process_stats() -> None:
+    """AccessDenied on some counters still shows the rest of the box."""
+
+    class DeniedProcess(SampleProcess):
+        def memory_full_info(self) -> object:
+            raise psutil.AccessDenied(pid=18432)
+
+        def io_counters(self) -> object:
+            raise psutil.AccessDenied(pid=18432)
+
+    ada = staff("Ada", Rank.CODER)
+    server = FakeServer(people=[ada])
+    server.process = DeniedProcess()
+    process_commands(server, ada, "system")  # type: ignore[arg-type]
+    body = server.sent[0]
+    assert "Memory USS           : unavailable" in body
+    assert "Disk read            : unavailable" in body
+    assert "Disk written         : unavailable" in body
+    assert "Memory RSS           : 48.6 MiB" in body
+
+
+def test_system_box_survives_a_missing_disk_counter() -> None:
+    """AttributeError on io_counters still shows the rest of the box."""
+
+    class NoDiskIoProcess(SampleProcess):
+        @property
+        def io_counters(self) -> object:
+            raise AttributeError("io_counters")
+
+    ada = staff("Ada", Rank.CODER)
+    server = FakeServer(people=[ada])
+    server.process = NoDiskIoProcess()
+    process_commands(server, ada, "system")  # type: ignore[arg-type]
+    body = server.sent[0]
+    assert "Disk read            : unavailable" in body
+    assert "Disk written         : unavailable" in body
+    assert "Memory RSS           : 48.6 MiB" in body
+
+
+def test_system_box_survives_a_real_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """System against the live process returns a box without raising."""
+    fixed = datetime(2026, 10, 12, 13, 45, 3, tzinfo=timezone.utc)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: tzinfo | None = None) -> datetime:
+            return fixed
+
+    monkeypatch.setattr("lupaxa.chat_server.coder.datetime", Clock)
+    ada = staff("Ada", Rank.CODER)
+    server = FakeServer(people=[ada])
+    server.started_at = fixed - timedelta(hours=2, minutes=5)
+    server.process = psutil.Process()
+    process_commands(server, ada, "system")  # type: ignore[arg-type]
+    body = server.sent[0]
+    assert body.startswith("+")
+    assert "Disk read" in body
+    assert "Memory RSS" in body
+
+
+def test_system_rejects_an_extra_word() -> None:
+    """System with a word asks for the bare command."""
+    ada = staff("Ada", Rank.CODER)
+    server = FakeServer(people=[ada])
+    process_commands(server, ada, "system please")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: system\n"]
+
+
+def test_a_super_user_cannot_use_system() -> None:
+    """System is a coder command."""
+    ada = staff("Ada", Rank.SUPER_USER)
+    server = FakeServer(people=[ada])
+    process_commands(server, ada, "system")  # type: ignore[arg-type]
+    assert server.sent == ["No such command 'system'\n"]
+
+
+def test_an_off_duty_coder_can_use_system() -> None:
+    """A coder command still runs while off duty. An admin is told it does not exist."""
+    ada = staff("Ada", Rank.CODER)
+    assert ada.player is not None
+    ada.player.off_duty = True
+    server = FakeServer(people=[ada])
+    server.process = SampleProcess()
+    process_commands(server, ada, "system")  # type: ignore[arg-type]
+    assert server.sent[0] != "You are off duty.\n"
+    assert "No such command 'system'\n" not in server.sent
+    boss = staff("Bea", Rank.ADMIN)
+    assert boss.player is not None
+    boss.player.off_duty = True
+    refused = FakeServer(people=[boss])
+    process_commands(refused, boss, "system")  # type: ignore[arg-type]
+    assert refused.sent == ["No such command 'system'\n"]
+
+
+def test_appoint_dismiss_and_roles_use_syntax_or_list_roles(tmp_path: Path) -> None:
+    """Bare dismiss lists roles; short lines and extra words get syntax help."""
+    ada = staff("Ada", Rank.ADMIN)
+    server = login_host(tmp_path)
+    server.people = [ada]
+    process_commands(server, ada, "dismiss")  # type: ignore[arg-type]
+    assert server.sent == ["Roles:\n  site_admin\n"]
+    server.sent.clear()
+    process_commands(server, ada, "appoint Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: appoint <name> <role>\n"]
+    server.sent.clear()
+    process_commands(server, ada, "dismiss Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: dismiss <name> <role>\n"]
+    server.sent.clear()
+    process_commands(server, ada, "roles Ada extra")  # type: ignore[arg-type]
+    assert server.sent == ["Syntax: roles [<name>]\n"]
+
+
+def test_appoint_and_dismiss_write_the_flag_and_tell_staff(tmp_path: Path) -> None:
+    """Appoint and dismiss update the file and the live player, and tell the staff channel."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    ada = staff("Ada", Rank.ADMIN)
+    bea = staff("Bea", Rank.RESIDENT)
+    server = login_host(tmp_path)
+    server.people = [ada, bea]
+    process_commands(server, ada, "appoint")  # type: ignore[arg-type]
+    assert server.sent == ["Roles:\n  site_admin\n"]
+    server.sent.clear()
+    process_commands(server, ada, "appoint Bea site_admin")  # type: ignore[arg-type]
+    stored = load_saved(player_path(tmp_path, "Bea"))
+    assert stored is not None
+    assert stored.roles == int(Roles.SITE_ADMIN)
+    assert bea.player is not None
+    assert bea.player.roles == int(Roles.SITE_ADMIN)
+    assign = "< SU > Ada assigns Bea to the role of 'Site Admin'\n"
+    assert server.admin_lines == []
+    assert server.staff_lines == [paint_staff(ada, assign)]
+    assert server.sent == [paint_staff(bea, assign)]
+    assert bea.sent == [paint_staff(bea, assign)]
+    server.staff_lines.clear()
+    server.sent.clear()
+    process_commands(server, ada, "appoint Bea site_admin")  # type: ignore[arg-type]
+    assert server.sent == ["Bea already has the Site Admin role.\n"]
+    server.sent.clear()
+    bea.sent.clear()
+    process_commands(server, ada, "dismiss Bea site_admin")  # type: ignore[arg-type]
+    stored = load_saved(player_path(tmp_path, "Bea"))
+    assert stored is not None
+    assert stored.roles == 0
+    assert bea.player.roles == 0
+    dismiss = "< SU > Ada dismisses Bea from the role of 'Site Admin'.\n"
+    assert server.admin_lines == []
+    assert server.staff_lines == [paint_staff(ada, dismiss)]
+    assert server.sent == [paint_staff(bea, dismiss)]
+
+
+def test_an_on_duty_super_user_hears_a_role_change_once(tmp_path: Path) -> None:
+    """An on-duty super user gets the staff line and not a second copy."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.SUPER_USER, hash_password("pw", rounds=4)))
+    ada = staff("Ada", Rank.ADMIN)
+    bea = staff("Bea", Rank.SUPER_USER)
+    server = login_host(tmp_path)
+    server.people = [ada, bea]
+    process_commands(server, ada, "appoint Bea site_admin")  # type: ignore[arg-type]
+    line = "< SU > Ada assigns Bea to the role of 'Site Admin'\n"
+    assert server.staff_lines == [paint_staff(ada, line), paint_staff(bea, line)]
+    assert bea.sent == [paint_staff(bea, line)]
+    assert server.sent == []
+
+
+def test_an_off_duty_super_user_is_told_a_role_change_directly(tmp_path: Path) -> None:
+    """Off duty skips the staff channel, so the player is told directly."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.SUPER_USER, hash_password("pw", rounds=4)))
+    ada = staff("Ada", Rank.ADMIN)
+    bea = staff("Bea", Rank.SUPER_USER)
+    assert bea.player is not None
+    bea.player.off_duty = True
+    server = login_host(tmp_path)
+    server.people = [ada, bea]
+    process_commands(server, ada, "appoint Bea site_admin")  # type: ignore[arg-type]
+    line = "< SU > Ada assigns Bea to the role of 'Site Admin'\n"
+    assert server.staff_lines == [paint_staff(ada, line)]
+    assert server.sent == [paint_staff(bea, line)]
+    assert bea.sent == [paint_staff(bea, line)]
+
+
+def test_a_locked_screen_swallows_the_direct_role_line(tmp_path: Path) -> None:
+    """A locked screen does not show the direct sentence. The staff channel still hears it."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    ada = staff("Ada", Rank.ADMIN)
+    bea = staff("Bea", Rank.RESIDENT)
+    assert bea.player is not None
+    bea.player.screen_locked = True
+    server = login_host(tmp_path)
+    server.people = [ada, bea]
+    process_commands(server, ada, "appoint Bea site_admin")  # type: ignore[arg-type]
+    line = "< SU > Ada assigns Bea to the role of 'Site Admin'\n"
+    assert server.staff_lines == [paint_staff(ada, line)]
+    assert server.sent == []
+    assert bea.sent == []
+
+
+def test_a_logged_out_player_is_not_sent_the_role_line(tmp_path: Path) -> None:
+    """A missing connection still announces on the staff channel."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    ada = staff("Ada", Rank.ADMIN)
+    server = login_host(tmp_path)
+    server.people = [ada]
+    process_commands(server, ada, "dismiss Bea site_admin")  # type: ignore[arg-type]
+    assert server.sent == ["Bea does not have the Site Admin role.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "appoint Bea site_admin")  # type: ignore[arg-type]
+    line = "< SU > Ada assigns Bea to the role of 'Site Admin'\n"
+    assert server.staff_lines == [paint_staff(ada, line)]
+    assert server.sent == []
+
+
+def test_an_on_duty_admin_who_appoints_themselves_hears_the_staff_line_once(tmp_path: Path) -> None:
+    """Changing your own role while on duty does not add a direct copy."""
+    save_player(tmp_path, SavedPlayer("Ada", Rank.ADMIN, hash_password("pw", rounds=4)))
+    ada = staff("Ada", Rank.ADMIN)
+    server = login_host(tmp_path)
+    server.people = [ada]
+    process_commands(server, ada, "appoint Ada site_admin")  # type: ignore[arg-type]
+    line = "< SU > Ada assigns Ada to the role of 'Site Admin'\n"
+    assert server.staff_lines == [paint_staff(ada, line)]
+    assert ada.sent == [paint_staff(ada, line)]
+    assert server.sent == []
+
+
+def test_appoint_refuses_another_super_admin_and_allows_yourself(tmp_path: Path) -> None:
+    """The caller may take a role. A different super admin may not be changed."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
+    save_player(tmp_path, SavedPlayer("Ada", Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
+    ada = staff("Ada", Rank.SUPER_ADMIN)
+    server = login_host(tmp_path)
+    server.people = [ada]
+    process_commands(server, ada, "appoint Bea site_admin")  # type: ignore[arg-type]
+    assert server.sent == ["Roles cannot be changed for the super admin.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "appoint Ada site_admin")  # type: ignore[arg-type]
+    stored = load_saved(player_path(tmp_path, "Ada"))
+    assert stored is not None
+    assert stored.roles == int(Roles.SITE_ADMIN)
+    server.sent.clear()
+    ada.name = "ADA"
+    process_commands(server, ada, "appoint ada site_admin")  # type: ignore[arg-type]
+    assert server.sent == ["Ada already has the Site Admin role.\n"]
+
+
+def test_appoint_names_the_unknown_role_and_the_unknown_player(tmp_path: Path) -> None:
+    """A bad role and a missing player use the spec sentences."""
+    ada = staff("Ada", Rank.ADMIN)
+    server = login_host(tmp_path)
+    server.people = [ada]
+    process_commands(server, ada, "appoint Bea widget")  # type: ignore[arg-type]
+    assert server.sent == ["There is no role 'widget'.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "appoint Bea site_admin")  # type: ignore[arg-type]
+    assert server.sent == ["No such player 'Bea'.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "dismiss Bea site_admin")  # type: ignore[arg-type]
+    assert server.sent == ["No such player 'Bea'.\n"]
+
+
+def test_appoint_refuses_the_spaced_name_and_the_label(tmp_path: Path) -> None:
+    """The display words are not a role token."""
+    ada = staff("Ada", Rank.ADMIN)
+    server = login_host(tmp_path)
+    server.people = [ada]
+    process_commands(server, ada, "appoint Bea site admin")  # type: ignore[arg-type]
+    assert server.sent == ["There is no role 'site admin'.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "appoint Bea Site Admin")  # type: ignore[arg-type]
+    assert server.sent == ["There is no role 'Site Admin'.\n"]
+
+
+def test_roles_lists_your_own_and_an_admin_may_look_up_a_name(tmp_path: Path) -> None:
+    """Residents see their own roles. Only an admin may name someone else."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), roles=int(Roles.SITE_ADMIN)))
+    ada = staff("Ada", Rank.ADMIN)
+    bea = staff("Bea", Rank.RESIDENT)
+    assert bea.player is not None
+    bea.player.roles = int(Roles.SITE_ADMIN)
+    server = login_host(tmp_path)
+    server.people = [ada, bea]
+    process_commands(server, bea, "roles")  # type: ignore[arg-type]
+    assert server.sent == ["Roles:\n  Site Admin\n"]
+    server.sent.clear()
+    process_commands(server, ada, "roles")  # type: ignore[arg-type]
+    assert server.sent == ["You have no roles.\n"]
+    server.sent.clear()
+    process_commands(server, bea, "roles Ada")  # type: ignore[arg-type]
+    assert server.sent == ["Only an admin can look up someone else's roles.\n"]
+    server.sent.clear()
+    process_commands(server, ada, "roles Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Bea:\n  Site Admin\n"]
+    server.sent.clear()
+    process_commands(server, ada, "dismiss Bea site_admin")  # type: ignore[arg-type]
+    server.sent.clear()
+    process_commands(server, ada, "roles Bea")  # type: ignore[arg-type]
+    assert server.sent == ["Bea has no roles.\n"]
+
+
+def test_a_newbie_has_no_roles_command() -> None:
+    """Roles is resident and above."""
+    newbie_player, _ = run("roles")
+    assert newbie_player.sent == ["No such command 'roles'\n"]
+
+
+def test_appoint_writes_a_logged_out_file(tmp_path: Path) -> None:
+    """Appoint updates a saved player who is not connected."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    ada = staff("Ada", Rank.ADMIN)
+    server = login_host(tmp_path)
+    server.people = [ada]
+    process_commands(server, ada, "appoint Bea site_admin")  # type: ignore[arg-type]
+    stored = load_saved(player_path(tmp_path, "Bea"))
+    assert stored is not None
+    assert stored.roles == int(Roles.SITE_ADMIN)
+    assert server.sent == []
+
+
+def test_dismiss_refuses_a_role_that_is_not_held(tmp_path: Path) -> None:
+    """Dismiss of a role that is not held names the player."""
+    save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
+    ada = staff("Ada", Rank.ADMIN)
+    server = login_host(tmp_path)
+    server.people = [ada]
+    process_commands(server, ada, "dismiss Bea site_admin")  # type: ignore[arg-type]
+    assert server.sent == ["Bea does not have the Site Admin role.\n"]
+
+
+def test_appoint_does_not_write_a_role_without_a_file(tmp_path: Path) -> None:
+    """A missing file is No such player, and the live player is left unchanged."""
+    ada = staff("Ada", Rank.ADMIN)
+    bea = staff("Bea", Rank.RESIDENT)
+    assert bea.player is not None
+    server = login_host(tmp_path)
+    server.people = [ada, bea]
+    process_commands(server, ada, "appoint Bea site_admin")  # type: ignore[arg-type]
+    assert server.sent == ["No such player 'Bea'.\n"]
+    assert bea.player.roles == 0
+    assert load_saved(player_path(tmp_path, "Bea")) is None
+
+
+def test_a_resident_site_admin_cannot_appoint_or_dismiss(tmp_path: Path) -> None:
+    """A resident with the site admin role cannot appoint or dismiss."""
+    bea = staff("Bea", Rank.RESIDENT)
+    assert bea.player is not None
+    bea.player.roles = int(Roles.SITE_ADMIN)
+    server = login_host(tmp_path)
+    server.people = [bea]
+    process_commands(server, bea, "appoint Bea site_admin")  # type: ignore[arg-type]
+    assert server.sent == ["No such command 'appoint'\n"]
+    server.sent.clear()
+    process_commands(server, bea, "dismiss Bea site_admin")  # type: ignore[arg-type]
+    assert server.sent == ["No such command 'dismiss'\n"]

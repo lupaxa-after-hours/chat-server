@@ -20,12 +20,6 @@ def test_clock_phrase_treats_a_naive_datetime_as_utc() -> None:
 
 def test_ordinals_for_the_first_days_and_the_teens() -> None:
     """1st, 2nd, 3rd, 11th, and 21st use the English endings."""
-    cases = (
-        (datetime(2026, 10, 1, tzinfo=timezone.utc), "1st"),
-        (datetime(2026, 10, 2, tzinfo=timezone.utc), "2nd"),
-        (datetime(2026, 10, 3, tzinfo=timezone.utc), "3rd"),
-        (datetime(2026, 10, 11, tzinfo=timezone.utc), "11th"),
-        (datetime(2026, 10, 21, tzinfo=timezone.utc), "21st"),
-    )
+    cases = ((datetime(2026, 10, 1, tzinfo=timezone.utc), "1st"), (datetime(2026, 10, 2, tzinfo=timezone.utc), "2nd"), (datetime(2026, 10, 3, tzinfo=timezone.utc), "3rd"), (datetime(2026, 10, 11, tzinfo=timezone.utc), "11th"), (datetime(2026, 10, 21, tzinfo=timezone.utc), "21st"))  # fmt: skip  # noqa: E501
     for moment, ordinal in cases:
         assert f" {ordinal} " in clock_phrase(moment)

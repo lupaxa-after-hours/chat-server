@@ -7,8 +7,8 @@ it at startup.
 
 ## Who Must Use it
 
-Residents may turn it on. Super users, admins, and the Super Admin must
-have it when `mfa_enabled` is true. A resident with no secret enters after
+Residents may turn it on. SU Channel and above must have it when
+`mfa_enabled` is true. A resident with no secret enters after
 the password. Staff with no secret are shown a new secret and cannot enter
 until the code matches.
 
@@ -25,10 +25,10 @@ either side. The same code cannot be used again. Three wrong codes
 disconnect, the same limit as a wrong password. `quit` on that prompt
 disconnects.
 
-The first login of the config account still has to come from localhost.
-With MFA on, the two passwords are followed by enrolment, and the player
-file is written only after the code matches. With MFA off, the two
-passwords save the Super Admin and let them in.
+The super admin account is created with `chat-server setup -c` and the config
+path while the talker is stopped. Setup does not write an MFA secret. The
+first time that account logs in with MFA on, enrolment follows the password.
+With MFA off, the password from setup is enough to enter.
 
 ## Setup and Removal
 
@@ -74,5 +74,5 @@ before they can enter. The flag stays true until that setup saves. Deleting
 both `mfa_secret` and `mfa_on` is a first-time login: a resident enters with
 no extra line, and staff still cannot enter until setup finishes.
 
-If the Super Admin loses their phone, edit their player file and clear
-`mfa_secret` by hand.
+If the Super Admin loses their phone, run `chat-server setup -c` and choose
+`2 Clear MFA`.

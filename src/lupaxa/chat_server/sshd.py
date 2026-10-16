@@ -14,6 +14,7 @@ from typing import Any
 import asyncssh
 
 from .exceptions import ServerError
+from .utilities import peer_address
 
 
 def load_or_create_host_key(path: Path) -> asyncssh.SSHKey:
@@ -41,23 +42,21 @@ def load_or_create_host_key(path: Path) -> asyncssh.SSHKey:
     return key
 
 
-class _Auth(asyncssh.SSHServer):
+class Auth(asyncssh.SSHServer):
     """Accept any username and do not ask for an SSH password."""
 
     def __init__(self, connections: set[asyncssh.SSHServerConnection]) -> None:
         """Share the listener's set of open connections."""
-        self._connections = connections
+        self.connections = connections
 
     def connection_made(self, conn: asyncssh.SSHServerConnection) -> None:
         """Remember ``conn`` so shutdown can close it."""
-        self._connections.add(conn)
+        self.connections.add(conn)
 
     def connection_lost(self, exc: Exception | None) -> None:
         """Forget every connection that has gone."""
         del exc
-        self._connections.difference_update(
-            {conn for conn in self._connections if conn.is_closed()}
-        )
+        self.connections.difference_update({conn for conn in self.connections if conn.is_closed()})
 
     def begin_auth(self, username: str) -> bool:
         """Let the first auth request succeed. The username is not a chat name."""
@@ -76,9 +75,7 @@ class _Auth(asyncssh.SSHServer):
         """Keyboard-interactive is available when auth continues."""
         return True
 
-    def get_kbdint_challenge(
-        self, username: str, lang: str, submethods: str
-    ) -> tuple[str, str, str, tuple[()]]:
+    def get_kbdint_challenge(self, username: str, lang: str, submethods: str) -> tuple[str, str, str, tuple[()]]:
         """Ask for nothing."""
         del username, lang, submethods
         return ("", "", "", ())
@@ -92,130 +89,131 @@ class _Auth(asyncssh.SSHServer):
 class SSHListener:
     """Run ``asyncssh`` and pass each session socket to ``handoff``."""
 
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        key: asyncssh.SSHKey,
-        handoff: Callable[[socket.socket, str, bool], None],
-        note_width: Callable[[socket.socket, int, int], None] | None = None,
-        listen_sock: socket.socket | None = None,
-    ) -> None:
+    def __init__(self, host: str, port: int, key: asyncssh.SSHKey, handoff: Callable[[socket.socket, str, bool], None], note_width: Callable[[socket.socket, int, int], None] | None = None, listen_sock: socket.socket | None = None, listen_socks: list[socket.socket] | None = None) -> None:  # fmt: skip  # noqa: E501
         """Keep the bind address, the already loaded key, and the game-thread handoff."""
-        self._host = host
-        self._port = port
-        self._key = key
-        self._listen_sock = listen_sock
-        self._handoff = handoff
-        self._note_width = note_width
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._acceptor: asyncssh.SSHAcceptor | None = None
-        self._connections: set[asyncssh.SSHServerConnection] = set()
-        self._thread: threading.Thread | None = None
-        self._ready = threading.Event()
-        self._error: ServerError | None = None
+        self.host = host
+        self.port = port
+        self.key = key
+        if listen_socks is None:
+            listen_socks = [listen_sock] if listen_sock is not None else []
+        self.listen_socks = listen_socks
+        self.listen_sock = listen_socks[0] if listen_socks else None
+        self.handoff = handoff
+        self.note_width = note_width
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.acceptor: asyncssh.SSHAcceptor | None = None
+        self.acceptors: list[asyncssh.SSHAcceptor] = []
+        self.connections: set[asyncssh.SSHServerConnection] = set()
+        self.thread: threading.Thread | None = None
+        self.ready = threading.Event()
+        self.error: ServerError | None = None
 
     def start(self) -> None:
         """Bind SSH. Raise ``ServerError`` when the key or the port fails."""
-        if self._thread is not None:
+        if self.thread is not None:
             return
-        self._thread = threading.Thread(target=self._run, name="ssh", daemon=True)
-        self._thread.start()
-        self._ready.wait()
-        if self._error is not None:
-            raise self._error
+        self.thread = threading.Thread(target=self.run, name="ssh", daemon=True)
+        self.thread.start()
+        self.ready.wait()
+        if self.error is not None:
+            raise self.error
 
     def close(self) -> None:
         """Stop accepting and close sessions. A second call does nothing."""
-        loop = self._loop
-        acceptor = self._acceptor
-        if loop is not None and acceptor is not None:
-            loop.call_soon_threadsafe(self._stop, acceptor)
-        thread = self._thread
+        loop = self.loop
+        acceptors = list(self.acceptors)
+        if self.acceptor is not None and self.acceptor not in acceptors:
+            acceptors.append(self.acceptor)
+        if loop is not None:
+            for acceptor in acceptors:
+                loop.call_soon_threadsafe(self.stop, acceptor)
+        thread = self.thread
         if thread is not None:
             thread.join(timeout=2)
-        self._thread = None
+        self.thread = None
 
-    def _stop(self, acceptor: asyncssh.SSHAcceptor) -> None:
+    def stop(self, acceptor: asyncssh.SSHAcceptor) -> None:
         """Stop listening and close every open SSH connection."""
         acceptor.close()
-        for conn in list(self._connections):
+        for conn in list(self.connections):
             conn.close()
 
-    def _run(self) -> None:
+    def run(self) -> None:
+        """Run the SSH listener until it stops."""
         try:
-            asyncio.run(self._serve())
+            asyncio.run(self.serve())
         except ServerError as exc:
-            self._error = exc
+            self.error = exc
         except Exception as exc:  # noqa: BLE001
-            self._error = ServerError(f"SSH listener stopped: {exc}")
+            self.error = ServerError(f"SSH listener stopped: {exc}")
         finally:
-            self._ready.set()
+            self.ready.set()
 
-    async def _serve(self) -> None:
-        self._loop = asyncio.get_running_loop()
+    async def serve(self) -> None:
+        """Accept SSH sessions and hand each one to the game loop."""
+        self.loop = asyncio.get_running_loop()
         listen_kwargs: dict[str, object] = {
-            "server_host_keys": [self._key],
-            "server_factory": lambda: _Auth(self._connections),
-            "process_factory": self._session,
+            "server_host_keys": [self.key],
+            "server_factory": lambda: Auth(self.connections),
+            "process_factory": self.session,
             "encoding": None,
             "line_editor": False,
         }
-        if self._listen_sock is not None:
-            listen_kwargs["sock"] = self._listen_sock
+        if self.listen_socks:
+            try:
+                for sock in self.listen_socks:
+                    self.acceptors.append(await asyncssh.listen(**listen_kwargs, sock=sock))
+            except OSError as exc:
+                for acceptor in self.acceptors:
+                    acceptor.close()
+                self.acceptors.clear()
+                raise ServerError(f"Could not listen for SSH on {self.host}:{self.port}: {exc.strerror}") from exc
         else:
-            listen_kwargs["host"] = self._host
-            listen_kwargs["port"] = self._port
-        try:
-            self._acceptor = await asyncssh.listen(**listen_kwargs)
-        except OSError as exc:
-            raise ServerError(
-                f"Could not listen for SSH on {self._host}:{self._port}: {exc.strerror}"
-            ) from exc
-        self._ready.set()
-        assert self._acceptor is not None  # noqa: S101
-        await self._acceptor.wait_closed()
+            listen_kwargs["host"] = self.host
+            listen_kwargs["port"] = self.port
+            try:
+                self.acceptors.append(await asyncssh.listen(**listen_kwargs))
+            except OSError as exc:
+                raise ServerError(f"Could not listen for SSH on {self.host}:{self.port}: {exc.strerror}") from exc
+        self.acceptor = self.acceptors[0]
+        self.ready.set()
+        await asyncio.gather(*(item.wait_closed() for item in self.acceptors))
 
-    async def _session(self, process: asyncssh.SSHServerProcess[Any]) -> None:
+    async def session(self, process: asyncssh.SSHServerProcess[Any]) -> None:
         """Bridge ``process`` to a socket the game thread already owns."""
         game, remote = socket.socketpair()
         game.setblocking(False)
         remote.setblocking(False)
         peer = process.get_extra_info("peername")
-        host = peer[0] if isinstance(peer, tuple) else "unknown"
-        self._report_width(process, game)
-        self._handoff(game, str(host), process.get_terminal_type() is not None)
+        host = peer_address(peer) if peer is not None else "unknown"
+        self.report_width(process, game)
+        self.handoff(game, str(host), process.get_terminal_type() is not None)
         loop = asyncio.get_running_loop()
-        to_game = asyncio.ensure_future(self._to_game(process, remote, loop, game))
+        to_game = asyncio.ensure_future(self.to_game(process, remote, loop, game))
         try:
-            await self._to_ssh(process, remote, loop)
+            await self.to_ssh(process, remote, loop)
         finally:
             to_game.cancel()
             await asyncio.gather(to_game, return_exceptions=True)
             remote.close()
 
-    def _report_width(self, process: asyncssh.SSHServerProcess[Any], game: socket.socket) -> None:
+    def report_width(self, process: asyncssh.SSHServerProcess[Any], game: socket.socket) -> None:
         """Queue the latest reported terminal size (columns and rows)."""
-        if self._note_width is None:
+        if self.note_width is None:
             return
         size = process.get_terminal_size()
         if size[0] <= 0 or size[1] <= 0:
             return
-        self._note_width(game, size[0], size[1])
+        self.note_width(game, size[0], size[1])
 
-    async def _to_game(
-        self,
-        process: asyncssh.SSHServerProcess[Any],
-        remote: socket.socket,
-        loop: asyncio.AbstractEventLoop,
-        game: socket.socket,
-    ) -> None:
+    async def to_game(self, process: asyncssh.SSHServerProcess[Any], remote: socket.socket, loop: asyncio.AbstractEventLoop, game: socket.socket) -> None:  # fmt: skip  # noqa: E501
+        """Copy SSH input onto the game socket."""
         try:
             while True:
                 try:
                     data = await process.stdin.read(4096)
                 except asyncssh.TerminalSizeChanged:
-                    self._report_width(process, game)
+                    self.report_width(process, game)
                     continue
                 except (asyncssh.BreakReceived, asyncssh.SignalReceived):
                     continue
@@ -228,12 +226,8 @@ class SSHListener:
             with contextlib.suppress(OSError):
                 remote.shutdown(socket.SHUT_WR)
 
-    async def _to_ssh(
-        self,
-        process: asyncssh.SSHServerProcess[Any],
-        remote: socket.socket,
-        loop: asyncio.AbstractEventLoop,
-    ) -> None:
+    async def to_ssh(self, process: asyncssh.SSHServerProcess[Any], remote: socket.socket, loop: asyncio.AbstractEventLoop) -> None:
+        """Copy game output onto the SSH channel."""
         try:
             while True:
                 data = await loop.sock_recv(remote, 4096)

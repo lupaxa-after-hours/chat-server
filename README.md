@@ -16,12 +16,11 @@ This server is a throwback to that. The days we grew up online and spent playing
 It is a bare-bones chat system, and it works. Use it straight out of the box, or do what we used to do: tinker
 with it, customise it, add to it, and make it your own.
 
-A multi-room TCP chat server. Each player picks a name, starts in the
-room named by `start`, and talks to the other people in that room.
-
 ## Key Features
 
 - Telnet, SSH, or both. SSH has no SSH password. The chat name is still the first prompt.
+- IPv4, IPv6, or both. `stack` is `ipv4`, `ipv6`, or `dual`.
+- Country lookup from an MMDB file. Loopback is Localhost, a private address is Private Network, and a miss is Unknown.
 - Saved players, bcrypt passwords, and ranks from newbie through Super Admin.
 - MFA with a six-digit code. The secret is sealed in the player file with the password.
 - Rooms, a map, tells, shouts, and staff tools for residents, super users, and admins.
@@ -32,15 +31,16 @@ room named by `start`, and talks to the other people in that room.
 pip install lupaxa-chat-server
 ```
 
-Requires Python 3.10+. AsyncSSH, bcrypt, colorama, cryptography, PyYAML,
-and qrcode are the runtime dependencies.
+Requires Python 3.10+. AsyncSSH, bcrypt, colorama, cryptography, maxminddb,
+PyYAML, and qrcode are the runtime dependencies.
 
 ## Run
 
 The server will not start without a config file. There is no default path.
-From a checkout:
+From a checkout, setup runs once while the talker is stopped:
 
 ```bash
+chat-server setup -c config/config.yml
 chat-server -c config/config.yml
 python -m lupaxa.chat_server -c config/config.yml
 ```
@@ -56,6 +56,7 @@ the help file yourself.
 - [Connect](mkdocs/usage/index.md), [Players](mkdocs/usage/players.md), [Rooms](mkdocs/usage/rooms.md), and [Commands](mkdocs/usage/commands.md) are how a player uses it.
 - [Reference](mkdocs/reference.md) is the config keys, ranks, and public names.
 - [Examples](mkdocs/examples.md) is a short telnet session and the SSH command.
+- [Developer Docs](developer-docs/README.md) is for changing the source. It is not part of the public site.
 
 <a href="https://github.com/the-lupaxa-project">
     <img src="https://raw.githubusercontent.com/the-lupaxa-project/brand-assets/master/logos/components/footer-for-child-orgs.svg" alt="The Lupaxa Project Footer" width="100%" />

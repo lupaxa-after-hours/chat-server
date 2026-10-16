@@ -16,12 +16,24 @@
   aliases: [":", ";"]
   text: |
     Act out a line in the room you are in. Other people see a line starting with - and your name and then the text. : and ; do the same thing with no space after them.
-- name: entermsg
+- name: set entermsg
   notes: The sentence is at most 80 characters.
   text: |
     Set the line people see when you enter a room. Your name is added in front.
-    entermsg crawls into the room shows your name, then that sentence.
-    The default is arrives. Bare entermsg clears a saved line.
+    set entermsg crawls into the room shows your name, then that sentence.
+    The default is arrives. Bare set entermsg clears a saved line.
+- name: set loginmsg
+  notes: The sentence is at most 80 characters.
+  text: |
+    Set the line people see when you log in. Your name is added in front.
+    set loginmsg wanders in shows your name, then that sentence.
+    The default is has connected. Bare set loginmsg clears a saved line.
+- name: set logoutmsg
+  notes: The sentence is at most 80 characters.
+  text: |
+    Set the line people see when you log out. Your name is added in front.
+    set logoutmsg slips away shows your name, then that sentence.
+    The default is has disconnected. Bare set logoutmsg clears a saved line.
 - name: think
   aliases: ["~"]
   text: |
@@ -39,6 +51,7 @@
     Speak to one named player, wherever they are. The name is the first word. They see a line starting with > and who told them.
     . and > are the same command. .Bea hello and > Bea hello are tell.
     Naming yourself replies Talking to yourself is the first sign of madness.
+    A comma-separated list names several people. tell Bea, Ade hello reaches both. Two or more other people start a chain, shown as (1) before the line. tell 1 hello sends to that chain. tell 1, Dee hello adds Dee. You can send only to a chain you are on. A chain holds at most 10 people. When someone logs out, the others are told. A chain closes when fewer than three people remain. If that smaller set matches another chain, the higher id is removed.
 - name: remote
   aliases: [",", "<"]
   text: |
@@ -46,15 +59,37 @@
     You see You emote: Ada smiles to Bea. They see a line starting with > and Ada smiles to you.
     , and < are the same command. ,Bea smiles and < Bea smiles are remote.
     Naming yourself replies Talking to yourself is the first sign of madness.
+    A comma-separated list names several people. remote Bea, Ade hello reaches both. Two or more other people start a chain, shown as (1) before the line. remote 1 hello sends to that chain. remote 1, Dee hello adds Dee. You can send only to a chain you are on. A chain holds at most 10 people. When someone logs out, the others are told. A chain closes when fewer than three people remain. If that smaller set matches another chain, the higher id is removed.
+- name: rthink
+  see_also: [think, remote]
+  text: |
+    Share a thought with one named player, wherever they are. The name is the first word.
+    You see You think . o O ( hmm ) to Bea. They see a line starting with > and Ada thinks . o O ( hmm ) to you.
+    Naming yourself replies Talking to yourself is the first sign of madness.
+    A comma-separated list names several people. rthink Bea, Ade hello reaches both. Two or more other people start a chain, shown as (1) before the line. rthink 1 hello sends to that chain. rthink 1, Dee hello adds Dee. You can send only to a chain you are on. A chain holds at most 10 people. When someone logs out, the others are told. A chain closes when fewer than three people remain. If that smaller set matches another chain, the higher id is removed.
+- name: chains
+  see_also: [tell, remote, rthink]
+  text: |
+    List the chains you are on. Each line shows the id, the people, and how long since a message was sent. The idle clocks line up on the right. Under five minutes is [ Active ] in green. From five minutes the clock is yellow, from 30 minutes red, and from 60 minutes light black [--:--:--]. A dash rule sits above and below the list. When you are on no chain it replies You are not on a chain.
+    chains leave <id> [reason] removes you. The others are told, and an optional reason is included. chains remove <id> <name>[,<name>] [reason] removes those people from that chain. chains delete <id> [reason] deletes it and tells everyone who was on it. Leave and remove close the chain when fewer than three people remain. A chain with no message for 2 hours is deleted, and everyone on it is told.
 - name: go
   text: |
     Move through an exit. Use n, s, e, w, ne, nw, se, sw, up, down, or the long name of one of those directions. A full room refuses the move, and only you are told.
 - name: join
   text: |
     Move to the room a named player is in, when that room has space. The name may contain spaces.
-- name: look
+- name: grab
   text: |
-    Show this room's description, exits, and who else is here. You are not included, and the room is not told you arrived.
+    Pull a player of lower rank into the office room you are in. Super users and above.
+    They are told -=> <name> stretches out and grabs you !!!!!! and then they see the room.
+    The room they leave hears that they are grabbed by you. Your room hears their enter line.
+    You cannot grab your own rank or higher. Naming yourself replies You cannot do that to yourself.
+    From a house or The Void the reply is You can only grab someone into a system room.
+    A full room refuses. Someone already with you replies But <name> is already in the same room as you!
+- name: look
+  aliases: ["l"]
+  text: |
+    Show this room's description, exits, and who else is here. You are not included, and the room is not told you arrived. l is the same command. lplease is not.
 - name: map
   text: |
     Show a map with your room in the centre. The map is 5 by 5 when that drawing fits your frame width, and 3 by 3 when it does not. One blank line appears above the map and one below it. Every room inside that window is shown. Your room is green when colour is on. A line is drawn where two shown rooms connect.
@@ -77,7 +112,7 @@
     Same rank or higher on that command is You cannot remove MFA for Bea.
     No secret is Bea has no MFA.
     A forced clear is announced only as [ Admin ] Ada removes MFA for Bea.
-    If the super admin loses their phone, edit their player file and clear mfa_secret by hand.
+    If the super admin loses their phone, run chat-server setup -c and choose 2 Clear MFA.
 - name: main
   text: |
     Move to the start room. The room you leave hears that you went there.
@@ -88,18 +123,24 @@
   aliases: ["w"]
   text: |
     List every player who is in a room. The columns are Name, Rank, Room, Status, and Idle.
-    Idle is a clock only after 10 seconds. w is the same command. wplease is not.
+    Idle under five minutes says [ Active ]. From five minutes it is a [HH:MM:SS] clock.
+    [ Active ] is green. The clock is yellow until 30 minutes, then red. From 60 minutes it says [--:--:--] in light black.
+    w is the same command. wplease is not.
     At the name prompt, who in any case shows this list and asks for a name again.
 - name: examine
   aliases: ["x"]
   text: |
-    Show a framed profile. The name is centered. Fields are the rank, then status when one is set,
+    Show a framed profile. The name is centered. Fields are the rank, then roles when one is set,
+    then status when one is set,
     how long this login has lasted, total login, and idle.
     Idle of 10 seconds or less says Not idle at all.
+    Then the enter, login, and logout messages, in their own block.
+    Logged in from is the hostname and the IP, then [via telnet] or [via ssh].
+    A logged-out profile shows rank, roles when one is set, Last from, when they left, how long ago, and total login,
+    then those three messages. A plan, when one is set, sits under that block whether they are in a room or logged out.
+    A description, when one is set, sits under the name while they are in a room.
     me is you. A player is found by their name in any case.
-    Someone who is logged out shows when they left, how long ago, and their total login.
-    A super user or the admin also sees where they are logged in from, or where they were last from.
-    Examining yourself also adds Terminal Size.
+    Examining yourself also adds Terminal Size. Your own idle is already zero.
     x needs a space, so x Bea is examine.
 - name: ae
   text: |
@@ -109,7 +150,7 @@
     The line is red when colour is on.
 - name: alarm
   text: |
-    Set a countdown for a whole number of minutes. When it reaches zero you are told the alarm has passed.
+    Set a countdown for a whole number of minutes. When it reaches zero you are told the alarm has passed. Residents and above.
 - name: allow
   text: |
     Open or close new logins for newbies or for rank resident. Only the admin can use it.
@@ -117,6 +158,12 @@
     Closing resident logins does not block super users or the admin.
     The change lasts until the server stops.
     It does not change the config file. The staff channel hears who opened or closed the talker.
+- name: appoint
+  text: |
+    Give a saved player a role. Bare appoint lists the typed names. appoint Bea site_admin writes the flag.
+    The role is the rest of the line. You may name yourself. Another super admin cannot be changed.
+    The staff channel sees < SU > Ada assigns Bea to the role of 'Site Admin' with no final period.
+    The player is told that same sentence when they would not already have heard the staff channel.
 - name: at
   text: |
     Think on the admin channel. Admins only.
@@ -129,15 +176,16 @@
     You see [ Admin ] You say 'hello'.
     Other admins see [ Admin ] Ada says 'hello'.
     The line is red when colour is on.
-- name: auto_reply
+- name: set auto_reply
   text: |
-    Set a line sent back to anyone who tells or remotes you. auto_reply on its own clears it.
-    It is not saved. After a successful tell or remote, the sender sees [ Auto Reply ] and your message.
+    Set a line sent back to anyone who tells or remotes you. set auto_reply on its own clears it. Residents and above.
+    It is not saved. After a successful tell, remote, or rthink, the sender sees [ Auto Reply from <name> ] and your message.
+    A locked screen sends the screen-lock line instead of this reply.
 - name: broadcast
   text: |
-    Send a centered message to every player who is in a room. Only the admin can use it.
+    Send a centered message to every player who is in a room. Coder, or the Site Admin role.
     The line is red when colour is on. Two blank lines appear above and below the message.
-- name: prompt
+- name: set prompt
   text: |
     Replace the line you type at. A resident's prompt is kept for the next login. The usual line is What? >.
 - name: term_width
@@ -145,37 +193,116 @@
     Set the frame width for this connection. term_width 70 sets the frame to 70 columns. The number is from 60 up to the discovered width, or 80 before a size is known. term_width auto follows the discovered size. term_width alone prints the terminal line. It is not saved. Every rank can use this.
 - name: time
   text: |
-    Show the current time and how long this server has been running. The time looks like Monday 12th October 2026, 13:45:03 UTC.
+    Show the current time, when this server booted, and how long it has been running.
+    After a reboot, Rebooted at shows when this process started.
+    The clocks look like Monday 12th October 2026, 13:45:03 UTC.
 - name: help
   aliases: ["?"]
   text: |
     Show the help page for one command or alias.
     ? is the same command with no space after it, so ?say is help say.
-- name: reload
+    help search <text> lists every visible page which contains that text. One page is shown. None says No help found for '<text>'.
+- name: home
   text: |
-    Read the help file again. reload help replaces the book in memory when the file loads. A bad file leaves the old book in place and tells you why. Other admins are told when a changed file fails to load on its own.
+    Go to your home. Residents and above. The first home creates the room.
+    The room you leave hears that you go home. Only you can enter it.
+    who and the other place lists say Home. say and emote stay there. shout still reaches you.
+    map at home draws your house.
+- name: reload
+  see_also: [reload commands]
+  text: |
+    Read files again. Coder, or the Site Admin role.
+    reload commands lists the ones you can use.
+    A bad file tells you why and leaves the old copy in place.
+    The coder channel is told when a changed file fails to load on its own.
+    Someone with the Site Admin role who is below coder is told the same line. A locked screen does not show it.
+- name: reload all
+  text: |
+    Run reload config, then reload rooms, then reload help, then reload messages.
+    Each one sends its own result.
+- name: reload commands
+  text: |
+    List the reload commands you can use.
+- name: reload config
+  text: |
+    Read hot.yml again. Coder, or the Site Admin role.
+    A good file replaces the hot values. A bad file leaves them and tells you why.
+    The cold file stays as it was at startup.
+- name: reload help
+  text: |
+    Replace the help book in memory when the file loads.
+    A bad file leaves the old book in place and tells you why.
+- name: reload messages
+  text: |
+    Read banner.msg, full.msg, and no-more-newbies.msg again.
+    A bad file leaves that message. The other two still update.
+    All three loading says Messages reloaded.
+- name: reload rooms
+  text: |
+    Replace the office, and any house that is already loaded.
+    A bad office file leaves every room in place. A bad house file leaves that house in place and still updates the rest.
+    A room that disappeared moves you to The Void.
+- name: reboot
+  text: |
+    Replace the running process without dropping telnet.
+    The staff channel hears < SU > Ada has initiated a reboot.
+    After telnet returns it hears < SU > Reboot completed.
+    reboot warns every SSH connection with Rebooting now! and then disconnects them.
+    reboot <reason> uses Rebooting now for '<reason>'. Telnet players stay, including someone still logging in.
+    With no telnet port, the reply is to use shutdown.
 - name: version
   text: |
     Show the version of this chat server.
+- name: cls
+  text: |
+    Clear your screen. The room is not told.
+- name: testcard
+  text: |
+    Show every foreground and background colour on your screen. The room is not told.
 - name: colour
   aliases: ["color"]
   text: |
     Turn colour on or off. colour on and colour off set it. colour on its own tells you which it is. It is on until you turn it off. A saved player keeps the choice. A newbie can use it, and that choice is kept when they become a resident.
 - name: commands
+  notes: "SU Channel and above: commands su. Admins: commands admin. Coder and the super admin: commands coder. Site Admin: commands site_admin."
   text: |
-    List the punctuation aliases first, then the command names in alphabetical order. staff, w, and x are listed with the names.
+    List the punctuation aliases first, then the command names in alphabetical order. l, staff, w, and x are listed with the names.
+    commands a lists the names from that list which start with a. commands A is the same list. A letter with nothing to list says No commands found beginning with 'Z'. The letter keeps the case you typed.
+    commands aliases lists the aliases from that list. With none, it says There are no aliases.
+    commands su with nothing to list says There are no Super User commands. commands admin with nothing to list says There are no Admin commands. commands coder with nothing to list says There are no Coder commands.
+    commands site_admin lists every command that role grants. Only a player who holds it can run that filter, including while off duty.
+    An empty list says There are no Site Admin commands.
+- name: set
+  see_also: [set commands]
+  text: |
+    Run one set command. Residents and above.
+    set commands lists the ones you can use.
+- name: set commands
+  text: |
+    List the set commands you can use.
+- name: set login
+  text: |
+    Choose where the next fresh login starts. Residents and above.
+    set login tells you the current choice.
+    set login home starts that login at home, and creates the room when you have none. It does not move you now.
+    set login main starts that login in the main room.
 - name: disconnect
   text: |
     Disconnect a player who is in a room. You cannot disconnect someone of your rank or higher.
     They are told they have been disconnected, the room sees the usual disconnect, and the reason goes to the staff channel.
     Naming yourself replies You cannot do that to yourself.
+- name: dismiss
+  text: |
+    Take a role from a saved player. Bare dismiss lists the typed names. dismiss Bea site_admin clears the flag.
+    The staff channel sees < SU > Ada dismisses Bea from the role of 'Site Admin'.
+    The player is told that same sentence when they would not already have heard the staff channel.
 - name: quit
   text: |
     Leave the server. The room you are in is told that you disconnected.
     At the name prompt, quit in any case says Goodbye! and disconnects. It cannot be a name.
 - name: recap
   text: |
-    Change the capitalisation of your own name. The letters must stay the same.
+    Change the capitalisation of your own name. The letters must stay the same. Residents and above.
 - name: resident
   text: |
     Save a connected newbie. They choose a password and become a saved player.
@@ -187,6 +314,23 @@
     Delete a saved player and disconnect them if they are here.
     Same rank or higher replies You cannot nuke {name}.
     Naming yourself replies You cannot do that to yourself.
+- name: off_list
+  see_also: [on_list, lsu]
+  text: |
+    Hide yourself from the public staff list. Admins only. off_list <reason> tells the staff channel that you have gone off list because of that reason.
+    On lsu your rank becomes Off List, in your usual colour. People who are not staff no longer see you there. Staff still do.
+    You still see both channels and you can still use your commands.
+- name: on_list
+  see_also: [off_list, lsu]
+  text: |
+    Show yourself on the public staff list again. The staff channel hears that you have gone back on list, and your usual rank returns.
+- name: ipinfo
+  example: ipinfo me
+  text: |
+    Show the country database record for a player or an IP address. Admins only, and only while country lookup is on.
+    ipinfo me uses your connection, the same way examine me does. A saved player who is logged out uses the address in their file.
+    The frame shows the address, hostname, country, and whatever else the database has, such as the continent, ASN, and IP block.
+    Loopback is Localhost (XL). A private address is Private Network (XP). No record is Unknown (XU).
 - name: network
   example: network telnet
   text: |
@@ -194,9 +338,26 @@
     With no argument the telnet and SSH figures are combined.
     network telnet and network ssh show that port.
     network <player> shows one person who is in a room, from the moment their socket was accepted.
+    network me shows the connection you are on, the same way examine me shows you.
+- name: system
+  text: |
+    Show this process: uptime, CPU, memory, threads, sockets, sessions, disk, and context switches.
+    After a reboot, Rebooted at shows when these figures started.
+    Coder, or the Site Admin role.
 - name: password
   text: |
     Change your saved password. You are asked for the current password, then the new one, twice.
+- name: off_duty
+  see_also: [on_duty, lsu]
+  text: |
+    Step away from the staff role until you return. off_duty <reason> tells the staff channel that you go off duty because of that reason.
+    You no longer see the super-user or admin channels, and super-user and admin commands reply You are off duty. The coder channel stays open. cu, ce, and ct still work. on_duty still works.
+    On lsu your rank becomes Off Duty, in your usual colour. People who are not staff no longer see you there. Staff still do.
+- name: on_duty
+  see_also: [off_duty, lsu]
+  text: |
+    Return to the staff role. You are asked for your saved password. The right password tells the staff channel that you have returned to duty. Your rank and commands come back. A super user returns to the public lsu list. An SU Channel player returns only for SU Channel and above, shown as < Channel Only >.
+    A wrong password leaves you off duty. The staff channel hears that you got your password wrong and failed to return to duty.
 - name: su
   text: |
     Speak on the super-user channel.
@@ -206,10 +367,20 @@
 - name: st
   text: |
     Think on the super-user channel.
+- name: cu
+  text: |
+    Speak on the coder channel. You see { Coder } You say 'hello'. The others see { Coder } and your name and says 'hello'. The line is magenta when colour is on. Off duty does not close this channel.
+- name: ce
+  text: |
+    Emote on the coder channel. You see { Coder } You emote: waves. The others see { Coder } and your name and the emote.
+- name: ct
+  text: |
+    Think on the coder channel. You see { Coder } You think . o O ( lunch ). The others see { Coder } and your name and thinks . o O ( lunch ).
 - name: lsu
   aliases: ["staff"]
   text: |
-    List connected super users and the admin in a frame. Columns are Name, Rank, Room, Status, and Idle. staff is the same command. Every rank can use this.
+    List SU Channel and above in a frame. Columns are Name, Rank, Room, Status, and Idle. staff is the same command. Every rank can use this.
+    An SU Channel row is hidden from residents and newbies. SU Channel and above see < Channel Only >.
 - name: lsn
   text: |
     List connected newbies in a frame. Columns are Name, Address, Room, and Idle. Address is the hostname, or the IP when no name was found.
@@ -218,39 +389,57 @@
   text: |
     List every open connection in a frame.
     The columns are Name, Hostname, IP Address, and Type.
+    When country lookup is on, Country is added before Type.
+    Loopback is Localhost. A private address is Private Network. No record is Unknown.
     A socket with no name yet shows <pending>.
     After a name has been typed, that name is shown, including during the password.
     Type is telnet or ssh. conns is the same command.
 - name: promote
   text: |
-    Make a resident a super user, or a super user an admin.
-    Any admin may promote to super user.
-    Only the config account may promote to admin.
-    Staff hear < SU > Ada promotes Bea to Super User.
-    Admins hear [ Admin ] Ada promotes Bea to Admin.
-    Someone who is already an admin gets Bea is already an admin.
-    The config account gets Bea is the super admin.
-    A promoted admin gets Only the admin can promote Bea to Admin.
+    Make a connected player one saved rank higher.
+    The steps are resident, SU Channel, super user, admin, and coder.
+    An admin may move resident, SU Channel, and super user.
+    A coder or the super admin may move someone between super user and admin.
+    Only the super admin may promote an admin to coder.
+    Every rank change is told on the staff channel: < SU > Ada promotes Bea to Coder.
+    A coder gets Bea is already a coder.
+    Promoting the super admin replies Bea is the super admin.
+    An admin promoting a super user to admin gets Only a coder or the super admin can promote Bea to Admin.
+    A coder promoting an admin gets Only the super admin can promote Bea to Coder.
     Naming yourself replies You cannot do that to yourself.
+- name: pstats
+  text: |
+    Show how many newbies are logged in, how saved players split by exact rank, and how many saved players hold each role.
 - name: demote
   text: |
-    Move an admin down to super user, or a super user down to resident.
-    Any admin may demote a super user to resident.
-    Only the config account may demote an admin, including with force.
-    demote <name> force drops either one straight to resident.
-    Admins hear [ Admin ] Ada demotes Bea from Admin.
-    Staff hear < SU > Ada demotes Bea from Super User.
-    Force from admin sends Ada demotes Bea from Admin. on both channels.
+    Move a saved player one rank down. demote <name> force drops them to resident.
+    An admin may demote SU Channel or a super user, including with force.
+    A coder or the super admin may demote an admin, including with force.
+    Only the super admin may demote a coder, including with force.
+    Every rank change is told on the staff channel: < SU > Ada demotes Bea from Coder.
     A resident gets Bea is a resident.
-    The config account gets The super admin cannot be demoted.
-    A promoted admin gets Only the admin can demote Bea from Admin.
+    The super admin cannot be demoted.
+    An admin demoting an admin gets Only a coder or the super admin can demote Bea from Admin.
+    A coder demoting a coder gets Only the super admin can demote Bea from Coder.
     Naming yourself replies You cannot do that to yourself.
 - name: retire
   text: |
     Delete your own saved account. For saved players from resident rank upward.
     retire asks Are you sure you want to retire?, then asks for your password,
     then removes your file and disconnects you.
-    The admin cannot retire.
+    The super admin cannot retire.
+- name: roles
+  text: |
+    List roles. Bare roles lists your own. No roles replies You have no roles. roles Bea is for an admin and may name someone who is here or logged out. A resident who adds a name is told Only an admin can look up someone else's roles.
+- name: screenlock
+  text: |
+    Lock your screen until you type your saved password. Residents and above. screenlock on its own is enough. A reason is optional.
+    SU Channel and above go off duty. The staff channel hears that they have locked their screen, including the reason when one was given.
+    Locking clears the screen.
+    While locked, the only lines you see are Enter password to unlock: and Wrong password.
+    A tell, remote, or rthink tells the sender [ Screen Locked ] and that your screen is currently locked.
+    A locked screen does not also send the auto-reply.
+    The right password shows Screen is now unlocked. before the prompt. Staff return to duty, and the staff channel hears that they have unlocked their screen.
 - name: save
   text: |
     Write your player file now. For saved players from resident rank upward.
@@ -263,12 +452,16 @@
     and the terminal beeps once.
     The staff channel hears who was warned and why.
     Naming yourself replies You cannot do that to yourself.
-- name: description
+- name: set description
   text: |
-    Set the one line shown on examine. description on its own clears it.
+    Set the one line shown on examine. set description on its own clears it. Residents and above.
     At most 80 characters. A newbie starts as I am new here, and that line is cleared when they become a resident.
     A description you type is saved.
-- name: status
+- name: set plan
   text: |
-    Set the status shown on examine, who, and lsu. status on its own clears it.
+    Set the one line shown on examine, under the room sentences, whether you are in a room or logged out. set plan on its own clears it.
+    Residents and above. At most 80 characters. A plan you type is saved.
+- name: set status
+  text: |
+    Set the status shown on examine, who, and lsu. set status on its own clears it. Residents and above.
     At most 20 characters. It is not saved.

@@ -7,6 +7,9 @@
 .worktrees/
 cursor-docs
 
+# Countries
+config/countries/*.mmdb
+
 # Make
 .makefiles/
 
@@ -25,6 +28,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+uv.lock
 
 # SSH
 config/ssh_host_key

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 DEFAULT_HOST = "0.0.0.0"  # noqa: S104
 DEFAULT_ENTERMSG = "arrives."
+DEFAULT_LOGINMSG = "has connected."
+DEFAULT_LOGOUTMSG = "has disconnected."
 DEFAULT_PROMPT = "What? > "
 DEFAULT_LOGIN_TIMEOUT = 3
 DEFAULT_PASSWORD_ROUNDS = 12

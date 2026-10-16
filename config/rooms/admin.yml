@@ -1,0 +1,4 @@
+admin_home:
+  description: You are home.
+  max_occupancy: 1
+  exits: {}

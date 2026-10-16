@@ -6,15 +6,15 @@ import socket
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from .player import Player
-from .saved_player import SavedPlayer
-
 if TYPE_CHECKING:
-    from .net import NetStats
+    from .netstats import NetStats
+    from .player import Player
+    from .saved_player import SavedPlayer
 
 
-def _default_net_stats() -> NetStats:
-    from .net import NetStats as stats
+def default_net_stats() -> NetStats:
+    """Return a fresh traffic counter for one connection."""
+    from .netstats import NetStats as stats
 
     return stats()
 
@@ -37,6 +37,8 @@ class Client:
     password_failures: int = 0
     address: str = "unknown"
     hostname: str = ""
+    country_name: str = ""
+    country_code: str = ""
     accepted_at: float = 0.0
     ssh: bool = False
     terminal: bool = False
@@ -46,7 +48,10 @@ class Client:
     discovered_columns: int | None = None
     discovered_rows: int | None = None
     frame_columns: int | None = None
-    net: NetStats = field(default_factory=_default_net_stats)
+    net: NetStats = field(default_factory=default_net_stats)
+    welcome_pending: bool = False
+    naws_refused: bool = False
+    show_lock: bool = False
 
     def __post_init__(self) -> None:
         """Use the IP as the hostname until a lookup replaces it."""
@@ -73,3 +78,11 @@ class Client:
         if self.player is None or room_id is None:
             return
         self.player.room = room_id
+
+
+def output_hidden(client: object) -> bool:
+    """Return whether a screen lock is swallowing this line."""
+    user = getattr(client, "player", None)
+    if user is None or not getattr(user, "screen_locked", False):
+        return False
+    return not getattr(client, "show_lock", False)

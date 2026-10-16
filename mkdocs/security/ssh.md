@@ -11,7 +11,10 @@ port: 9000
 ssh_port: 9022
 ```
 
-Startup prints `Listening for SSH on 0.0.0.0:9022` when that port is set.
+Startup prints one `Listening for SSH` line for each address. `stack`
+chooses IPv4, IPv6, or both, and an IPv6 socket does not also accept IPv4.
+The default stack prints `Listening for SSH on 0.0.0.0:9022` when that
+port is set.
 A port that is already taken stops startup.
 
 ```bash
