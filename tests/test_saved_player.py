@@ -3,7 +3,7 @@
 from __future__ import annotations  # noqa: I001
 
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 
 import pytest
@@ -59,7 +59,7 @@ def test_password_problem_rejects_empty_and_over_72_bytes() -> None:
 
 def test_save_and_load_round_trip(tmp_path: Path) -> None:
     """A saved player comes back with the same spelling, rank, and logout time."""
-    logged_out = datetime(2026, 10, 12, 1, 16, tzinfo=timezone.utc)
+    logged_out = datetime(2026, 10, 12, 1, 16, tzinfo=UTC)
     hashed = hash_password("secret", rounds=4)
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hashed, logged_out))
     path = player_path(tmp_path, "Bea")
@@ -437,7 +437,7 @@ def test_logout_keeps_colour_off(tmp_path: Path) -> None:
     from lupaxa.chat_server.saved_player import record_saved_logout
 
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("secret", rounds=4), colour=False))
-    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT, colour=False)
+    user = Player("Bea", "hall", datetime.now(UTC), rank=Rank.RESIDENT, colour=False)
     record_saved_logout(tmp_path, user)
     saved = load_saved(player_path(tmp_path, "bea"))
     assert saved is not None

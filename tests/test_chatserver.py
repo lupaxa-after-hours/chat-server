@@ -7,7 +7,7 @@ import socket
 import threading
 import time
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 
 import pytest
@@ -202,10 +202,10 @@ def test_server_copies_allow_flags(tmp_path: Path) -> None:
 
 def test_the_server_records_when_it_was_created(tmp_path: Path) -> None:
     """started_at is UTC and is the moment the object is created."""
-    before = datetime.now(timezone.utc)
+    before = datetime.now(UTC)
     server = ChatServer(make_config(players=player_dir(tmp_path)), layout(tmp_path), TEST_HELP)
-    after = datetime.now(timezone.utc)
-    assert server.started_at.tzinfo is timezone.utc
+    after = datetime.now(UTC)
+    assert server.started_at.tzinfo is UTC
     assert before <= server.started_at <= after
 
 
@@ -955,7 +955,7 @@ def test_get_clients_defaults_to_login_order_and_can_sort_by_name() -> None:
     """Login order stays the default. Alphabetical order is by name, with no name last."""
     left, right = socket.socketpair()
     try:
-        when = datetime.now(timezone.utc)
+        when = datetime.now(UTC)
         cara = Client(sock=left, player=Player("Cara", "hall", when))
         ada = Client(sock=left, player=Player("Ada", "hall", when))
         pending = Client(sock=left)
@@ -972,7 +972,7 @@ def test_find_player_finds_bob_and_skips_incomplete_clients() -> None:
     """A lowercase bob finds Bob. Clients with no room or no player are skipped."""
     left, right = socket.socketpair()
     try:
-        when = datetime.now(timezone.utc)
+        when = datetime.now(UTC)
         no_player = Client(sock=left)
         waiting = Player("Bob", "hall", when)
         waiting.room = None  # type: ignore[assignment]
@@ -1137,7 +1137,7 @@ def test_remember_address_writes_the_country(tmp_path: Path) -> None:
     server = ChatServer(make_config(players=players), layout(tmp_path), TEST_HELP)
     left, right = socket.socketpair()
     try:
-        user = Player("Bea", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+        user = Player("Bea", "reception", datetime.now(UTC), rank=Rank.RESIDENT)
         client = Client(sock=left, player=user, address="8.8.8.8", hostname="dns.google", country_name="United States", country_code="US")
         remember_address(server, client)  # type: ignore[arg-type]
         saved = load_saved(player_path(players, "Bea"))
@@ -1311,7 +1311,7 @@ def test_a_saved_player_reconnects_over_a_live_session(tmp_path: Path, capsys: p
     players = tmp_path / "players"
     players.mkdir()
     save_player(players, SavedPlayer("admin", Rank.ADMIN, hash_password("pw", rounds=4)))
-    logged_out = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    logged_out = datetime(2020, 1, 1, tzinfo=UTC)
     save_player(players, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), logged_out_at=logged_out, ip_address="192.168.0.9"))  # fmt: skip  # noqa: E501
     save_player(players, SavedPlayer("Cyd", Rank.RESIDENT, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Ada", Rank.SUPER_USER, hash_password("pw", rounds=4)))
@@ -1442,7 +1442,7 @@ def test_record_logout_saves_the_total_and_the_time_in_one_write(tmp_path: Path)
     left, right = socket.socketpair()
     other, extra = socket.socketpair()
     try:
-        user = Player("Bea", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+        user = Player("Bea", "reception", datetime.now(UTC), rank=Rank.RESIDENT)
         user.connected_seconds = 40
         resident = Client(sock=left, player=user)
         server.clients[left] = resident
@@ -1452,7 +1452,7 @@ def test_record_logout_saves_the_total_and_the_time_in_one_write(tmp_path: Path)
         assert saved.connected_seconds == 40
         assert saved.logged_out_at is not None
 
-        newbie = Player("Cyd", "reception", datetime.now(timezone.utc), connected_seconds=40)
+        newbie = Player("Cyd", "reception", datetime.now(UTC), connected_seconds=40)
         fresh = Client(sock=other, player=newbie)
         server.clients[other] = fresh
         server.drop(fresh, announce=False)

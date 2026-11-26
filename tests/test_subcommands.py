@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -211,7 +211,7 @@ def test_the_lister_sends_the_heading(monkeypatch: pytest.MonkeyPatch) -> None:
     attach_subcommands(commands)
     parent = commands[0]
     monkeypatch.setattr("lupaxa.chat_server.commands.by_name", lambda: {"set": parent})
-    user = Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    user = Player("Ada", "reception", datetime.now(UTC), rank=Rank.RESIDENT)
     ada = FakePlayer(name="Ada", player=user)
     server = FakeServer(people=[ada])
     listed = parent.subcommands[-1]  # type: ignore[index]
@@ -230,7 +230,7 @@ def parent_ran(server: Server, client: Client, command: Command, text: str | Non
 
 def test_set_lists_its_commands() -> None:
     """A resident sees the list. A newbie does not see set."""
-    user = Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT, idle_seconds=5)
+    user = Player("Ada", "reception", datetime.now(UTC), rank=Rank.RESIDENT, idle_seconds=5)
     ada = FakePlayer(name="Ada", player=user)
     server = FakeServer(people=[ada])
     process_commands(server, ada, "set")  # type: ignore[arg-type]
@@ -242,7 +242,7 @@ def test_set_lists_its_commands() -> None:
     server.sent.clear()
     process_commands(server, ada, "set Commands extra")  # type: ignore[arg-type]
     assert server.sent == ["Subcommands available:\nauto_reply commands description entermsg login loginmsg logoutmsg plan\nprompt status\n"]
-    newbie = FakePlayer(name="Bea", player=Player("Bea", "reception", datetime.now(timezone.utc), rank=Rank.NEWBIE))
+    newbie = FakePlayer(name="Bea", player=Player("Bea", "reception", datetime.now(UTC), rank=Rank.NEWBIE))
     server.sent.clear()
     process_commands(server, newbie, "set commands")  # type: ignore[arg-type]
     assert server.sent == ["No such command 'set'\n"]
@@ -253,7 +253,7 @@ def test_set_lists_its_commands() -> None:
 
 def test_an_unknown_child_keeps_the_typed_case() -> None:
     """Foo is not a child. The reply uses the typed word."""
-    ada = FakePlayer(name="Ada", player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    ada = FakePlayer(name="Ada", player=Player("Ada", "reception", datetime.now(UTC), rank=Rank.RESIDENT))
     server = FakeServer(people=[ada])
     process_commands(server, ada, "set Foo")  # type: ignore[arg-type]
     assert server.sent == ["No such subcommand 'Foo'.\n"]
@@ -268,12 +268,12 @@ def test_the_parent_function_is_not_called(monkeypatch: pytest.MonkeyPatch) -> N
     parent = commands[0]
     monkeypatch.setattr("lupaxa.chat_server.parse.by_name", lambda: {"widget": parent})
     monkeypatch.setattr("lupaxa.chat_server.parse.aliases", lambda: ())
-    ada = FakePlayer(name="Ada", player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.SUPER_USER))
+    ada = FakePlayer(name="Ada", player=Player("Ada", "reception", datetime.now(UTC), rank=Rank.SUPER_USER))
     server = FakeServer(people=[ada])
     process_commands(server, ada, "widget foo")  # type: ignore[arg-type]
     assert server.sent == ["Syntax: widget foo <name>\n"]
     assert CALLED["parent"] == 0
-    resident = FakePlayer(name="Bea", player=Player("Bea", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    resident = FakePlayer(name="Bea", player=Player("Bea", "reception", datetime.now(UTC), rank=Rank.RESIDENT))
     server.sent.clear()
     process_commands(server, resident, "widget foo")  # type: ignore[arg-type]
     assert server.sent == ["No such subcommand 'foo'.\n"]
@@ -281,7 +281,7 @@ def test_the_parent_function_is_not_called(monkeypatch: pytest.MonkeyPatch) -> N
 
 def test_off_duty_blocks_a_super_parent_and_a_super_child(monkeypatch: pytest.MonkeyPatch) -> None:
     """Off duty stops a super parent, and a super child, before they run."""
-    user = Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.SUPER_USER, off_duty=True)
+    user = Player("Ada", "reception", datetime.now(UTC), rank=Rank.SUPER_USER, off_duty=True)
     ada = FakePlayer(name="Ada", player=user)
     server = FakeServer(people=[ada])
     process_commands(server, ada, "set commands")  # type: ignore[arg-type]
@@ -331,7 +331,7 @@ def test_help_set_pages_follow_rank() -> None:
     assert resident.find("set commands") is not None
     assert newbie.find("set") is None
     assert newbie.find("set commands") is None
-    ada = FakePlayer(name="Ada", player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.NEWBIE))
+    ada = FakePlayer(name="Ada", player=Player("Ada", "reception", datetime.now(UTC), rank=Rank.NEWBIE))
     server = FakeServer(people=[ada], help=book)
     command_help(server, ada, by_name()["help"], "set")  # type: ignore[arg-type]
     command_help(server, ada, by_name()["help"], "set commands")  # type: ignore[arg-type]
@@ -346,7 +346,7 @@ def test_a_hidden_child_is_missing_from_help(monkeypatch: pytest.MonkeyPatch) ->
     book = HelpBook(entries=(HelpEntry("widget foo", (), "Secret."),))
     assert visible_help(book, Rank.RESIDENT, mfa_enabled=False).find("widget foo") is None
     assert visible_help(book, Rank.SUPER_USER, mfa_enabled=False).find("widget foo") is not None
-    ada = FakePlayer(name="Ada", player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    ada = FakePlayer(name="Ada", player=Player("Ada", "reception", datetime.now(UTC), rank=Rank.RESIDENT))
     server = FakeServer(people=[ada], help=book)
     command_help(server, ada, by_name()["help"], "widget foo")  # type: ignore[arg-type]
     assert server.sent == ["help for widget foo not found\n"]
@@ -385,7 +385,7 @@ def test_child_aliases_match_whole_words(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr("lupaxa.chat_server.parse.by_name", by_widget)
     monkeypatch.setattr("lupaxa.chat_server.commands.by_name", by_widget)
     monkeypatch.setattr("lupaxa.chat_server.parse.aliases", lambda: ())
-    ada = FakePlayer(name="Ada", player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    ada = FakePlayer(name="Ada", player=Player("Ada", "reception", datetime.now(UTC), rank=Rank.RESIDENT))
     server = FakeServer(people=[ada])
     process_commands(server, ada, "widget commands")  # type: ignore[arg-type]
     assert server.sent == ["Subcommands available:\n! c commands\n"]

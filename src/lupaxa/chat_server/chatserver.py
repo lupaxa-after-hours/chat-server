@@ -10,7 +10,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -205,7 +205,7 @@ class ChatServer:
         self.message_stamps = message_file_stamps(config.messages_path)
         self.message_failed: dict[str, HelpStamp] = {}
         self.help_check_seconds = 0
-        self.started_at = datetime.now(timezone.utc)
+        self.started_at = datetime.now(UTC)
         self.rebooted_at: datetime | None = None
         self.process = psutil.Process()
         self.process.cpu_percent(interval=None)
@@ -304,7 +304,7 @@ class ChatServer:
 
     def adopt(self, state: RebootState) -> None:
         """Register inherited listeners and telnet clients from a reboot snapshot."""
-        self.rebooted_at = datetime.now(timezone.utc)
+        self.rebooted_at = datetime.now(UTC)
         self.started_at = state.started_at
         self.timer_mark = state.timer_mark
         self.timer_remainder = state.timer_remainder

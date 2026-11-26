@@ -6,7 +6,7 @@ import os
 import re
 import tempfile
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import bcrypt
@@ -240,7 +240,7 @@ def record_saved_logout(directory: Path, player: Player) -> None:
         saved = load_saved(player_path(directory, player.lowercase_name))
         if saved is None:
             return
-        stamped = replace(saved, logged_out_at=datetime.now(timezone.utc), connected_seconds=player.connected_seconds)
+        stamped = replace(saved, logged_out_at=datetime.now(UTC), connected_seconds=player.connected_seconds)
         save_player(directory, stamped)
     except (ConfigError, OSError) as exc:
         print(exc)

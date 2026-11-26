@@ -5,7 +5,7 @@ from __future__ import annotations  # noqa: I001
 import contextlib
 import socket
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 
 import pytest
@@ -73,7 +73,7 @@ def test_snapshot_records_listener_and_ssh_listen_fds() -> None:
 
 def test_finish_reboot_rewrites_outgoing_after_ssh_drop(tmp_path: Path) -> None:
     sock_r, sock_w = socket.socketpair()
-    player = Player("Ada", "reception", datetime.now(timezone.utc))
+    player = Player("Ada", "reception", datetime.now(UTC))
     client = Client(sock_r, player=player, auth="name")
     server = FinishRebootServer(roster_dir=tmp_path, clients={sock_r: client})
     state = snapshot(FakeServer(roster_dir=tmp_path), [client], "")
@@ -87,9 +87,9 @@ def test_finish_reboot_rewrites_outgoing_after_ssh_drop(tmp_path: Path) -> None:
 
 
 def test_snapshot_round_trips_live_state(tmp_path: Path) -> None:
-    started = datetime(2026, 10, 15, 8, 0, tzinfo=timezone.utc)
-    connected = datetime(2026, 10, 15, 8, 1, tzinfo=timezone.utc)
-    logged_out = datetime(2026, 10, 15, 7, 0, tzinfo=timezone.utc)
+    started = datetime(2026, 10, 15, 8, 0, tzinfo=UTC)
+    connected = datetime(2026, 10, 15, 8, 1, tzinfo=UTC)
+    logged_out = datetime(2026, 10, 15, 7, 0, tzinfo=UTC)
     player = Player("Ada", "reception", connected, alarm_seconds=12, idle_seconds=3, prompt="Yes? ", rank=Rank.RESIDENT, connected_seconds=9, flushed_seconds=4, colour=False, description="Here", status="Away", auto_reply="Later", entermsg="arrives")
     saved = SavedPlayer("Ada", Rank.RESIDENT, "hash", logged_out_at=logged_out, ip_address="127.0.0.1", hostname="localhost", connected_seconds=9, prompt="Yes? ", colour=False, description="Here", mfa_secret="secret", mfa_on=True, entermsg="arrives")  # noqa: E501
     client = Client(socket.socket(), player=player, auth="renew", pending_name="Ada", pending_saved=saved, pending_password="new", pending_current_password="old", pending_mfa_secret="sec", pending_issuer="chat", password_failures=1, address="127.0.0.1", hostname="localhost", accepted_at=10.5, terminal=True, hide_input=True, discovered_columns=80, discovered_rows=24, frame_columns=72)  # fmt: skip  # noqa: E501
@@ -140,7 +140,7 @@ def test_snapshot_round_trips_live_state(tmp_path: Path) -> None:
 
 
 def test_an_unknown_step_is_cleared_only_in_the_file() -> None:
-    player = Player("Ada", "reception", datetime(2026, 10, 15, tzinfo=timezone.utc))
+    player = Player("Ada", "reception", datetime(2026, 10, 15, tzinfo=UTC))
     client = Client(socket.socket(), player=player, auth="mystery", pending_password="secret")
     server = FakeServer()
     state = snapshot(server, [client], "maintenance")
@@ -164,8 +164,8 @@ def test_a_normal_start_deletes_a_leftover_file(tmp_path: Path) -> None:
 def test_a_dead_fd_is_skipped_and_the_other_client_returns() -> None:
     live_r, live_w = socket.socketpair()
     state = snapshot(FakeServer(), [], "")
-    good = RebootClient(fileno=live_r.fileno(), buffer=b"", outgoing=b"hi", player=Player("Ada", "reception", datetime.now(timezone.utc)), auth="name", pending_name="", pending_saved=None, pending_password="", pending_current_password="", pending_mfa_secret="", pending_issuer="", password_failures=0, address="127.0.0.1", hostname="localhost", accepted_at=1.0, terminal=False, hide_input=False, iac=b"", saw_cr=False, discovered_columns=None, discovered_rows=None, frame_columns=None, net=NetStats(), restart_notice="")  # fmt: skip  # noqa: E501
-    dead = replace(good, fileno=99999, player=Player("Bea", "hall", datetime.now(timezone.utc)))
+    good = RebootClient(fileno=live_r.fileno(), buffer=b"", outgoing=b"hi", player=Player("Ada", "reception", datetime.now(UTC)), auth="name", pending_name="", pending_saved=None, pending_password="", pending_current_password="", pending_mfa_secret="", pending_issuer="", password_failures=0, address="127.0.0.1", hostname="localhost", accepted_at=1.0, terminal=False, hide_input=False, iac=b"", saw_cr=False, discovered_columns=None, discovered_rows=None, frame_columns=None, net=NetStats(), restart_notice="")  # fmt: skip  # noqa: E501
+    dead = replace(good, fileno=99999, player=Player("Bea", "hall", datetime.now(UTC)))
     state.clients = [good, dead]
     restored = clients_from_state(state)
     assert [client.name for client in restored] == ["Ada"]
@@ -244,7 +244,7 @@ def test_reboot_without_reason_warns_ssh_and_announces_admin(tmp_path: Path) -> 
     ada = FakePlayer(name="Ada")
     ada.player.rank = Rank.CODER
     ada.player.colour = False
-    bea = FakePlayer(name="Bea", ssh=True, player=Player("Bea", "reception", datetime.now(timezone.utc)))
+    bea = FakePlayer(name="Bea", ssh=True, player=Player("Bea", "reception", datetime.now(UTC)))
     server.people = [ada, bea]
     process_commands(server, ada, "reboot")  # type: ignore[arg-type]
     assert "< SU > Ada has initiated a reboot.\n" in server.staff_lines
@@ -260,7 +260,7 @@ def test_reboot_announces_and_warns_ssh(tmp_path: Path) -> None:
     ada = FakePlayer(name="Ada")
     ada.player.rank = Rank.CODER
     ada.player.colour = False
-    bea = FakePlayer(name="Bea", ssh=True, player=Player("Bea", "reception", datetime.now(timezone.utc)))
+    bea = FakePlayer(name="Bea", ssh=True, player=Player("Bea", "reception", datetime.now(UTC)))
     server.people = [ada, bea]
     process_commands(server, ada, "reboot maintenance")  # type: ignore[arg-type]
     assert "< SU > Ada has initiated a reboot for 'maintenance'.\n" in server.staff_lines
@@ -302,7 +302,7 @@ def test_exec_failure_tells_telnet_players_to_carry_on(tmp_path: Path, monkeypat
     ada.auth = "mystery"
     ada.pending_password = "secret"
     ada.sock = socket.socket()
-    cay = FakePlayer(name="Cay", ssh=True, player=Player("Cay", "hall", datetime.now(timezone.utc)))
+    cay = FakePlayer(name="Cay", ssh=True, player=Player("Cay", "hall", datetime.now(UTC)))
     server.people = [ada, cay]
 
     def refuse(_argv: list[str]) -> None:
@@ -327,7 +327,7 @@ def test_adopt_warns_every_connected_site_admin(tmp_path: Path, monkeypatch: pyt
     save_player(players, SavedPlayer("Fay", Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
     save_player(players, SavedPlayer("Guy", Rank.SUPER_ADMIN, hash_password("pw", rounds=4)))
     listener = bind_listener("127.0.0.1", free_port())
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     ada_left, ada_right = socket.socketpair()
     bea_left, bea_right = socket.socketpair()
     cyd_left, cyd_right = socket.socketpair()
@@ -395,7 +395,7 @@ def test_adopt_warns_every_connected_site_admin(tmp_path: Path, monkeypatch: pyt
 def test_adopt_registers_inherited_telnet_and_deletes_reboot_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     players = player_dir(tmp_path)
     listener = bind_listener("127.0.0.1", free_port())
-    started = datetime(2026, 10, 15, 8, 0, tzinfo=timezone.utc)
+    started = datetime(2026, 10, 15, 8, 0, tzinfo=UTC)
     server_stub = FakeServer(started_at=started, roster_dir=players)
     state = snapshot(server_stub, [], "")
     state.telnet_fd = listener.fileno()
@@ -430,7 +430,7 @@ def test_adopt_restores_a_home_room(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     players = player_dir(tmp_path)
     listener = bind_listener("127.0.0.1", free_port())
     left, right = socket.socketpair()
-    player = Player("Ada", "home_ada", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    player = Player("Ada", "home_ada", datetime.now(UTC), rank=Rank.RESIDENT)
     client = Client(left, player=player)
     server_stub = FakeServer(roster_dir=players)
     state = snapshot(server_stub, [client], "")
@@ -461,7 +461,7 @@ def test_adopt_puts_a_missing_room_in_the_void(tmp_path: Path) -> None:
     players = player_dir(tmp_path)
     listener = bind_listener("127.0.0.1", free_port())
     left, right = socket.socketpair()
-    player = Player("Ada", "kitchen", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    player = Player("Ada", "kitchen", datetime.now(UTC), rank=Rank.RESIDENT)
     client = Client(left, player=player)
     server_stub = FakeServer(roster_dir=players)
     state = snapshot(server_stub, [client], "")
@@ -493,7 +493,7 @@ def test_adopt_puts_a_missing_room_in_the_void(tmp_path: Path) -> None:
 
 def test_reboot_snapshot_round_trips_chains(tmp_path: Path) -> None:
     """A chain's id, names, and last message survive the reboot file."""
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     server = FakeServer(roster_dir=tmp_path)
     server.chains = [Chain(4, ["Ada", "Bea", "Cyd"], when)]
     state = snapshot(server, [], "")

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .broadcast import broadcast_all, broadcast_coder
@@ -104,7 +104,7 @@ def apply_net_tick(server: Server, whole: int) -> None:
 def process_timer(server: Server) -> None:
     """Advance idle and alarm counters by the seconds elapsed since the last loop."""
     if not server.is_stopping():
-        close_idle_chains(server, datetime.now(timezone.utc))
+        close_idle_chains(server, datetime.now(UTC))
     now = time.monotonic()
     mark, remainder, whole = consume_seconds(server.timer_mark, server.timer_remainder, now)
     server.timer_mark = mark

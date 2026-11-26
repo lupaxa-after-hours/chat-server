@@ -11,7 +11,7 @@ text does not clear it.
 pip install lupaxa-chat-client
 ```
 
-Requires Python 3.10 or newer. It only runs in a terminal. It stops
+Requires Python 3.11 to 3.15. It only runs in a terminal. It stops
 before connecting when standard input or standard output is not a
 terminal.
 

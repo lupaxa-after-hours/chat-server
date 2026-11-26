@@ -8,7 +8,7 @@ The server will not start without a config file. There is no default path.
 pip install lupaxa-chat-server
 ```
 
-Requires Python 3.10 or newer. AsyncSSH, bcrypt, colorama, cryptography,
+Requires Python 3.11 to 3.15. AsyncSSH, bcrypt, colorama, cryptography,
 maxminddb, PyYAML, and qrcode are the runtime dependencies.
 
 `config/config.yml`, `config/rooms/system.yml`, and `config/help.yml` in this

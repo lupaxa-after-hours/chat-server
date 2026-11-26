@@ -1,6 +1,6 @@
 """Chain names, ids, and the tell target split."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from test_commands import FakePlayer, FakeServer
 
@@ -44,7 +44,7 @@ def test_listed_names_sorts_and_says_you() -> None:
 
 def test_lowest_free_number_reuses_a_gap() -> None:
     """The next id is the smallest positive integer that is free."""
-    when = datetime(2026, 10, 15, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, tzinfo=UTC)
     chains = [Chain(number, ["Ada"], when) for number in (1, 2, 3, 5)]
     assert lowest_free_number(chains) == 4
     assert lowest_free_number([]) == 1
@@ -52,7 +52,7 @@ def test_lowest_free_number_reuses_a_gap() -> None:
 
 def test_find_chain_matches_the_set_and_ignores_order() -> None:
     """Lookup is by id, or by the same people in any order and case."""
-    when = datetime(2026, 10, 15, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, tzinfo=UTC)
     chain = Chain(4, ["Ada", "Bea", "Cyd"], when)
     assert find_chain([chain], 4) is chain
     assert find_chain([chain], 1) is None
@@ -86,7 +86,7 @@ def test_deliver_treats_non_ascii_digit_as_a_name() -> None:
     """A superscript digit is matched as a player name, not a chain id."""
     ada = _person("Ada", "reception")
     server = _server(ada)
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     result = deliver(server, ada, ["²"], when)
     assert result.stopped is False
     assert result.sender_lines == ["Player ² not found.\n"]
@@ -99,7 +99,7 @@ def test_two_names_create_the_lowest_free_chain() -> None:
     bea = _person("Bea")
     cyd = _person("Cyd")
     server = _server(ada, bea, cyd)
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     result = deliver(server, ada, ["Bea", "Cyd"], when)
     assert result.stopped is False
     assert result.sender_lines == []
@@ -115,7 +115,7 @@ def test_one_survivor_does_not_create_a_chain() -> None:
     ada = _person("Ada", "reception")
     bea = _person("Bea")
     server = _server(ada, bea)
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     result = deliver(server, ada, ["Bea", "Zed"], when)
     assert result.chain is None
     assert result.stopped is False
@@ -128,7 +128,7 @@ def test_a_chain_you_are_not_on_stops_before_name_matching() -> None:
     """A bad chain id sends nothing, and the other piece is not matched."""
     ada = _person("Ada", "reception")
     server = _server(ada)
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     result = deliver(server, ada, ["4", "Zed"], when)
     assert result.stopped is True
     assert result.sender_lines == ["You are not on chain 4.\n"]
@@ -142,7 +142,7 @@ def test_two_chain_ids_are_refused() -> None:
     bea = _person("Bea")
     cyd = _person("Cyd")
     server = _server(ada, bea, cyd)
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     made = deliver(server, ada, ["Bea", "Cyd"], when)
     assert made.chain is not None
     again = deliver(server, ada, ["1", "1"], when)
@@ -160,7 +160,7 @@ def test_adding_until_the_sets_match_removes_the_other_chain() -> None:
     cyd = _person("Cyd")
     dee = _person("Dee")
     server = _server(ada, bea, cyd, dee)
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     first = deliver(server, ada, ["Bea", "Cyd"], when)
     second = deliver(server, ada, ["Bea", "Cyd", "Dee"], when)
     assert first.chain is not None
@@ -182,7 +182,7 @@ def test_eleven_people_are_refused_without_a_change() -> None:
     names = ["Ada", "Bea", "Cyd", "Dee", "Eve", "Fay", "Gus", "Hal", "Ian", "Joe", "Kay"]
     people = [_person(name, "reception" if name == "Ada" else "hall") for name in names]
     server = _server(*people)
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     result = deliver(server, people[0], names[1:], when)
     assert result.stopped is True
     assert result.sender_lines == [f"A chain can hold {MAX_CHAIN_PEOPLE} people. Get in a room and use say.\n"]
@@ -191,7 +191,7 @@ def test_eleven_people_are_refused_without_a_change() -> None:
 
 def test_one_departure_closes_a_chain_of_three() -> None:
     """Two people left are told, and the chain is gone."""
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     chains = [Chain(1, ["Ada", "Bea", "Cyd"], when)]
     notices = depart(chains, "Bea")
     assert chains == []
@@ -200,7 +200,7 @@ def test_one_departure_closes_a_chain_of_three() -> None:
 
 def test_departure_of_the_only_member_leaves_no_close_line() -> None:
     """One person alone on a chain leaves nothing behind."""
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     chains = [Chain(1, ["Ada"], when)]
     assert depart(chains, "Ada") == []
     assert chains == []
@@ -208,7 +208,7 @@ def test_departure_of_the_only_member_leaves_no_close_line() -> None:
 
 def test_a_departure_that_leaves_three_tells_the_others() -> None:
     """Four people become three, and the people still on it are told."""
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     chains = [Chain(1, ["Ada", "Bea", "Cyd", "Dee"], when)]
     notices = depart(chains, "Dee")
     assert notices == [(["Ada", "Bea", "Cyd"], "(1) Dee has left the chain because they logged out.\n")]
@@ -217,7 +217,7 @@ def test_a_departure_that_leaves_three_tells_the_others() -> None:
 
 def test_a_smaller_chain_that_matches_another_deletes_the_higher_id() -> None:
     """A logout that copies an existing set removes the higher id."""
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     chains = [
         Chain(1, ["Ada", "Bea", "Cyd"], when),
         Chain(4, ["Ada", "Bea", "Cyd", "Dee"], when),
@@ -234,7 +234,7 @@ def test_note_chain_departure_tells_the_people_still_here() -> None:
     bea = _person("Bea")
     cyd = _person("Cyd")
     server = _server(ada, bea, cyd)
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     deliver(server, ada, ["Bea", "Cyd"], when)
     note_chain_departure(server, "Bea")
     assert server.chains == []
@@ -245,7 +245,7 @@ def test_note_chain_departure_tells_the_people_still_here() -> None:
 
 def test_prune_offline_closes_with_every_absent_name() -> None:
     """Several people missing at once share one close line."""
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     chains = [Chain(1, ["Ada", "Bea", "Cyd", "Dee"], when)]
     kept, notices = prune_offline(chains, {"ada", "bea"})
     assert kept == []
@@ -254,7 +254,7 @@ def test_prune_offline_closes_with_every_absent_name() -> None:
 
 def test_prune_offline_keeps_a_chain_of_three() -> None:
     """One absent name that leaves three people is announced."""
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     chains = [Chain(1, ["Ada", "Bea", "Cyd", "Dee"], when)]
     kept, notices = prune_offline(chains, {"ada", "bea", "cyd"})
     assert notices == [(["Ada", "Bea", "Cyd"], "(1) Dee has left the chain because they logged out.\n")]
@@ -270,7 +270,7 @@ def test_addressing_the_higher_chain_still_deletes_the_higher_id() -> None:
     cyd = _person("Cyd")
     dee = _person("Dee")
     server = _server(ada, bea, cyd, dee)
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     deliver(server, ada, ["Bea", "Cyd", "Dee"], when)
     deliver(server, ada, ["Bea", "Cyd"], when)
     merged = deliver(server, ada, ["2", "Dee"], when)
@@ -282,7 +282,7 @@ def test_addressing_the_higher_chain_still_deletes_the_higher_id() -> None:
 
 def test_leave_remove_and_delete() -> None:
     """Leave and remove close a chain below three. Delete removes it at any size."""
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     chains = [Chain(1, ["Ada", "Bea", "Cyd", "Dee"], when)]
     error, notices = leave_chain(chains, 1, "Dee", "dinner")
     assert error is None
@@ -305,11 +305,11 @@ def test_close_idle_chains_tells_the_members() -> None:
     bea = _person("Bea")
     cyd = _person("Cyd")
     server = _server(ada, bea, cyd)
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     server.chains.append(Chain(1, ["Ada", "Bea", "Cyd"], when))
     close_idle_chains(server, when)
     assert len(server.chains) == 1
-    close_idle_chains(server, datetime(2026, 10, 15, 14, 0, tzinfo=timezone.utc))
+    close_idle_chains(server, datetime(2026, 10, 15, 14, 0, tzinfo=UTC))
     assert server.chains == []
     assert ada.sent == ["(1) Chain closed. It was unused for 2 hours.\n"]
     assert bea.sent == ["(1) Chain closed. It was unused for 2 hours.\n"]
@@ -317,7 +317,7 @@ def test_close_idle_chains_tells_the_members() -> None:
 
 def test_prune_offline_with_no_one_online_leaves_no_close_line() -> None:
     """When nobody is connected, small chains vanish quietly."""
-    when = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+    when = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
     chains = [Chain(1, ["Ada", "Bea"], when)]
     kept, notices = prune_offline(chains, set())
     assert kept == []

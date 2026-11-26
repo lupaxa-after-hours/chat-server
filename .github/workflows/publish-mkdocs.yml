@@ -10,7 +10,6 @@ on:
       - "mkdocs.yml"
       - "overrides/**"
       - "requirements.txt"
-      - "hooks/**"
 
   workflow_dispatch:
 
@@ -31,7 +30,6 @@ jobs:
     uses: the-lupaxa-project/workflows/.github/workflows/reusable-mkdocs-site-publisher.yml@master
     secrets: inherit
     with:
-      python-version: "3.13"
       cleanup: true
 
   generate-workflow-summary:

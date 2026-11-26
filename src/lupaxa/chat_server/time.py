@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import ROUND_HALF_UP, Decimal
 
 WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
@@ -27,8 +27,8 @@ def ordinal(day: int) -> str:
 def clock_phrase(moment: datetime) -> str:
     """Return ``moment`` as ``Monday 12th October 2026, 13:45:03 UTC``."""
     if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=timezone.utc)
-    moment = moment.astimezone(timezone.utc)
+        moment = moment.replace(tzinfo=UTC)
+    moment = moment.astimezone(UTC)
     weekday = WEEKDAYS[moment.weekday()]
     month = MONTHS[moment.month - 1]
     clock = moment.strftime("%H:%M:%S")

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from .broadcast import broadcast_room, broadcast_staff
 from .client import Client, send_lock_line
@@ -197,7 +197,7 @@ def enter(server: Server, client: Client, name: str, rank: Rank) -> None:
     restart_login(client)
     newbie_text = "I am new here"
     description = newbie_text if rank == Rank.NEWBIE else ""
-    client.player = Player(name, start, datetime.now(timezone.utc), rank=rank, description=description)
+    client.player = Player(name, start, datetime.now(UTC), rank=rank, description=description)
     client.room = start
     load_profile(server, client.player)
     sync_country(client)

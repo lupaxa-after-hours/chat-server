@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from test_commands import FakePlayer, FakeServer, process_commands, staff
@@ -14,7 +14,7 @@ from lupaxa.chat_server.rooms import Room, house_room_id
 
 def resident(name: str, room: str) -> FakePlayer:
     """Return a resident standing in ``room``."""
-    user = Player(name, room, datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    user = Player(name, room, datetime.now(UTC), rank=Rank.RESIDENT)
     return FakePlayer(name=name, room=room, player=user)
 
 

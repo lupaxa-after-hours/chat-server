@@ -1,12 +1,12 @@
 """How long a player has been connected."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from lupaxa.chat_server.player import Player
 from lupaxa.chat_server.time import connected_phrase
 from lupaxa.chat_server.timer import apply_timer_tick
 
-START = datetime(2026, 10, 12, tzinfo=timezone.utc)
+START = datetime(2026, 10, 12, tzinfo=UTC)
 
 
 def test_connected_phrase_uses_the_largest_unit() -> None:
@@ -36,6 +36,6 @@ def test_timer_tick_counts_idle_and_fires_the_alarm() -> None:
 
 def test_a_player_keeps_a_lowercase_key() -> None:
     """The display spelling and the key are both stored."""
-    user = Player("Bob", "hall", datetime(2026, 10, 12, tzinfo=timezone.utc))
+    user = Player("Bob", "hall", datetime(2026, 10, 12, tzinfo=UTC))
     assert user.name == "Bob"
     assert user.lowercase_name == "bob"

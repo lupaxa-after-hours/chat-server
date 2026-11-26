@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import socket
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -71,8 +71,8 @@ def test_the_void_is_added_and_has_no_limit(tmp_path: Path) -> None:
     left, right = socket.socketpair()
     other, peer = socket.socketpair()
     try:
-        ada = Client(left, player=Player("Ada", "void", datetime.now(timezone.utc)))
-        bea = Client(other, player=Player("Bea", "void", datetime.now(timezone.utc)))
+        ada = Client(left, player=Player("Ada", "void", datetime.now(UTC)))
+        bea = Client(other, player=Player("Bea", "void", datetime.now(UTC)))
         assert is_full(layout, [ada, bea], "void") is False
     finally:
         left.close()
@@ -118,7 +118,7 @@ def test_release_empty_houses_keeps_an_occupied_house(tmp_path: Path) -> None:
     layout = base.with_house("Ada", {"ada_home": Room("Ada is home.", 1, {})}).with_house("Bea", {"bea_home": Room("Bea is home.", 1, {})})
     left, right = socket.socketpair()
     try:
-        ada = Client(left, player=Player("Ada", "ada_home", datetime.now(timezone.utc)))
+        ada = Client(left, player=Player("Ada", "ada_home", datetime.now(UTC)))
         released = release_empty_houses(layout, [ada])
     finally:
         left.close()

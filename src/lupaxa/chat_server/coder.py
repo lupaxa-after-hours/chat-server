@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import psutil
@@ -216,7 +216,7 @@ def system_box(server: Server) -> str:
     """Return the process box, ending with a newline."""
     process: Any = server.process
     missing = "unavailable"
-    seconds = int((datetime.now(timezone.utc) - server.started_at).total_seconds())
+    seconds = int((datetime.now(UTC) - server.started_at).total_seconds())
     pid = cpu_usage = cpu_user = cpu_system = missing
     rss = uss = vms = threads = descriptors = sockets = missing
     disk_read = disk_written = voluntary = involuntary = missing

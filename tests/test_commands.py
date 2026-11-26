@@ -5,7 +5,7 @@ from __future__ import annotations  # noqa: I001
 import contextlib
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta, timezone, tzinfo
+from datetime import datetime, timedelta, tzinfo, UTC
 from pathlib import Path
 from types import SimpleNamespace
 import threading
@@ -81,7 +81,7 @@ class FakeClientMap:
 class FakePlayer:
     name: str | None = "Ada"
     room: str | None = "reception"
-    player: Player | None = field(default_factory=lambda: Player("Ada", "reception", datetime.now(timezone.utc)))
+    player: Player | None = field(default_factory=lambda: Player("Ada", "reception", datetime.now(UTC)))
     auth: str = "name"
     pending_name: str = ""
     pending_saved: SavedPlayer | None = None
@@ -126,7 +126,7 @@ class FakeServer:
     replaced: list[FakePlayer] = field(default_factory=list)
     dropped: bool = False
     stopped: bool = False
-    started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     rebooted_at: datetime | None = None
     process: object | None = None
     timer_mark: float | None = None
@@ -502,7 +502,7 @@ def test_who_and_quit_cannot_be_names() -> None:
 def test_who_at_the_name_prompt_lists_players(tmp_path: Path) -> None:
     """Who shows the connected frame and asks for a name again."""
     server = login_host(tmp_path)
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     server.people = [FakePlayer(name="Ada", room="reception", player=Player("Ada", "reception", when, idle_seconds=10))]
     asker = FakePlayer(player=None)
     process_input(server, asker, "WHO")  # type: ignore[arg-type]
@@ -628,7 +628,7 @@ def test_help_version_and_commands() -> None:
     version_result, _ = run("version")
     assert version_result.sent == [f"The current version is: {get_version()}\n"]
 
-    resident = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    resident = FakePlayer(player=Player("Ada", "reception", datetime.now(UTC), rank=Rank.RESIDENT))
     listed, _ = run("commands", resident)
     words = command_words(Rank.RESIDENT).split()
     width = frame_width(resident.discovered_columns, resident.frame_columns)
@@ -888,7 +888,7 @@ def test_recap_changes_only_the_capitalisation(tmp_path: Path) -> None:
     """BoB updates the live name and the file. The file stays bob.yml."""
     save_player(tmp_path, SavedPlayer("Bob", Rank.RESIDENT, hash_password("pw", rounds=4)))
     server = login_host(tmp_path)
-    user = Player("Bob", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    user = Player("Bob", "hall", datetime.now(UTC), rank=Rank.RESIDENT)
     bob = FakePlayer(name="Bob", room="hall", player=user)
     server.people = [bob]
     process_commands(server, bob, "recap BoB")  # type: ignore[arg-type]
@@ -923,7 +923,7 @@ def test_recap_cannot_rename_someone_else(tmp_path: Path) -> None:
 
 def test_recap_of_the_current_spelling_succeeds() -> None:
     """Typing the spelling already in use is still a success."""
-    resident = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    resident = FakePlayer(player=Player("Ada", "reception", datetime.now(UTC), rank=Rank.RESIDENT))
     ada, _ = run("recap Ada", resident)
     assert ada.sent == ["Name set to Ada.\n"]
 
@@ -932,7 +932,7 @@ def test_recap_keeps_the_live_name_when_the_save_fails(tmp_path: Path, monkeypat
     """A failed save leaves the display name the player already has."""
     save_player(tmp_path, SavedPlayer("Bob", Rank.RESIDENT, hash_password("pw", rounds=4)))
     server = login_host(tmp_path)
-    user = Player("Bob", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    user = Player("Bob", "hall", datetime.now(UTC), rank=Rank.RESIDENT)
     bob = FakePlayer(name="Bob", room="hall", player=user)
     server.people = [bob]
 
@@ -1084,7 +1084,7 @@ def test_help_look_shows_the_command_name_as_syntax() -> None:
 
 def test_help_through_process_commands_uses_the_shipped_book() -> None:
     """Real help through process_commands shows rank, syntax, and colour from the shipped book."""
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     resident = FakePlayer(player=Player("Ada", "reception", when, rank=Rank.RESIDENT, colour=False))
     server = FakeServer(help=SHIPPED_HELP, people=[resident])
     process_commands(server, resident, "help shout")  # type: ignore[arg-type]
@@ -1144,7 +1144,7 @@ def test_prompt_follows_a_finished_command() -> None:
 
 def test_prompt_command_replaces_the_next_prompt() -> None:
     """``prompt`` stores the text and the following prompt uses it."""
-    user = Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    user = Player("Ada", "reception", datetime.now(UTC), rank=Rank.RESIDENT)
     player = FakePlayer(player=user)
     server = FakeServer()
     process_input(server, player, "set prompt Hello >")  # type: ignore[arg-type]
@@ -1277,7 +1277,7 @@ def test_save_writes_the_live_profile(tmp_path: Path) -> None:
 
 def test_newbie_cannot_save() -> None:
     """A newbie is told save does not exist."""
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     newbie = FakePlayer(player=Player("Ada", "reception", when, rank=Rank.NEWBIE))
     server, _ = run("save", newbie)
     assert server.sent == ["No such command 'save'\n"]
@@ -1429,7 +1429,7 @@ def test_retire_keeps_the_file_when_delete_fails(tmp_path: Path, monkeypatch: py
 
 def test_status_under_rank_on_connected_examine(tmp_path: Path) -> None:
     """Connected examine shows Status under User Rank; logged-out examine does not."""
-    user = Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.SUPER_USER)
+    user = Player("Ada", "hall", datetime.now(UTC), rank=Rank.SUPER_USER)
     ada = FakePlayer(player=user)
     server = FakeServer(people=[ada])
     process_commands(server, ada, "set status busy")  # type: ignore[arg-type]
@@ -1455,7 +1455,7 @@ def test_status_under_rank_on_connected_examine(tmp_path: Path) -> None:
 
 def test_examine_shows_roles_under_rank_when_one_is_set(tmp_path: Path) -> None:
     """Connected and logged-out examine list named roles under User Rank."""
-    user = Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT, roles=int(Roles.SITE_ADMIN))
+    user = Player("Ada", "hall", datetime.now(UTC), rank=Rank.RESIDENT, roles=int(Roles.SITE_ADMIN))
     user.status = "busy"
     ada = FakePlayer(player=user)
     server = FakeServer(people=[ada])
@@ -1481,7 +1481,7 @@ def test_examine_shows_roles_under_rank_when_one_is_set(tmp_path: Path) -> None:
 
 def test_examine_omits_roles_when_none_are_set(tmp_path: Path) -> None:
     """A player with no named role has no Roles line."""
-    user = Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    user = Player("Ada", "hall", datetime.now(UTC), rank=Rank.RESIDENT)
     ada = FakePlayer(player=user)
     server = FakeServer(people=[ada])
     process_commands(server, ada, "examine me")  # type: ignore[arg-type]
@@ -1494,7 +1494,7 @@ def test_examine_omits_roles_when_none_are_set(tmp_path: Path) -> None:
 
 def test_status_shows_on_examine_who_and_lsu_and_is_not_saved(tmp_path: Path) -> None:
     """Status is a session field under User Rank on examine, and on both lists."""
-    user = Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.SUPER_USER)
+    user = Player("Ada", "hall", datetime.now(UTC), rank=Rank.SUPER_USER)
     ada = FakePlayer(player=user)
     server, _ = run("set status in a meeting", ada)
     assert user.status == "in a meeting"
@@ -1545,7 +1545,7 @@ def test_load_profile_copies_a_saved_description(tmp_path: Path) -> None:
     """A saved player enters with the description from the file."""
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), description="Hello"))
     server = login_host(tmp_path)
-    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    user = Player("Bea", "hall", datetime.now(UTC), rank=Rank.RESIDENT)
     entry_api.load_profile(server, user)  # type: ignore[arg-type]
     assert user.description == "Hello"
 
@@ -1554,7 +1554,7 @@ def test_load_profile_copies_a_saved_entermsg(tmp_path: Path) -> None:
     """A saved player enters with the enter message from the file."""
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), entermsg="crawls into the room"))
     server = login_host(tmp_path)
-    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    user = Player("Bea", "hall", datetime.now(UTC), rank=Rank.RESIDENT)
     entry_api.load_profile(server, user)  # type: ignore[arg-type]
     assert user.entermsg == "crawls into the room"
 
@@ -1648,7 +1648,7 @@ def test_a_failed_colour_write_still_changes_the_live_choice(tmp_path: Path, mon
 def test_a_newbie_colour_off_is_stored_on_resident(tmp_path: Path) -> None:
     """Becoming a resident writes the colour chosen on this visit."""
     server = login_host(tmp_path)
-    user = Player("Bea", "hall", datetime.now(timezone.utc), colour=False)
+    user = Player("Bea", "hall", datetime.now(UTC), colour=False)
     bea = FakePlayer(name="Bea", room="hall", player=user)
     server.people = [bea]
     password_api.promote_to_resident(server, bea, "secret")  # type: ignore[arg-type]
@@ -1712,7 +1712,7 @@ def test_go_uses_the_destination_enter_sentence() -> None:
 
 def test_go_announces_the_player_enter_message() -> None:
     """The destination hears the player's sentence, not a direction."""
-    user = Player("Ada", "reception", datetime.now(timezone.utc), entermsg="crawls into the room")
+    user = Player("Ada", "reception", datetime.now(UTC), entermsg="crawls into the room")
     ada = FakePlayer(player=user)
     server = FakeServer(people=[ada])
     process_commands(server, ada, "go nw")  # type: ignore[arg-type]
@@ -1758,8 +1758,8 @@ def test_home_creates_the_room_and_tells_only_the_room_they_left(tmp_path: Path)
     save(players, "Bea", Rank.RESIDENT)
     save(players, "Cyd", Rank.RESIDENT)
     ada = staff("Ada", Rank.RESIDENT)
-    bea = FakePlayer(name="Bea", room="reception", player=Player("Bea", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
-    cyd = FakePlayer(name="Cyd", room="hall", player=Player("Cyd", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    bea = FakePlayer(name="Bea", room="reception", player=Player("Bea", "reception", datetime.now(UTC), rank=Rank.RESIDENT))
+    cyd = FakePlayer(name="Cyd", room="hall", player=Player("Cyd", "hall", datetime.now(UTC), rank=Rank.RESIDENT))
     server = login_host(tmp_path)
     server.roster_dir = players
     server.config = replace(server.config, rooms=tmp_path / "system.yml", players=players)
@@ -2199,7 +2199,7 @@ def test_main_from_home_uses_the_start_room_line() -> None:
     ada.room = "ada_home"
     assert ada.player is not None
     ada.player.room = "ada_home"
-    bea = FakePlayer(name="Bea", room="ada_home", player=Player("Bea", "ada_home", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    bea = FakePlayer(name="Bea", room="ada_home", player=Player("Bea", "ada_home", datetime.now(UTC), rank=Rank.RESIDENT))
     server = FakeServer(people=[ada, bea])
     server.layout = server.layout.with_house("Ada", {house_room_id("Ada"): Room("You are home.", 1, {})})
     process_commands(server, ada, "main")  # type: ignore[arg-type]
@@ -2238,7 +2238,7 @@ def test_shout_reaches_a_home_and_say_stays_in_the_office() -> None:
     assert ada.player is not None
     ada.player.room = "ada_home"
     ada.player.colour = False
-    bea = FakePlayer(name="Bea", room="reception", player=Player("Bea", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT, colour=False))
+    bea = FakePlayer(name="Bea", room="reception", player=Player("Bea", "reception", datetime.now(UTC), rank=Rank.RESIDENT, colour=False))
     server = FakeServer(people=[ada, bea])
     server.layout = server.layout.with_house("Ada", {house_room_id("Ada"): Room("You are home.", 1, {})})
     process_commands(server, bea, "say hello")  # type: ignore[arg-type]
@@ -2282,7 +2282,7 @@ def test_question_mark_is_help() -> None:
 
 def test_map_leaves_the_current_room_plain_when_colour_is_off() -> None:
     """Colour off keeps the room name, without a green code."""
-    player = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), colour=False))
+    player = FakePlayer(player=Player("Ada", "reception", datetime.now(UTC), colour=False))
     server, _ = run("map", player)
     assert "Reception" in server.sent[0]
     assert green("Reception") not in server.sent[0]
@@ -2296,7 +2296,7 @@ def test_map_rejects_extra_text() -> None:
 
 def test_newbie_cannot_shout() -> None:
     """A newbie is told shout does not exist. A resident still shouts."""
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     newbie = FakePlayer(player=Player("Ada", "reception", when, rank=Rank.NEWBIE))
     server, _ = run("shout hi", newbie)
     assert server.sent == ["No such command 'shout'\n"]
@@ -2327,7 +2327,7 @@ def test_newbie_cannot_shout() -> None:
 def test_help_hides_shout_from_a_newbie() -> None:
     """Help for a command above the player's rank is the same as a missing topic."""
     book = HelpBook(entries=(HelpEntry("say", ("'",), "Speak."), HelpEntry("shout", ("!",), "Shout to everyone.")))
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     newbie = FakePlayer(player=Player("Ada", "reception", when, rank=Rank.NEWBIE))
     server = FakeServer(help=book)
     process_commands(server, newbie, "help shout")  # type: ignore[arg-type]
@@ -2356,7 +2356,7 @@ def test_help_hides_shout_from_a_newbie() -> None:
 
 def test_shout_reaches_everyone_and_alias_needs_no_space() -> None:
     """Shout is not limited to the current room. ``!`` needs no space."""
-    resident = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    resident = FakePlayer(player=Player("Ada", "reception", datetime.now(UTC), rank=Rank.RESIDENT))
     server, _ = run("shout hello there", resident)
     assert server.sent == ["You shout 'hello there'\n"]
     assert server.room_lines == []
@@ -2394,7 +2394,7 @@ def test_chains_lists_only_your_chains_with_aligned_idle() -> None:
     server = FakeServer(people=[ada, bea, cyd, dee])
     process_commands(server, ada, "tell Bea, Cyd hello")  # type: ignore[arg-type]
     process_commands(server, ada, "tell Bea, Cyd, Dee hello")  # type: ignore[arg-type]
-    server.chains[1].last_message_at = datetime.now(timezone.utc) - timedelta(seconds=724)
+    server.chains[1].last_message_at = datetime.now(UTC) - timedelta(seconds=724)
     ada.sent.clear()
     process_commands(server, ada, "chains")  # type: ignore[arg-type]
     text = ada.sent[0]
@@ -2632,10 +2632,10 @@ def test_remote_alias_to_yourself_is_refused() -> None:
 
 def test_auto_reply_comes_back_to_the_sender(tmp_path: Path) -> None:
     """Tell and remote still arrive, and the sender gets the reply."""
-    bea_user = Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    bea_user = Player("Bea", "hall", datetime.now(UTC), rank=Rank.RESIDENT)
     bea_user.auto_reply = "In a meeting"
     bea = FakePlayer(name="Bea", player=bea_user)
-    ada = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    ada = FakePlayer(player=Player("Ada", "reception", datetime.now(UTC), rank=Rank.RESIDENT))
     server = FakeServer(people=[ada, bea])
     process_commands(server, ada, "tell Bea hello")  # type: ignore[arg-type]
     assert any(line == "[ Auto Reply from Bea ] In a meeting\n" for line in server.sent)
@@ -2714,7 +2714,7 @@ def test_a_received_tell_and_remote_are_green() -> None:
 
 def test_room_and_shout_prefixes_respect_colour_off() -> None:
     """Prefixed room and shout lines stay plain when the recipient's colour is off."""
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     bea = FakePlayer(name="Bea", room="reception")
     bea.player.colour = False
     server = FakeServer(people=[bea])
@@ -2731,7 +2731,7 @@ def test_room_and_shout_prefixes_respect_colour_off() -> None:
 
 def test_paint_staff_colours_when_colour_is_on() -> None:
     """Staff lines are cyan when colour is on and plain when it is off."""
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     on = FakePlayer(player=Player("Ada", "hall", when, rank=Rank.SUPER_USER))
     off = FakePlayer(player=Player("Bea", "hall", when, rank=Rank.SUPER_USER))
     off.player.colour = False
@@ -2992,7 +2992,7 @@ def test_cpu_phrase_keeps_the_fractional_second() -> None:
 
 def test_time_frame_is_the_boot_box(monkeypatch: pytest.MonkeyPatch) -> None:
     """Time prints the clock, the boot time, and the uptime in a snug box."""
-    fixed = datetime(2026, 10, 12, 13, 45, 3, tzinfo=timezone.utc)
+    fixed = datetime(2026, 10, 12, 13, 45, 3, tzinfo=UTC)
 
     class Clock(datetime):
         @classmethod
@@ -3023,7 +3023,7 @@ def test_time_frame_is_the_boot_box(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_time_frame_shows_rebooted_at_only_after_a_reboot(monkeypatch: pytest.MonkeyPatch) -> None:
     """Rebooted at appears under Booted at, and only when a reboot has happened."""
-    fixed = datetime(2026, 10, 12, 13, 45, 3, tzinfo=timezone.utc)
+    fixed = datetime(2026, 10, 12, 13, 45, 3, tzinfo=UTC)
 
     class Clock(datetime):
         @classmethod
@@ -3033,7 +3033,7 @@ def test_time_frame_shows_rebooted_at_only_after_a_reboot(monkeypatch: pytest.Mo
     monkeypatch.setattr("lupaxa.chat_server.newbie.datetime", Clock)
     server = FakeServer()
     server.started_at = fixed - timedelta(hours=2, minutes=5)
-    server.rebooted_at = datetime(2026, 10, 12, 12, 10, 3, tzinfo=timezone.utc)
+    server.rebooted_at = datetime(2026, 10, 12, 12, 10, 3, tzinfo=UTC)
     player = FakePlayer()
     process_commands(server, player, "time")  # type: ignore[arg-type]
     expected = """\
@@ -3093,7 +3093,7 @@ def test_term_width_is_not_saved_and_a_narrow_window_rejects_numbers(tmp_path: P
     """The manual width is not a player-file field. Below 60 only auto works."""
     save_player(tmp_path, SavedPlayer("Ada", Rank.RESIDENT, hash_password("pw", rounds=4)))
     server = login_host(tmp_path)
-    user = Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    user = Player("Ada", "reception", datetime.now(UTC), rank=Rank.RESIDENT)
     ada = FakePlayer(name="Ada", player=user, discovered_columns=40, discovered_rows=12)
     server.people = [ada]
     process_commands(server, ada, "term_width 60")  # type: ignore[arg-type]
@@ -3113,7 +3113,7 @@ def test_a_long_name_grows_the_frame() -> None:
 
 def test_who_lists_players_rooms_and_idle() -> None:
     """Who lists name, room, and idle, and skips someone who is not in a room."""
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     ada_user = Player("Ada", "reception", when, idle_seconds=10)
     bea_user = Player("Bea", "hall", when, idle_seconds=300)
     server = FakeServer(people=[FakePlayer(name="Bea", room="hall", player=bea_user), FakePlayer(name="Ada", room="reception", player=ada_user), FakePlayer(name="Cyd", room=None),])  # fmt: skip  # noqa: E501
@@ -3139,7 +3139,7 @@ def test_who_lists_players_rooms_and_idle() -> None:
 
 def test_who_lists_a_player_who_is_alone() -> None:
     """A player in a room is listed, including when they are the only one."""
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     ada = FakePlayer(name="Ada", room="reception", player=Player("Ada", "reception", when))
     server = FakeServer(people=[ada])
     process_commands(server, ada, "who")  # type: ignore[arg-type]
@@ -3150,7 +3150,7 @@ def test_who_lists_a_player_who_is_alone() -> None:
 def test_w_lists_the_same_players_as_who() -> None:
     """W is who. wplease is not. w please is the who syntax."""
     ada = FakePlayer()
-    bea = FakePlayer(name="Bea", room="hall", player=Player("Bea", "hall", datetime.now(timezone.utc)))
+    bea = FakePlayer(name="Bea", room="hall", player=Player("Bea", "hall", datetime.now(UTC)))
     server = FakeServer(people=[ada, bea])
     process_commands(server, ada, "who")  # type: ignore[arg-type]
     who_text = server.sent[0]
@@ -3167,7 +3167,7 @@ def test_w_lists_the_same_players_as_who() -> None:
 
 def test_enter_at_the_play_prompt_does_not_clear_idle() -> None:
     """An empty line shows the prompt again and leaves idle alone."""
-    user = Player("Ada", "hall", datetime.now(timezone.utc), idle_seconds=40)
+    user = Player("Ada", "hall", datetime.now(UTC), idle_seconds=40)
     ada = FakePlayer(player=user)
     server = FakeServer(people=[ada])
     process_input(server, ada, "")  # type: ignore[arg-type]
@@ -3209,7 +3209,7 @@ def test_join_refuses_someone_elses_home() -> None:
     ada.room = "ada_home"
     assert ada.player is not None
     ada.player.room = "ada_home"
-    bea = FakePlayer(name="Bea", room="hall", player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    bea = FakePlayer(name="Bea", room="hall", player=Player("Bea", "hall", datetime.now(UTC), rank=Rank.RESIDENT))
     server = FakeServer(people=[ada, bea])
     server.layout = server.layout.with_house("Ada", {house_room_id("Ada"): Room("You are home.", 1, {})})
     process_commands(server, bea, "join Ada")  # type: ignore[arg-type]
@@ -3340,9 +3340,9 @@ def test_examine_idle_of_ten_seconds_is_not_idle(tmp_path: Path) -> None:
     Examining yourself is already zero, because typing cleared idle first.
     """
     server = login_host(tmp_path)
-    user = Player("Bea", "hall", datetime.now(timezone.utc), idle_seconds=10)
+    user = Player("Bea", "hall", datetime.now(UTC), idle_seconds=10)
     bea = FakePlayer(name="Bea", room="hall", player=user, discovered_columns=72)
-    ada_user = Player("Ada", "hall", datetime.now(timezone.utc), idle_seconds=40)
+    ada_user = Player("Ada", "hall", datetime.now(UTC), idle_seconds=40)
     ada = FakePlayer(name="Ada", room="hall", player=ada_user, discovered_columns=72)
     server.people = [ada, bea]
     process_commands(server, ada, "examine Bea")  # type: ignore[arg-type]
@@ -3365,7 +3365,7 @@ def test_examine_idle_of_ten_seconds_is_not_idle(tmp_path: Path) -> None:
 
 def test_examine_shows_ssh_when_the_socket_is_ssh() -> None:
     """Connected via is ssh on an SSH socket and telnet otherwise."""
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     user = Player("Bea", "hall", when)
     bea = FakePlayer(name="Bea", room="hall", player=user, ssh=True)
     server = FakeServer(people=[bea])
@@ -3377,7 +3377,7 @@ def test_examine_shows_ssh_when_the_socket_is_ssh() -> None:
     process_commands(server, FakePlayer(), "examine Bea")  # type: ignore[arg-type]
     assert "[via telnet]" in server.sent[0]
     """Examine names a player. ``x`` needs a space, and a missing player is not found."""
-    when = datetime.now(timezone.utc) - timedelta(minutes=10)
+    when = datetime.now(UTC) - timedelta(minutes=10)
     bea = FakePlayer(name="Bea", room="hall", player=Player("Bea", "hall", when, connected_seconds=7200))
     server = FakeServer(people=[bea])
     process_commands(server, FakePlayer(), "examine Bea")  # type: ignore[arg-type]
@@ -3410,7 +3410,7 @@ def test_examine_text_is_the_seventy_two_column_profile() -> None:
     """Examine keeps a coloured rank inside the 72-column terminal."""
     from lupaxa.chat_server.colour import green, plain_len
 
-    when = datetime.now(timezone.utc) - timedelta(minutes=10)
+    when = datetime.now(UTC) - timedelta(minutes=10)
     user = Player("Bea", "hall", when, connected_seconds=7200, idle_seconds=0)
     bea = FakePlayer(name="Bea", room="hall", player=user, discovered_columns=72)
     server = FakeServer(people=[bea])
@@ -3429,7 +3429,7 @@ def test_examine_text_is_the_seventy_two_column_profile() -> None:
 
 def test_examine_hides_the_terminal_line_from_other_players(tmp_path: Path) -> None:
     """Another player, and a logged-out examine, do not show the terminal line."""
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     bea_user = Player("Bea", "hall", when)
     ada = FakePlayer(discovered_columns=80, discovered_rows=24)
     bea = FakePlayer(name="Bea", room="hall", player=bea_user)
@@ -3437,7 +3437,7 @@ def test_examine_hides_the_terminal_line_from_other_players(tmp_path: Path) -> N
     process_commands(server, ada, "examine Bea")  # type: ignore[arg-type]
     assert "Terminal Size" not in server.sent[0]
 
-    left = datetime.now(timezone.utc) - timedelta(hours=2)
+    left = datetime.now(UTC) - timedelta(hours=2)
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), logged_out_at=left))
     server = login_host(tmp_path)
     process_commands(server, viewer(Rank.RESIDENT), "examine Bea")  # type: ignore[arg-type]
@@ -3451,7 +3451,7 @@ def test_examine_hides_the_terminal_line_from_other_players(tmp_path: Path) -> N
 
 def test_examine_me_is_the_typist() -> None:
     """me, Me, and ME show the typist, and staff see their own address."""
-    when = datetime.now(timezone.utc) - timedelta(minutes=10)
+    when = datetime.now(UTC) - timedelta(minutes=10)
     user = Player("Ada", "reception", when, connected_seconds=7200)
     ada = FakePlayer(name="Ada", room="reception", player=user, address="10.0.0.5")
     server = FakeServer(people=[ada])
@@ -3498,7 +3498,7 @@ def test_examine_lowercase_saved_name_uses_the_in_room_block(tmp_path: Path) -> 
     """A saved player who is here gets the in-room block, not the logout block."""
     save(tmp_path, "Bea", Rank.RESIDENT)
     server = login_host(tmp_path)
-    when = datetime.now(timezone.utc) - timedelta(minutes=10)
+    when = datetime.now(UTC) - timedelta(minutes=10)
     user = Player("Bea", "hall", when, connected_seconds=7200)
     bea = FakePlayer(name="Bea", room="hall", player=user)
     server.people = [bea, newbie("Ada")]
@@ -3515,7 +3515,7 @@ def test_examine_lowercase_saved_name_uses_the_in_room_block(tmp_path: Path) -> 
 
 def test_alarm_sets_seconds_and_idle_lists_players() -> None:
     """Alarm stores minutes as seconds and resets the asker's idle."""
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     ada_user = Player("Ada", "reception", when, idle_seconds=40, rank=Rank.RESIDENT)
     bea_user = Player("Bea", "hall", when, idle_seconds=125)
     ada = FakePlayer(name="Ada", room="reception", player=ada_user)
@@ -3950,7 +3950,7 @@ def test_mfa_reconnect_waits_for_the_code(tmp_path: Path, monkeypatch: pytest.Mo
     totp_seed = TOTP_TEST_SEED
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), mfa_secret=totp_seed))
     server = mfa_login_host(tmp_path)
-    live = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    live = FakePlayer(player=Player("Bea", "hall", datetime.now(UTC), rank=Rank.RESIDENT))
     server.people = [live]
     newcomer = FakePlayer(player=None, address="10.0.0.5")
     monkeypatch.setattr("lupaxa.chat_server.password.time.time", lambda: 1_700_000_000.0)
@@ -4498,7 +4498,7 @@ def test_a_missing_disclaimer_disconnects_the_newbie(tmp_path: Path) -> None:
     """No disclaimer topic tells the newbie, drops them, and tells admins."""
     server = login_host(tmp_path)
     server.help = HelpBook(entries=())
-    admin_user = Player("Ann", "reception", datetime.now(timezone.utc), rank=Rank.ADMIN)
+    admin_user = Player("Ann", "reception", datetime.now(UTC), rank=Rank.ADMIN)
     admin_user.colour = False
     admin = FakePlayer(name="Ann", player=admin_user)
     server.people = [admin]
@@ -4636,7 +4636,7 @@ def test_a_taken_saved_name_still_asks_for_the_password(tmp_path: Path) -> None:
     """A saved name that is in a room is not refused before the password."""
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
     server = login_host(tmp_path)
-    live = FakePlayer(player=Player("Bea", "hall", datetime(2026, 10, 12, tzinfo=timezone.utc), alarm_seconds=120, idle_seconds=40, prompt="Go: ", rank=Rank.SUPER_USER))  # fmt: skip  # noqa: E501
+    live = FakePlayer(player=Player("Bea", "hall", datetime(2026, 10, 12, tzinfo=UTC), alarm_seconds=120, idle_seconds=40, prompt="Go: ", rank=Rank.SUPER_USER))  # fmt: skip  # noqa: E501
     server.people = [live]
     newcomer = FakePlayer(player=None, address="10.0.0.5")
     process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
@@ -4648,10 +4648,10 @@ def test_a_taken_saved_name_still_asks_for_the_password(tmp_path: Path) -> None:
 
 def test_the_right_password_reconnects_the_live_session(tmp_path: Path) -> None:
     """The same player stays, idle clears, and the room hears reconnected."""
-    logged_out = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    logged_out = datetime(2020, 1, 1, tzinfo=UTC)
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), logged_out_at=logged_out, ip_address="192.168.0.9"))  # fmt: skip  # noqa: E501
     server = login_host(tmp_path)
-    connected_at = datetime(2026, 10, 12, tzinfo=timezone.utc)
+    connected_at = datetime(2026, 10, 12, tzinfo=UTC)
     user = Player("Bea", "hall", connected_at, connected_seconds=500, alarm_seconds=120, idle_seconds=40, prompt="Go: ", rank=Rank.SUPER_USER)
     live = FakePlayer(player=user, address="192.168.0.9")
     server.people = [live]
@@ -4691,7 +4691,7 @@ def test_a_reconnect_drops_an_unfinished_password_change(tmp_path: Path) -> None
     before = load_saved(player_path(tmp_path, "Bea"))
     assert before is not None
     server = login_host(tmp_path)
-    live = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    live = FakePlayer(player=Player("Bea", "hall", datetime.now(UTC), rank=Rank.RESIDENT))
     server.people = [live]
     process_input(server, live, "password")  # type: ignore[arg-type]
     process_input(server, live, "pw")  # type: ignore[arg-type]
@@ -4718,7 +4718,7 @@ def test_a_reconnect_drops_an_unfinished_password_change(tmp_path: Path) -> None
 def test_a_taken_newbie_name_is_still_refused(tmp_path: Path) -> None:
     """A name with no file does not get a password just because it is in use."""
     server = login_host(tmp_path)
-    live = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.NEWBIE))
+    live = FakePlayer(player=Player("Bea", "hall", datetime.now(UTC), rank=Rank.NEWBIE))
     server.people = [live]
     newcomer = FakePlayer(player=None)
     process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
@@ -4732,7 +4732,7 @@ def test_another_case_reconnects_the_live_session(tmp_path: Path) -> None:
     """Reconnect the live session after another case and the right password."""
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
     server = login_host(tmp_path)
-    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    user = Player("Bea", "hall", datetime.now(UTC), rank=Rank.RESIDENT)
     live = FakePlayer(player=user)
     server.people = [live]
     newcomer = FakePlayer(player=None)
@@ -4747,7 +4747,7 @@ def test_a_wrong_password_leaves_the_live_session(tmp_path: Path) -> None:
     """Three failures drop only the new connection."""
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
     server = login_host(tmp_path)
-    live = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), idle_seconds=40, rank=Rank.RESIDENT))
+    live = FakePlayer(player=Player("Bea", "hall", datetime.now(UTC), idle_seconds=40, rank=Rank.RESIDENT))
     server.people = [live]
     newcomer = FakePlayer(player=None)
     process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
@@ -4765,7 +4765,7 @@ def test_a_missing_file_does_not_reconnect(tmp_path: Path) -> None:
     """The file is gone when the password arrives, so the live player stays."""
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4)))
     server = login_host(tmp_path)
-    live = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    live = FakePlayer(player=Player("Bea", "hall", datetime.now(UTC), rank=Rank.RESIDENT))
     server.people = [live]
     newcomer = FakePlayer(player=None)
     process_input(server, newcomer, "Bea")  # type: ignore[arg-type]
@@ -4840,14 +4840,14 @@ def test_a_name_that_cannot_be_a_file_is_a_newbie(tmp_path: Path) -> None:
 
 
 def staff(name: str, rank: Rank) -> FakePlayer:
-    user = Player(name, "reception", datetime.now(timezone.utc), rank=rank)
+    user = Player(name, "reception", datetime.now(UTC), rank=rank)
     return FakePlayer(name=name, player=user)
 
 
 def test_another_capitalisation_of_a_newbie_is_in_use(tmp_path: Path) -> None:
     """Bea and BEA are the newbie already in the room."""
     server = login_host(tmp_path)
-    bea = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.NEWBIE))
+    bea = FakePlayer(player=Player("Bea", "hall", datetime.now(UTC), rank=Rank.NEWBIE))
     server.people = [bea]
     for typed in ("bea", "BEA"):
         server.sent.clear()
@@ -4862,7 +4862,7 @@ def test_another_capitalisation_of_a_newbie_is_in_use(tmp_path: Path) -> None:
 def test_a_newbie_who_quits_frees_the_name(tmp_path: Path) -> None:
     """After quit, the other capitalisation can enter, and no file is written."""
     server = login_host(tmp_path)
-    bea = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.NEWBIE))
+    bea = FakePlayer(player=Player("Bea", "hall", datetime.now(UTC), rank=Rank.NEWBIE))
     server.people = [bea]
     process_input(server, bea, "quit")  # type: ignore[arg-type]
     assert bea in server.dropped_clients
@@ -4879,7 +4879,7 @@ def test_a_newbie_who_quits_frees_the_name(tmp_path: Path) -> None:
 def test_a_newbie_setting_a_resident_password_still_holds_the_name(tmp_path: Path) -> None:
     """The name stays taken until confirm writes the file."""
     server = login_host(tmp_path)
-    bea = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.NEWBIE))
+    bea = FakePlayer(player=Player("Bea", "hall", datetime.now(UTC), rank=Rank.NEWBIE))
     server.people = [bea]
     issuer = staff("Ada", Rank.SUPER_USER)
     server.people.append(issuer)
@@ -4917,7 +4917,7 @@ def test_a_saved_player_at_the_password_prompt_does_not_hold_the_name(tmp_path: 
 
 
 def newbie(name: str) -> FakePlayer:
-    return FakePlayer(name=name, room="hall", player=Player(name, "hall", datetime.now(timezone.utc)))
+    return FakePlayer(name=name, room="hall", player=Player(name, "hall", datetime.now(UTC)))
 
 
 def save(tmp_path: Path, name: str, rank: Rank) -> None:
@@ -5374,7 +5374,7 @@ def test_disconnect_of_a_login_name_is_not_found(tmp_path: Path) -> None:
 
 def test_disconnect_finds_a_name_with_a_space(tmp_path: Path) -> None:
     """The first word is the name, and the rest is the reason."""
-    bea = FakePlayer(player=Player("BeaSmith", "hall", datetime.now(timezone.utc), rank=Rank.NEWBIE))
+    bea = FakePlayer(player=Player("BeaSmith", "hall", datetime.now(UTC), rank=Rank.NEWBIE))
     server = login_host(tmp_path)
     ada = staff("Ada", Rank.ADMIN)
     server.people = [bea, ada]
@@ -5826,7 +5826,7 @@ def test_pstats_counts_live_newbies_and_saved_ranks(tmp_path: Path) -> None:
     save_player(tmp_path, SavedPlayer("Gus", Rank.CODER, password))
     save_player(tmp_path, SavedPlayer("Hal", Rank.SUPER_ADMIN, password))
     ada = staff("Ada", Rank.ADMIN)
-    bea = FakePlayer(player=Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.NEWBIE))
+    bea = FakePlayer(player=Player("Bea", "hall", datetime.now(UTC), rank=Rank.NEWBIE))
     hal = staff("Hal", Rank.SUPER_ADMIN)
     waiting = FakePlayer(player=None)
     server = FakeServer(people=[ada, bea, hal, waiting], roster_dir=tmp_path)
@@ -5924,7 +5924,7 @@ def test_an_old_admin_file_for_the_config_account_becomes_super_admin(tmp_path: 
 
 def test_finger_shows_when_they_logged_out(tmp_path: Path) -> None:
     """Examine gives rank, the UTC logout time with seconds, and how long ago."""
-    left = datetime.now(timezone.utc) - timedelta(hours=2)
+    left = datetime.now(UTC) - timedelta(hours=2)
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), logged_out_at=left))
     server = login_host(tmp_path)
     process_commands(server, newbie("Ada"), "examine Bea")  # type: ignore[arg-type]
@@ -5965,7 +5965,7 @@ def viewer(rank: Rank) -> FakePlayer:
 
 
 def here_at(server: FakeServer, name: str, address: str) -> FakePlayer:
-    when = datetime.now(timezone.utc) - timedelta(minutes=10)
+    when = datetime.now(UTC) - timedelta(minutes=10)
     user = Player(name, "hall", when, connected_seconds=7200)
     bea = FakePlayer(name=name, room="hall", player=user, address=address)
     server.people = [bea]
@@ -5987,7 +5987,7 @@ def test_examine_shows_where_they_connected(tmp_path: Path) -> None:
 
 def test_examine_shows_last_connected_from(tmp_path: Path) -> None:
     """A logged-out player shows the last hostname and IP."""
-    left = datetime.now(timezone.utc) - timedelta(hours=2)
+    left = datetime.now(UTC) - timedelta(hours=2)
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), logged_out_at=left, ip_address="10.0.0.5", hostname="bea.example"))
     stamp = clock_phrase(left)
     logged_out = (("User Rank", "Resident"), ("Last from", "bea.example (10.0.0.5)"), ("Logged out", stamp), ("Ago", "2 hours"), ("Total Login", "0 seconds"), *ROOM_SENTENCES)
@@ -6290,7 +6290,7 @@ def test_lsu_with_colour_off_is_the_plain_frame(tmp_path: Path) -> None:
 
 def test_staff_lists_the_same_frame_as_lsu() -> None:
     """Staff is lsu. staffroom is not. staff please is the lsu syntax."""
-    ada = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.SUPER_USER))
+    ada = FakePlayer(player=Player("Ada", "reception", datetime.now(UTC), rank=Rank.SUPER_USER))
     server = FakeServer(people=[ada])
     process_commands(server, ada, "lsu")  # type: ignore[arg-type]
     listed = server.sent[0]
@@ -6631,7 +6631,7 @@ def test_lsn_lists_connected_newbies(tmp_path: Path) -> None:
 
 def test_lsn_shows_hostname_and_room() -> None:
     """Each newbie row shows hostname, room display name, and idle clock."""
-    ada = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.SUPER_USER))
+    ada = FakePlayer(player=Player("Ada", "reception", datetime.now(UTC), rank=Rank.SUPER_USER))
     server = FakeServer(people=[ada])
     server.newbies = [("Bea", "bea.example", "hall", 300)]
     process_commands(server, ada, "lsn")  # type: ignore[arg-type]
@@ -6692,7 +6692,7 @@ def test_connection_rows_use_the_pending_name_and_sort_by_ip() -> None:
 
 def test_connections_frames_every_socket_for_a_super_user() -> None:
     """The frame names the columns and includes the person who asked."""
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     viewer = FakePlayer(player=Player("Cyd", "reception", when, rank=Rank.SUPER_USER), address="192.0.2.1", hostname="staff.example")
     unnamed = FakePlayer(player=None, name=None, room=None, address="192.0.2.10", hostname="192.0.2.10")
     server = FakeServer(people=[unnamed, viewer])
@@ -6711,7 +6711,7 @@ def test_connections_frames_every_socket_for_a_super_user() -> None:
 
 def test_connections_adds_a_country_column_when_lookup_is_on() -> None:
     """Country sits between the IP and the connection type."""
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     viewer = FakePlayer(player=Player("Cyd", "reception", when, rank=Rank.SUPER_USER), address="8.8.8.8", hostname="dns.example", country_name="United States", country_code="US")
     server = FakeServer(people=[viewer], country_lookup=True)
     process_commands(server, viewer, "connections")  # type: ignore[arg-type]
@@ -6723,7 +6723,7 @@ def test_connections_adds_a_country_column_when_lookup_is_on() -> None:
 
 def test_conns_is_the_same_list_and_needs_a_space() -> None:
     """Conns lists sockets. connsplease is not the command."""
-    viewer = FakePlayer(player=Player("Cyd", "reception", datetime.now(timezone.utc), rank=Rank.SUPER_USER))
+    viewer = FakePlayer(player=Player("Cyd", "reception", datetime.now(UTC), rank=Rank.SUPER_USER))
     listed, _ = run("conns", viewer)
     assert "Cyd" in listed.sent[0]
     missing, _ = run("connsplease", viewer)
@@ -6736,7 +6736,7 @@ def test_conns_is_the_same_list_and_needs_a_space() -> None:
 
 def test_a_resident_cannot_use_connections() -> None:
     """Residents are told the words are not commands."""
-    resident = FakePlayer(player=Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT))
+    resident = FakePlayer(player=Player("Ada", "reception", datetime.now(UTC), rank=Rank.RESIDENT))
     refused, _ = run("connections", resident)
     assert refused.sent == ["No such command 'connections'\n"]
     alias, _ = run("conns", resident)
@@ -6769,7 +6769,7 @@ def test_password_via_process_input_leaves_only_current_prompt(tmp_path: Path) -
 
 def test_saved_player_can_change_password(tmp_path: Path) -> None:
     """A saved resident replaces their password after the three prompts."""
-    left = datetime(2024, 6, 1, 12, 0, tzinfo=timezone.utc)
+    left = datetime(2024, 6, 1, 12, 0, tzinfo=UTC)
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), logged_out_at=left, ip_address="10.0.0.5", prompt="Go: ", connected_seconds=90))  # fmt: skip  # noqa: E501
     bea = staff("Bea", Rank.RESIDENT)
     server = login_host(tmp_path)
@@ -6925,7 +6925,7 @@ def test_examine_ranks_use_the_viewers_colour() -> None:
     """Newbie is green, super user is cyan, admin is red, and resident is plain."""
     from lupaxa.chat_server.colour import cyan, green, red
 
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     newbie = FakePlayer(player=Player("Bea", "hall", when))
     server = FakeServer(people=[newbie])
     process_commands(server, newbie, "examine me")  # type: ignore[arg-type]
@@ -7010,7 +7010,7 @@ def saved_seconds(tmp_path: Path) -> int:
 
 
 def resident_bea(seconds: int, flushed: int) -> Player:
-    return Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT, connected_seconds=seconds, flushed_seconds=flushed)
+    return Player("Bea", "hall", datetime.now(UTC), rank=Rank.RESIDENT, connected_seconds=seconds, flushed_seconds=flushed)
 
 
 def test_note_connected_time_writes_after_300_more_seconds(tmp_path: Path) -> None:
@@ -7045,7 +7045,7 @@ def test_note_connected_time_ignores_nothing_to_add(tmp_path: Path) -> None:
 
 def test_note_connected_time_keeps_a_newbie_off_disk(tmp_path: Path) -> None:
     """A newbie counts the seconds, and no file is written."""
-    user = Player("Bea", "hall", datetime.now(timezone.utc))
+    user = Player("Bea", "hall", datetime.now(UTC))
     note_connected_time(tmp_path, user, 300)
     assert user.connected_seconds == 300
     assert user.flushed_seconds == 0
@@ -7075,7 +7075,7 @@ def test_record_saved_logout_writes_the_time_and_the_total_together(tmp_path: Pa
 
 def test_record_saved_logout_skips_a_newbie(tmp_path: Path) -> None:
     """A newbie has no file, so none is written."""
-    user = Player("Bea", "hall", datetime.now(timezone.utc), connected_seconds=40)
+    user = Player("Bea", "hall", datetime.now(UTC), connected_seconds=40)
     record_saved_logout(tmp_path, user)
     assert list(tmp_path.iterdir()) == []
 
@@ -7125,17 +7125,17 @@ def test_allow_changes_the_live_flag_and_not_the_file(tmp_path: Path) -> None:
 def test_broadcast_is_centered_with_blank_lines() -> None:
     """An admin broadcast is red when colour is on, with a blank line after it."""
     plain = "-=> Broadcast Messages from Ada: hello <=-"
-    ada = FakePlayer(player=Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.CODER), frame_columns=len(plain))
+    ada = FakePlayer(player=Player("Ada", "hall", datetime.now(UTC), rank=Rank.CODER), frame_columns=len(plain))
     server, _ = run("broadcast hello", ada)
     assert server.sent[0] == f"\n\n\n{red(plain)}\n\n\n\n"
     resident, _ = run("broadcast hello", staff("Bea", Rank.RESIDENT))
     assert resident.sent == ["No such command 'broadcast'\n"]
     empty, _ = run("broadcast", ada)
     assert empty.sent == ["Syntax: broadcast <message>\n"]
-    ada_off = FakePlayer(player=Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.CODER, colour=False), frame_columns=len(plain))
+    ada_off = FakePlayer(player=Player("Ada", "hall", datetime.now(UTC), rank=Rank.CODER, colour=False), frame_columns=len(plain))
     host_off, _ = run("broadcast hello", ada_off)
     assert host_off.sent[0] == f"\n\n\n{plain}\n\n\n\n"
-    ada_wide = FakePlayer(player=Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.CODER), frame_columns=len(plain) + 4)
+    ada_wide = FakePlayer(player=Player("Ada", "hall", datetime.now(UTC), rank=Rank.CODER), frame_columns=len(plain) + 4)
     host_wide, _ = run("broadcast hello", ada_wide)
     assert host_wide.sent[0] == f"\n\n\n  {red(plain)}\n\n\n\n"
 
@@ -8190,7 +8190,7 @@ def test_a_login_that_never_enters_is_timed_out(tmp_path: Path, monkeypatch: pyt
 def test_a_player_in_a_room_is_not_login_timed_out(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """A player who already has a room is not dropped by the login limit."""
     server = login_host(tmp_path)
-    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    user = Player("Bea", "hall", datetime.now(UTC), rank=Rank.RESIDENT)
     bea = FakePlayer(player=user, accepted_at=0.0)
     server.clients = {"b": bea}  # type: ignore[attr-defined]
     advance(server, monkeypatch, 10_000.0)
@@ -8204,7 +8204,7 @@ def test_process_timer_adds_the_seconds_to_the_total(tmp_path: Path, monkeypatch
     server.timer_mark = 10.0  # type: ignore[attr-defined]
     server.timer_remainder = 0.0  # type: ignore[attr-defined]
     server.clients = {}  # type: ignore[attr-defined]
-    user = Player("Ada", "hall", datetime.now(timezone.utc))
+    user = Player("Ada", "hall", datetime.now(UTC))
     server.clients["a"] = FakePlayer(player=user)  # type: ignore[attr-defined]
     monkeypatch.setattr("lupaxa.chat_server.timer.time.monotonic", lambda: 13.0)
     process_timer(server)  # type: ignore[arg-type]
@@ -8216,7 +8216,7 @@ def test_login_loads_colour_off(tmp_path: Path) -> None:
     """A saved player starts from the colour stored in the file."""
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), colour=False))
     server = login_host(tmp_path)
-    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    user = Player("Bea", "hall", datetime.now(UTC), rank=Rank.RESIDENT)
     entry_api.load_profile(server, user)  # type: ignore[arg-type]
     assert user.colour is False
 
@@ -8452,7 +8452,7 @@ def test_a_plan_sits_under_the_sentences_online_and_offline(tmp_path: Path) -> N
     server.sent.clear()
     process_commands(server, bea, f"set plan {'x' * 81}")  # type: ignore[arg-type]
     assert server.sent == ["A plan is at most 80 characters.\n"]
-    left = datetime.now(timezone.utc) - timedelta(hours=1)
+    left = datetime.now(UTC) - timedelta(hours=1)
     save_player(tmp_path, SavedPlayer("Bea", Rank.RESIDENT, hash_password("pw", rounds=4), logged_out_at=left, plan="Out for lunch", description="Hello"))
     server = login_host(tmp_path)
     process_commands(server, viewer(Rank.RESIDENT), "examine Bea")  # type: ignore[arg-type]
@@ -8470,7 +8470,7 @@ def test_a_plan_sits_under_the_sentences_online_and_offline(tmp_path: Path) -> N
 
 def test_a_newbie_cannot_set_a_prompt() -> None:
     """A newbie is told prompt does not exist, and help hides it."""
-    when = datetime.now(timezone.utc)
+    when = datetime.now(UTC)
     newbie = FakePlayer(player=Player("Ada", "reception", when, rank=Rank.NEWBIE))
     server, _ = run("set prompt Go:", newbie)
     assert server.sent == ["No such command 'set'\n"]
@@ -8557,7 +8557,7 @@ def test_becoming_a_resident_stores_no_prompt(tmp_path: Path) -> None:
 
 def test_custom_prompt_ends_with_a_space() -> None:
     """A custom prompt gains one trailing space and keeps it."""
-    user = Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    user = Player("Ada", "hall", datetime.now(UTC), rank=Rank.RESIDENT)
     ada = FakePlayer(player=user)
     server, _ = run("set prompt Hi:", ada)
     assert user.prompt == "Hi: "
@@ -8566,8 +8566,8 @@ def test_custom_prompt_ends_with_a_space() -> None:
 
 def test_commands_wrap_on_visible_width() -> None:
     """Colour codes do not make the command list wrap early."""
-    on_user = Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.ADMIN, colour=True)
-    off_user = Player("Ada", "hall", datetime.now(timezone.utc), rank=Rank.ADMIN, colour=False)
+    on_user = Player("Ada", "hall", datetime.now(UTC), rank=Rank.ADMIN, colour=True)
+    off_user = Player("Ada", "hall", datetime.now(UTC), rank=Rank.ADMIN, colour=False)
     on, _ = run("commands", FakePlayer(player=on_user, frame_columns=60))
     off, _ = run("commands", FakePlayer(player=off_user, frame_columns=60))
     on_body = on.sent[0].split("Commands available:\n", 1)[1]
@@ -8673,7 +8673,7 @@ def test_ten_seconds_rolls_port_and_connection_counters(tmp_path: Path, monkeypa
     server = login_host(tmp_path)
     server.timer_mark = 0.0
     server.timer_remainder = 0.0
-    person = FakePlayer(player=Player("Ada", "hall", datetime.now(timezone.utc)))
+    person = FakePlayer(player=Player("Ada", "hall", datetime.now(UTC)))
     person.net.in_current = 25
     server.telnet_net.in_current = 25
     server.combined_net.in_current = 25
@@ -8776,7 +8776,7 @@ def test_a_house_file_name_cannot_be_the_rooms_or_help_file(tmp_path: Path) -> N
 def test_a_resident_cannot_use_network(tmp_path: Path) -> None:
     """Below coder, network is not a command."""
     server = login_host(tmp_path)
-    user = Player("Ada", "reception", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    user = Player("Ada", "reception", datetime.now(UTC), rank=Rank.RESIDENT)
     player = FakePlayer(player=user)
     process_commands(server, player, "network")  # type: ignore[arg-type]
     assert player.sent[-1] == "No such command 'network'\n"
@@ -8787,7 +8787,7 @@ def test_network_with_no_argument_shows_the_combined_box(tmp_path: Path) -> None
     server = login_host(tmp_path)
     server.combined_net.in_total = 1500
     server.telnet_net.in_total = 9
-    user = Player("Ann", "reception", datetime.now(timezone.utc), rank=Rank.CODER)
+    user = Player("Ann", "reception", datetime.now(UTC), rank=Rank.CODER)
     player = FakePlayer(player=user)
     server.people = [player]
     process_commands(server, player, "network")  # type: ignore[arg-type]
@@ -8800,7 +8800,7 @@ def test_network_telnet_and_ssh_select_those_ports(tmp_path: Path) -> None:
     server = login_host(tmp_path)
     server.telnet_net.in_total = 1500
     server.ssh_net.out_total = 300_000_000
-    user = Player("Ann", "reception", datetime.now(timezone.utc), rank=Rank.CODER)
+    user = Player("Ann", "reception", datetime.now(UTC), rank=Rank.CODER)
     player = FakePlayer(player=user)
     server.people = [player]
     process_commands(server, player, "network TELNET")  # type: ignore[arg-type]
@@ -8812,7 +8812,7 @@ def test_network_telnet_and_ssh_select_those_ports(tmp_path: Path) -> None:
 def test_network_me_shows_the_callers_connection(tmp_path: Path) -> None:
     """Network me is the caller's own counters, the way examine me is the caller."""
     server = login_host(tmp_path)
-    user = Player("Ann", "reception", datetime.now(timezone.utc), rank=Rank.CODER)
+    user = Player("Ann", "reception", datetime.now(UTC), rank=Rank.CODER)
     player = FakePlayer(player=user)
     player.net.in_total = 42
     server.people = [player]
@@ -8878,10 +8878,10 @@ def test_ipinfo_frames_a_player_or_an_address(tmp_path: Path, monkeypatch: pytes
 def test_network_shows_one_connection_from_accept(tmp_path: Path) -> None:
     """The player's box is the connection counter, including login bytes."""
     server = login_host(tmp_path)
-    user = Player("Bea", "hall", datetime.now(timezone.utc), rank=Rank.RESIDENT)
+    user = Player("Bea", "hall", datetime.now(UTC), rank=Rank.RESIDENT)
     bea = FakePlayer(name="Bea", player=user, room="hall")
     bea.net.in_total = 999
-    admin_user = Player("Ann", "reception", datetime.now(timezone.utc), rank=Rank.CODER)
+    admin_user = Player("Ann", "reception", datetime.now(UTC), rank=Rank.CODER)
     admin = FakePlayer(player=admin_user)
     server.people = [admin, bea]
     process_commands(server, admin, "network bea")  # type: ignore[arg-type]
@@ -8891,7 +8891,7 @@ def test_network_shows_one_connection_from_accept(tmp_path: Path) -> None:
 def test_network_reports_a_missing_player_and_extra_words(tmp_path: Path) -> None:
     """An unknown name and a second word are refused."""
     server = login_host(tmp_path)
-    user = Player("Ann", "reception", datetime.now(timezone.utc), rank=Rank.CODER)
+    user = Player("Ann", "reception", datetime.now(UTC), rank=Rank.CODER)
     player = FakePlayer(player=user)
     server.people = [player]
     process_commands(server, player, "network Ada")  # type: ignore[arg-type]
@@ -8948,7 +8948,7 @@ class SampleProcess:
 
 def test_system_shows_uptime_cpu_memory_and_load(monkeypatch: pytest.MonkeyPatch) -> None:
     """System shows the process box with uptime and resource figures."""
-    fixed = datetime(2026, 10, 12, 13, 45, 3, tzinfo=timezone.utc)
+    fixed = datetime(2026, 10, 12, 13, 45, 3, tzinfo=UTC)
 
     class Clock(datetime):
         @classmethod
@@ -8992,7 +8992,7 @@ def test_system_shows_uptime_cpu_memory_and_load(monkeypatch: pytest.MonkeyPatch
     lines = narrow.splitlines()
     width = len(lines[0])
     assert all(len(line) == width for line in lines)
-    server.rebooted_at = datetime(2026, 10, 12, 12, 10, 3, tzinfo=timezone.utc)
+    server.rebooted_at = datetime(2026, 10, 12, 12, 10, 3, tzinfo=UTC)
     server.sent.clear()
     process_commands(server, ada, "system")  # type: ignore[arg-type]
     wide = """\
@@ -9068,7 +9068,7 @@ def test_system_box_survives_a_missing_disk_counter() -> None:
 
 def test_system_box_survives_a_real_process(monkeypatch: pytest.MonkeyPatch) -> None:
     """System against the live process returns a box without raising."""
-    fixed = datetime(2026, 10, 12, 13, 45, 3, tzinfo=timezone.utc)
+    fixed = datetime(2026, 10, 12, 13, 45, 3, tzinfo=UTC)
 
     class Clock(datetime):
         @classmethod

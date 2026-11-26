@@ -4,7 +4,7 @@ from __future__ import annotations  # noqa: I001
 
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 
 from .broadcast import broadcast_room
 from .chain import Delivery, chain_number, delete_chain, deliver, leave_chain, listed_names, remove_from_chain, split_target_message, tell_names
@@ -350,7 +350,7 @@ def command_tell(server: Server, client: Client, command: Command, text: str | N
         server.send(client, f"Syntax: {shown_syntax(command)}\n")
         return
     pieces, message = parsed
-    delivery = deliver(server, client, pieces, datetime.now(timezone.utc))
+    delivery = deliver(server, client, pieces, datetime.now(UTC))
     for line in delivery.sender_lines:
         server.send(client, line)
     if delivery.stopped or not delivery.recipients:
@@ -376,7 +376,7 @@ def command_remote(server: Server, client: Client, command: Command, text: str |
         server.send(client, f"Syntax: {shown_syntax(command)}\n")
         return
     pieces, message = parsed
-    delivery = deliver(server, client, pieces, datetime.now(timezone.utc))
+    delivery = deliver(server, client, pieces, datetime.now(UTC))
     for line in delivery.sender_lines:
         server.send(client, line)
     if delivery.stopped or not delivery.recipients:
@@ -402,7 +402,7 @@ def command_rthink(server: Server, client: Client, command: Command, text: str |
         server.send(client, f"Syntax: {shown_syntax(command)}\n")
         return
     pieces, message = parsed
-    delivery = deliver(server, client, pieces, datetime.now(timezone.utc))
+    delivery = deliver(server, client, pieces, datetime.now(UTC))
     for line in delivery.sender_lines:
         server.send(client, line)
     if delivery.stopped or not delivery.recipients:
@@ -448,7 +448,7 @@ def send_chain_list(server: Server, client: Client) -> None:
         server.send(client, "You are not on a chain.\n")
         return
     mine.sort(key=lambda chain: chain.number)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     rows: list[tuple[str, str]] = []
     for chain in mine:
         label = f"Chain {chain.number}: {listed_names(chain.names)}"
@@ -551,7 +551,7 @@ def command_examine(server: Server, client: Client, command: Command, text: str 
         if here is not None and here.player is not None:
             send_connected_examine(server, client, here)
             return
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         fields = logged_out_fields(saved, now, has_rank(client), colour_of(client))
         server.send(client, examine_frame(saved.name, fields, frame_width(client.discovered_columns, client.frame_columns), plan=saved.plan))  # fmt: skip  # noqa: E501
         return
@@ -563,7 +563,7 @@ def send_connected_examine(server: Server, viewer: Client, target: Client) -> No
     user = target.player
     if user is None:
         return
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     fields: list[tuple[str, str]] = [
         ("User Rank", shown_person_rank(has_rank(viewer), user.rank, colour_of(viewer))),
     ]
@@ -636,7 +636,7 @@ def command_time(server: Server, client: Client, command: Command, text: str | N
     if text:
         server.send(client, f"Syntax: {shown_syntax(command)}\n")
         return
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     seconds = int((now - server.started_at).total_seconds())
     rebooted = server.rebooted_at
     reboot_clock = clock_phrase(rebooted) if rebooted is not None else None
@@ -799,8 +799,8 @@ def logged_out_fields(saved: SavedPlayer, now: datetime, viewer: Rank, colour: b
         fields.append(("Logged out", "unknown"))
     else:
         if left.tzinfo is None:
-            left = left.replace(tzinfo=timezone.utc)
-        left = left.astimezone(timezone.utc)
+            left = left.replace(tzinfo=UTC)
+        left = left.astimezone(UTC)
         stamp = clock_phrase(left)
         ago = duration_phrase(int((now - left).total_seconds()))
         fields.append(("Logged out", stamp))

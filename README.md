@@ -31,7 +31,7 @@ with it, customise it, add to it, and make it your own.
 pip install lupaxa-chat-server
 ```
 
-Requires Python 3.10+. AsyncSSH, bcrypt, colorama, cryptography, maxminddb,
+Requires Python 3.11 to 3.15. AsyncSSH, bcrypt, colorama, cryptography, maxminddb,
 PyYAML, and qrcode are the runtime dependencies.
 
 ## Run
