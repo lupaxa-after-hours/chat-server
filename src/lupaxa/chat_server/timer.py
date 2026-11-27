@@ -139,11 +139,7 @@ def message_file_stamps(messages_path: Path) -> dict[str, HelpStamp]:
 
 def reload_messages(server: Server, *, force: bool) -> list[str]:
     """Re-read the three message files. Return one error line per bad file."""
-    files = (
-        ("banner", "banner.msg", "banner", "Banner"),
-        ("full", "full.msg", "full", "Full"),
-        ("no-more-newbies", "no-more-newbies.msg", "no-more-newbies", "No-more-newbies"),
-    )
+    files = (("banner", "banner.msg", "banner", "Banner"), ("full", "full.msg", "full", "Full"), ("no-more-newbies", "no-more-newbies.msg", "no-more-newbies", "No-more-newbies"))
     directory = server.config.messages_path
     errors: list[str] = []
     for key, filename, missing_name, utf8_name in files:

@@ -11,7 +11,22 @@ import pytest
 from lupaxa.chat_server.client import Client
 from lupaxa.chat_server.exceptions import ConfigError
 from lupaxa.chat_server.player import Player
-from lupaxa.chat_server.rooms import Layout, Room, cannot_go_line, full_line, house_room_id, is_full, is_home_id, leave_line, load_house, load_layout, release_empty_houses, spoken_line, system_room_ids, write_default_house
+from lupaxa.chat_server.rooms import (
+    Layout,
+    Room,
+    cannot_go_line,
+    full_line,
+    house_room_id,
+    is_full,
+    is_home_id,
+    leave_line,
+    load_house,
+    load_layout,
+    release_empty_houses,
+    spoken_line,
+    system_room_ids,
+    write_default_house,
+)
 
 OFFICE = """\
 reception:
@@ -85,7 +100,10 @@ def test_a_house_file_uses_the_player_prefix(tmp_path: Path) -> None:
     """Bea's kitchen is labelled Kitchen, and a visitor would see Bea's Kitchen."""
     system = load_layout(write(tmp_path, "reception:\n  description: Hi.\n  max_occupancy: 1\n  exits: {}\n")).with_void()
     house = tmp_path / "bea.yml"
-    house.write_text("bea_home:\n  description: You are home.\n  max_occupancy: 1\n  exits:\n    n: bea_kitchen\nbea_kitchen:\n  description: A kettle.\n  max_occupancy: 2\n  exits:\n    s: bea_home\n", encoding="utf-8")
+    house.write_text(
+        "bea_home:\n  description: You are home.\n  max_occupancy: 1\n  exits:\n    n: bea_kitchen\nbea_kitchen:\n  description: A kettle.\n  max_occupancy: 2\n  exits:\n    s: bea_home\n",
+        encoding="utf-8",
+    )
     loaded = load_house(house, "Bea", system_room_ids(system))
     layout = system.with_house("Bea", loaded)
     assert layout.display_name("bea_kitchen") == "Kitchen"

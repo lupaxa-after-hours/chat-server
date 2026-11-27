@@ -366,16 +366,7 @@ def test_child_aliases_match_whole_words(monkeypatch: pytest.MonkeyPatch) -> Non
     RAN_CHILD.clear()
     alias_c = Command("c", record_child, True, None, rank=Rank.RESIDENT)
     alias_bang = Command("!", record_child, True, None, rank=Rank.RESIDENT)
-    commands = [
-        Command(
-            "widget",
-            parent_ran,
-            False,
-            "widget <command>",
-            rank=Rank.RESIDENT,
-            subcommands=(alias_c, alias_bang),
-        )
-    ]
+    commands = [Command("widget", parent_ran, False, "widget <command>", rank=Rank.RESIDENT, subcommands=(alias_c, alias_bang))]
     attach_subcommands(commands)
     parent = commands[0]
 

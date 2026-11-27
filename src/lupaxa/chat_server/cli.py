@@ -81,7 +81,9 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 ensure_players_directory(config.players)
                 # Prompts are already written by run_setup. Empty strings keep input and getpass from printing them again.
-                run_setup(config.players, config.rooms, config.help, read_line=lambda prompt: input(""), read_secret=lambda prompt: getpass.getpass(""), write=lambda text: print(text, end="", flush=True))
+                run_setup(
+                    config.players, config.rooms, config.help, read_line=lambda prompt: input(""), read_secret=lambda prompt: getpass.getpass(""), write=lambda text: print(text, end="", flush=True)
+                )
             except (KeyboardInterrupt, EOFError):
                 print()
                 return 1

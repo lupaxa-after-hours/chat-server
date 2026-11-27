@@ -14,12 +14,7 @@ from lupaxa.chat_server.saved_player import SavedPlayer, hash_password, load_sav
 from lupaxa.chat_server.setup import run_setup
 
 
-def drive(
-    tmp_path: Path,
-    lines: list[str],
-    secrets: list[str],
-    on_write: Callable[[str, Path], None] | None = None,
-) -> tuple[Path, list[str], list[str], list[str]]:
+def drive(tmp_path: Path, lines: list[str], secrets: list[str], on_write: Callable[[str, Path], None] | None = None) -> tuple[Path, list[str], list[str], list[str]]:
     """Run setup and return the players directory, writes, and prompts."""
     players = tmp_path / "players"
     players.mkdir(exist_ok=True)

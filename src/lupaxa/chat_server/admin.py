@@ -359,11 +359,7 @@ def set_rank(server: Server, client: Client, saved: SavedPlayer, rank: Rank) -> 
     return True
 
 
-RANK_PAIRS = (
-    ("Residents", Rank.RESIDENT, "Channel Only", Rank.SU_CHANNEL),
-    ("Super Users", Rank.SUPER_USER, "Admins", Rank.ADMIN),
-    ("Coders", Rank.CODER, "Super Admin", Rank.SUPER_ADMIN),
-)
+RANK_PAIRS = (("Residents", Rank.RESIDENT, "Channel Only", Rank.SU_CHANNEL), ("Super Users", Rank.SUPER_USER, "Admins", Rank.ADMIN), ("Coders", Rank.CODER, "Super Admin", Rank.SUPER_ADMIN))
 
 
 def pstats_box(server: Server) -> str:

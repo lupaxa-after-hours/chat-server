@@ -53,10 +53,7 @@ def empty_players_config(tmp_path: Path) -> tuple[Path, Path]:
     players = tmp_path / "players"
     players.mkdir()
     path = write_at(
-        tmp_path,
-        "chat.yaml",
-        "port: 9000\nrooms: rooms.yml\nstart: reception\nhelp: help.yml\nmax_connections: 128\nmax_newbies: 20\nmessages_path: files\nplayers: players\n",
-        caps=False,
+        tmp_path, "chat.yaml", "port: 9000\nrooms: rooms.yml\nstart: reception\nhelp: help.yml\nmax_connections: 128\nmax_newbies: 20\nmessages_path: files\nplayers: players\n", caps=False
     )
     return path, players
 
@@ -141,12 +138,7 @@ def test_bind_failure_exits_1(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     files.mkdir()
     (files / "banner.msg").write_text("Hello\n", encoding="utf-8")
     write_gate_files(files)
-    path = write_at(
-        tmp_path,
-        "chat.yaml",
-        f"port: {port}\nrooms: rooms.yml\nstart: reception\nhelp: help.yml\nmax_connections: 128\nmax_newbies: 20\nmessages_path: files\n",
-        caps=False,
-    )
+    path = write_at(tmp_path, "chat.yaml", f"port: {port}\nrooms: rooms.yml\nstart: reception\nhelp: help.yml\nmax_connections: 128\nmax_newbies: 20\nmessages_path: files\n", caps=False)
     seed_super_admin(tmp_path / "players")
     try:
         code = main(["--config", str(path)])
@@ -187,12 +179,7 @@ def listen_config(tmp_path: Path) -> tuple[str, Path]:
     files.mkdir()
     (files / "banner.msg").write_text("Hello\n", encoding="utf-8")
     write_gate_files(files)
-    path = write_at(
-        tmp_path,
-        "chat.yaml",
-        f"port: {port}\nrooms: rooms.yml\nstart: reception\nhelp: help.yml\nmax_connections: 128\nmax_newbies: 20\nmessages_path: files\n",
-        caps=False,
-    )
+    path = write_at(tmp_path, "chat.yaml", f"port: {port}\nrooms: rooms.yml\nstart: reception\nhelp: help.yml\nmax_connections: 128\nmax_newbies: 20\nmessages_path: files\n", caps=False)
     config_path = str(path)
     players = tmp_path / "players"
     players.mkdir(parents=True, exist_ok=True)

@@ -327,10 +327,7 @@ def test_port_range(tmp_path: Path, text: str) -> None:
 
 def test_obsolete_keys_load_and_a_missing_required_key_still_raises(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """A leftover key is stored on the file that held it. A missing required key still stops startup."""
-    path = write(
-        tmp_path,
-        "port: 9000\nrooms: rooms.yml\nstart: reception\nhelp: help.yml\nadmin: legacy\ncolour: 1\nbeta: 1\nZeta: 1\n",
-    )
+    path = write(tmp_path, "port: 9000\nrooms: rooms.yml\nstart: reception\nhelp: help.yml\nadmin: legacy\ncolour: 1\nbeta: 1\nZeta: 1\n")
     loaded = load_config(path)
     assert loaded.obsolete_cold == ("admin", "beta", "colour", "Zeta")
     assert loaded.obsolete_hot == ()

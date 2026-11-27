@@ -660,7 +660,10 @@ def command_who(server: Server, client: Client, command: Command, text: str | No
     if text:
         server.send(client, f"Syntax: {shown_syntax(command)}\n")
         return
-    rows = [(name, shown_person_cell(has_rank(client), rank, colour_of(client)), server.layout.location_name(room_id, name), status, paint_idle(idle, colour_of(client))) for name, rank, room_id, status, idle in who(get_clients(server))]
+    rows = [
+        (name, shown_person_cell(has_rank(client), rank, colour_of(client)), server.layout.location_name(room_id, name), status, paint_idle(idle, colour_of(client)))
+        for name, rank, room_id, status, idle in who(get_clients(server))
+    ]
     if not rows:
         server.send(client, " -=> There is currently no one connected\n")
         return

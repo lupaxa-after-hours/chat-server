@@ -13,11 +13,7 @@ PRIVATE_COUNTRY_NAME = "Private Network"
 PRIVATE_COUNTRY_CODE = "XP"
 UNKNOWN_COUNTRY_NAME = "Unknown"
 UNKNOWN_COUNTRY_CODE = "XU"
-RFC1918 = (
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-)
+RFC1918 = (ipaddress.ip_network("10.0.0.0/8"), ipaddress.ip_network("172.16.0.0/12"), ipaddress.ip_network("192.168.0.0/16"))
 ULA = ipaddress.ip_network("fc00::/7")
 
 

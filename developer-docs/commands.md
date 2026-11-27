@@ -23,8 +23,8 @@ A row is `Command(name, function, is_alias, syntax, needs_space, rank)`. The cat
 The missing-text reply and a bad-arguments reply both use it. `command.syntax` on its own is the tail. `say` is a normal command. `'` is an alias for the same function:
 
 ```python
-Command("say", command_say, False, "<message>"),
-Command("'", command_say, True, "<message>"),
+(Command("say", command_say, False, "<message>"),)
+(Command("'", command_say, True, "<message>"),)
 ```
 
 `shout` also sets `rank` to resident.
@@ -102,7 +102,7 @@ def command_wave(server: Server, client: Client, command: Command, text: str | N
 Register it next to the other rows:
 
 ```python
-Command("wave", command_wave, False, "<message>"),
+(Command("wave", command_wave, False, "<message>"),)
 ```
 
 A parent passes `subcommands=()`. `ensure_commands` adds the `commands` child, which lists the children this rank may use.

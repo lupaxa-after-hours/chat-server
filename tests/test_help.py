@@ -175,13 +175,7 @@ def test_load_finds_a_name_or_an_alias(tmp_path: Path) -> None:
 
 def test_help_book_search_matches_name_alias_text_example_and_notes() -> None:
     """Search matches the name, an alias, the text, the example, and the notes."""
-    book = HelpBook(
-        entries=(
-            HelpEntry("say", ("'",), "Speak."),
-            HelpEntry("map", (), "Draw.", example="map here", notes="The house."),
-            HelpEntry("quit", (), "Leave."),
-        )
-    )
+    book = HelpBook(entries=(HelpEntry("say", ("'",), "Speak."), HelpEntry("map", (), "Draw.", example="map here", notes="The house."), HelpEntry("quit", (), "Leave.")))
     assert [entry.name for entry in book.search("say")] == ["say"]
     assert [entry.name for entry in book.search("'")] == ["say"]
     assert [entry.name for entry in book.search("DRAW")] == ["map"]

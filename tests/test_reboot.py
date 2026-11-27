@@ -21,7 +21,20 @@ from lupaxa.chat_server.client import output_hidden
 from lupaxa.chat_server.netstats import NetStats
 from lupaxa.chat_server.chain import Chain
 from lupaxa.chat_server.colour import cyan
-from lupaxa.chat_server.reboot import COMPLETED, RebootClient, announce_completed, clients_from_state, decode_state, discard_leftover, encode_state, finish_reboot, read_reboot, reboot_path, snapshot, write_reboot
+from lupaxa.chat_server.reboot import (
+    COMPLETED,
+    RebootClient,
+    announce_completed,
+    clients_from_state,
+    decode_state,
+    discard_leftover,
+    encode_state,
+    finish_reboot,
+    read_reboot,
+    reboot_path,
+    snapshot,
+    write_reboot,
+)
 from lupaxa.chat_server.saved_player import SavedPlayer, hash_password, save_player
 from lupaxa.chat_server.ranks import Rank
 from lupaxa.chat_server.roles import Roles
@@ -90,8 +103,37 @@ def test_snapshot_round_trips_live_state(tmp_path: Path) -> None:
     started = datetime(2026, 10, 15, 8, 0, tzinfo=UTC)
     connected = datetime(2026, 10, 15, 8, 1, tzinfo=UTC)
     logged_out = datetime(2026, 10, 15, 7, 0, tzinfo=UTC)
-    player = Player("Ada", "reception", connected, alarm_seconds=12, idle_seconds=3, prompt="Yes? ", rank=Rank.RESIDENT, connected_seconds=9, flushed_seconds=4, colour=False, description="Here", status="Away", auto_reply="Later", entermsg="arrives")
-    saved = SavedPlayer("Ada", Rank.RESIDENT, "hash", logged_out_at=logged_out, ip_address="127.0.0.1", hostname="localhost", connected_seconds=9, prompt="Yes? ", colour=False, description="Here", mfa_secret="secret", mfa_on=True, entermsg="arrives")  # noqa: E501
+    player = Player(
+        "Ada",
+        "reception",
+        connected,
+        alarm_seconds=12,
+        idle_seconds=3,
+        prompt="Yes? ",
+        rank=Rank.RESIDENT,
+        connected_seconds=9,
+        flushed_seconds=4,
+        colour=False,
+        description="Here",
+        status="Away",
+        auto_reply="Later",
+        entermsg="arrives",
+    )
+    saved = SavedPlayer(
+        "Ada",
+        Rank.RESIDENT,
+        "hash",
+        logged_out_at=logged_out,
+        ip_address="127.0.0.1",
+        hostname="localhost",
+        connected_seconds=9,
+        prompt="Yes? ",
+        colour=False,
+        description="Here",
+        mfa_secret="secret",
+        mfa_on=True,
+        entermsg="arrives",
+    )  # noqa: E501
     client = Client(socket.socket(), player=player, auth="renew", pending_name="Ada", pending_saved=saved, pending_password="new", pending_current_password="old", pending_mfa_secret="sec", pending_issuer="chat", password_failures=1, address="127.0.0.1", hostname="localhost", accepted_at=10.5, terminal=True, hide_input=True, discovered_columns=80, discovered_rows=24, frame_columns=72)  # fmt: skip  # noqa: E501
     client.buffer.extend(b"hel")
     client.outgoing.extend(b"out")

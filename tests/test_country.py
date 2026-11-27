@@ -84,7 +84,16 @@ def test_ipinfo_fields_include_the_network_and_asn() -> None:
     """A public record adds the continent, ASN, and the prefix as an IP block."""
     from lupaxa.chat_server.country import ipinfo_fields
 
-    record = {"country": "United States", "country_code": "US", "continent": "North America", "continent_code": "NA", "asn": "AS15169", "as_name": "Google LLC", "as_domain": "google.com", "city": "Mountain View"}
+    record = {
+        "country": "United States",
+        "country_code": "US",
+        "continent": "North America",
+        "continent_code": "NA",
+        "asn": "AS15169",
+        "as_name": "Google LLC",
+        "as_domain": "google.com",
+        "city": "Mountain View",
+    }
     fields = dict(ipinfo_fields("8.8.8.8", "dns.google", record, 24))
     assert fields["Country"] == "United States (US)"
     assert fields["Continent"] == "North America (NA)"

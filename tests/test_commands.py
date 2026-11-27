@@ -256,7 +256,11 @@ class FakeServer:
         return sorted(rows)
 
     def who(self) -> list[tuple[str, str, str, str, int]]:
-        rows = [(person.name, person.player.rank, person.room, person.player.status, person.player.idle_seconds) for person in self.people if person.name is not None and person.room is not None and person.player is not None]
+        rows = [
+            (person.name, person.player.rank, person.room, person.player.status, person.player.idle_seconds)
+            for person in self.people
+            if person.name is not None and person.room is not None and person.player is not None
+        ]
         return sorted(rows)
 
     def others(self, room_id: str, client: FakePlayer) -> list[str]:
@@ -998,13 +1002,7 @@ def test_help_for_a_topic_that_is_not_a_command() -> None:
 
 def search_book() -> HelpBook:
     """Return two visible pages and one admin page."""
-    return HelpBook(
-        entries=(
-            HelpEntry("say", (), "Speak in the room."),
-            HelpEntry("map", (), "Draw the house."),
-            HelpEntry("shutdown", (), "Stop the server."),
-        )
-    )
+    return HelpBook(entries=(HelpEntry("say", (), "Speak in the room."), HelpEntry("map", (), "Draw the house."), HelpEntry("shutdown", (), "Stop the server.")))
 
 
 def test_help_search_shows_the_one_page() -> None:
@@ -1029,13 +1027,7 @@ def test_help_search_lists_several_pages() -> None:
 def test_help_search_keeps_a_spaced_name_on_one_line() -> None:
     """A page name that contains spaces stays on one line."""
     resident = staff("Ada", Rank.RESIDENT)
-    book = HelpBook(
-        entries=(
-            HelpEntry("set plan", (), "A plan."),
-            HelpEntry("examine", (), "A plan of the house."),
-            HelpEntry("quit", (), "Leave."),
-        )
-    )
+    book = HelpBook(entries=(HelpEntry("set plan", (), "A plan."), HelpEntry("examine", (), "A plan of the house."), HelpEntry("quit", (), "Leave.")))
     server = FakeServer(help=book, people=[resident])
     process_commands(server, resident, "help search plan")  # type: ignore[arg-type]
     assert server.sent == ["Help pages:\n  examine\n  set plan\n"]
